@@ -1,0 +1,3 @@
+# Threads (and so every test) get a 64 MB stack so deeply nested lambdas, adverbs and functional queries do not overflow in debug builds.
+[env]
+RUST_MIN_STACK = "67108864"

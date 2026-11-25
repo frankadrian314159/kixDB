@@ -1,0 +1,65 @@
+[package]
+name = "kixdb"
+version = "0.1.0"
+edition = "2021"
+description = "Black-box clone of KX's kdb+ columnstore database and the q query language"
+license = "MIT"
+
+[workspace]
+# The distributed (cluster) edition lives in crates/parallel; the single-node server above is the root package and is
+# unchanged by it (`cargo build` / `cargo test` at the root build only the root package; add `--workspace` for all).
+members = []
+resolver = "2"
+
+[lib]
+name = "kixdb"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kix"
+path = "src/main.rs"
+
+[[bin]]
+name = "kix-serve"
+path = "src/serve.rs"
+
+# The desktop app is optional so the engine and the shell build without a GUI toolkit:
+#   cargo run --release --features gui --bin kix-gui
+[[bin]]
+name = "kix-gui"
+path = "src/gui/main.rs"
+required-features = ["gui"]
+
+[features]
+default = []
+prof = []
+fast-alloc = ["dep:mimalloc"]
+gui = ["dep:eframe", "dep:egui", "dep:egui_extras", "dep:rfd"]
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+rand = "0.8"
+regex = "1"
+serde = { version = "1", features = ["derive", "rc"] }
+postcard = { version = "1", features = ["alloc"] }
+crc32fast = "1"
+eframe = { version = "0.32.3", optional = true }
+egui = { version = "0.32.3", optional = true }
+egui_extras = { version = "0.32.3", optional = true }
+rfd = { version = "0.17.2", optional = true }
+mimalloc = { version = "0.1", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+
+# rustc crashes (STACK_BUFFER_OVERRUN) compiling this GUI dependency without optimisation on Windows
+[profile.dev.package.simd-adler32]
+opt-level = 1

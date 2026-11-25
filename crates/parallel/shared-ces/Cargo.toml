@@ -1,0 +1,16 @@
+[package]
+name = "kix-shared-ces"
+version = "0.1.0"
+edition = "2021"
+description = "Shared cluster configuration, Arrow batch conversion, deterministic sym/date routing, and wire types for distributed kixdb"
+license = "MIT"
+
+[dependencies]
+kixdb = { path = "../../.." }
+arrow-array = "60"
+arrow-schema = "60"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+postcard = { version = "1", features = ["alloc"] }
+tonic = "0.14"
+sysinfo = { version = "0.30", default-features = false }
