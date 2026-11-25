@@ -94,6 +94,11 @@ fn queries_are_pushed_to_the_shards() {
     p.plan("select from inst where lot > 20", "replicated");
     p.plan("select sum lot by sector from inst", "replicated");
     p.plan("exec i from inst where sector = `tech", "replicated");
+    // replies large enough to be unpacked away from the thread that gathers them
+    p.check(".kix.dist[`wide; `sharded; `a]");
+    p.check("wide: ([] a: til 60000; b: reverse til 60000)");
+    p.plan("select from wide", "merged in order");
+    p.plan("select sum b by a from wide where b > 10", "grouped by the distribution column");
 }
 
 #[test]

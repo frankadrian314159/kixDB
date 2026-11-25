@@ -17,6 +17,9 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Status};
 
 const MAX_MESSAGE: usize = 256 * 1024 * 1024;
+/// A reply with more cells than this is unpacked on a thread of its own, so that the replies of several shards are
+/// unpacked at the same time; handing over a smaller one costs more than unpacking it.
+const UNPACK_ELSEWHERE: usize = 16_384;
 /// How long to look for the leader of a replicated shard (an election takes a moment).
 const FAILOVER: Duration = Duration::from_secs(8);
 
@@ -56,6 +59,11 @@ fn reply<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> KResult<T> {
 
 fn body<T: serde::Serialize>(v: &T) -> KResult<Vec<u8>> {
     postcard::to_allocvec(v).map_err(|e| KError::new("cluster", e.to_string()))
+}
+
+/// Work encoded for `ShardClient::run`: made once, however many shards get it (a clone shares the bytes).
+pub fn ticket(work: Work) -> KResult<Ticket> {
+    Ok(Ticket::new(body(&Fragment { work })?))
 }
 
 impl ShardClient {
@@ -148,17 +156,26 @@ impl ShardClient {
 
     /// Evaluate work on the shard and return its value.
     pub async fn query(&self, work: Work) -> KResult<K> {
-        let ticket = body(&Fragment { work })?;
+        self.run(ticket(work)?).await
+    }
+
+    /// Evaluate work that is already encoded.
+    pub async fn run(&self, ticket: Ticket) -> KResult<K> {
         self.on_leader(true, |ch| {
             let ticket = ticket.clone();
             async move {
-                let mut stream = client(ch).do_get(Ticket::new(ticket)).await.map_err(status_of)?;
+                let mut stream = client(ch).do_get(ticket).await.map_err(status_of)?;
                 let mut batches = vec![];
                 while let Some(b) = stream.try_next().await.map_err(status_of)? {
                     batches.push(b);
                 }
                 let schema = stream.schema().cloned().ok_or_else(|| Status::internal("the shard sent no schema"))?;
-                arrowconv::batches_to_k(&schema, &batches).map_err(Status::internal)
+                let cells = batches.iter().map(|b| b.num_rows() * b.num_columns()).sum::<usize>();
+                let unpack = move || arrowconv::batches_to_k(&schema, &batches).map_err(Status::internal);
+                if cells <= UNPACK_ELSEWHERE {
+                    return unpack();
+                }
+                tokio::task::spawn_blocking(unpack).await.map_err(|e| Status::internal(e.to_string()))?
             }
         })
         .await

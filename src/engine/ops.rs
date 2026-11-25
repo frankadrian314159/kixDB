@@ -646,7 +646,7 @@ fn narrow(keys: &[u64], room: usize) -> Option<(u64, usize)> {
 }
 
 /// A group number for every row: rows alike in all of `cols` share one, numbered in order of first appearance.
-fn group_ids(cols: &[ColVec], nrows: usize) -> Vec<usize> {
+pub(crate) fn group_ids(cols: &[ColVec], nrows: usize) -> Vec<usize> {
     // split the groups made so far by one more column, and count the groups there are then
     fn refine<T: Hash + Eq>(ids: &mut [usize], keys: impl Iterator<Item = T>) -> usize {
         let mut seen = HashMap::new();
@@ -684,7 +684,7 @@ fn group_ids(cols: &[ColVec], nrows: usize) -> Vec<usize> {
 }
 
 /// The first row of every group that `group_ids` numbered.
-fn first_rows(ids: &[usize]) -> Vec<usize> {
+pub(crate) fn first_rows(ids: &[usize]) -> Vec<usize> {
     let mut found = Vec::new();
     for (r, &id) in ids.iter().enumerate() {
         if id == found.len() {

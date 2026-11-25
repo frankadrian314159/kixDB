@@ -139,3 +139,32 @@ fn attribute_accelerated_filters_find_and_joins() {
     assert_eq!(c.eval("exec v from (idxed ij ks)").unwrap().to_string(), "2 5 8");
     assert_eq!(c.eval("exec v from (idxed pj ([id: `u#100 107] v: 100 200))").unwrap().to_string(), "101 2 3 4 5 6 7 208");
 }
+
+#[test]
+fn joins_match_keys_by_type_and_value_however_they_are_looked_up() {
+    let mut c = Server::new().connect();
+    // keys 0 to 29 and again 0 to 9; `w` and `lw` hold the same keys spread far apart, so that they are hashed
+    c.eval("r: ([] k: (til 30), til 10; s: 40#`a`b`c; v: til 40); l: ([] k: 3 1 35 0N 29 3; s: `a`b`c`a`a`c)").unwrap();
+    c.eval("w: update k: k * 1000000000000 from r; lw: update k: k * 1000000000000 from l").unwrap();
+    // an indexed table so large that a few rows are looked up in its index, many by numbering both sides' keys
+    c.eval("big: `k xkey ([] k: `s#til 1000; v: til 1000)").unwrap();
+    for (code, expected) in [
+        // the first row with a key wins, and a missing key gives nulls
+        ("exec v from l lj `k xkey r", "3 1 0N 0N 29 3"),
+        ("exec v from lw lj `k xkey w", "3 1 0N 0N 29 3"),
+        ("exec v from l lj `k`s xkey r", "3 1 0N 0N 0N 0N"),
+        ("exec v from lw lj `k`s xkey w", "3 1 0N 0N 0N 0N"),
+        ("exec v from l ij `k xkey r", "3 1 29 3"),
+        // an equi-join keeps every match, in the order of the right table
+        ("exec v from ej[`k; l; r]", "3 33 1 31 29 3 33"),
+        ("exec v from ej[`k`s; lw; w]", "3 33 1 31"),
+        // keys of unlike types differ
+        ("exec v from ([] k: 3 1i) lj `k xkey r", "0N 0N"),
+        ("exec v from l lj big", "3 1 35 0N 29 3"),
+        ("(600 # exec v from l lj big) ~ exec v from (600 # l) lj big", "1b"),
+        ("exec v from ([k: 1 2] v: 10 20) uj ([k: 2 3] v: 21 31)", "10 21 31"),
+        ("exec p from aj[`s`t; ([] s: `a`b`a`c; t: 5 5 9 9); ([] s: `a`a`b; t: 1 7 3; p: 10 20 30)]", "10 30 20 0N"),
+    ] {
+        assert_eq!(c.eval(code).unwrap().to_string(), expected, "{code}");
+    }
+}

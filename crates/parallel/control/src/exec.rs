@@ -1,5 +1,6 @@
 //! Running a pushed-down query: move the tables it needs, send the shards their part, put their answers together.
 use crate::catalog::{rekey, unkey};
+use crate::client::ticket;
 use crate::merge::Aggs;
 use crate::plan::{Kind, Move, Push, Rel, DRIVER};
 use crate::Inner;
@@ -97,7 +98,8 @@ fn dict(keys: K, vals: K) -> K {
 impl Inner {
     /// Evaluate the same work on every shard.
     pub(crate) fn all(&self, work: Work) -> KResult<Vec<K>> {
-        self.wait(try_join_all(self.shards.iter().map(|s| s.query(work.clone()))))
+        let ticket = ticket(work)?;
+        self.wait(try_join_all(self.shards.iter().map(|s| s.run(ticket.clone()))))
     }
 
     pub(crate) fn one(&self, shard: usize, e: Expr) -> KResult<K> {

@@ -2,6 +2,7 @@
 //! - `ij` (inner join), `lj` (left join), `uj` (union join), `ej` (equi-join), `pj` (plus join)
 //! - `aj` / `aj0` (as-of join on symbol/entity keys + monotonic time column, binary-searched per entity!)
 //! - `wj` / `wj1` (window join aggregating quote windows `[lo; hi]` per trade row!)
+use crate::engine::ops::{first_rows, group_ids};
 use crate::error::{KError, KResult};
 use crate::sym::{resolve, SymId};
 use crate::types::*;
@@ -9,17 +10,36 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-fn row_hash(cols: &[&ColVec], row: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(cols.len() * 10);
-    for c in cols {
-        out.extend_from_slice(&c.get_atom(row).hash_key());
-    }
-    out
+/// Numbers for the rows of the key columns `left` and of `right` such that equal keys share one. The keys of `right` are
+/// numbered first, from 0 in order of first appearance: a larger number is a key that `right` does not have.
+fn key_ids(left: &[&ColVec], nleft: usize, right: &[&ColVec], nright: usize) -> (Vec<usize>, Vec<usize>) {
+    // numbered as one column: values of unlike types make a general list there, and still differ
+    let both: Vec<ColVec> = right.iter().zip(left).map(|(r, l)| r.concat(l)).collect();
+    let mut right_ids = group_ids(&both, nright + nleft);
+    let left_ids = right_ids.split_off(nright);
+    (left_ids, right_ids)
 }
 
-/// Probe row index in `kt` for each row of `left_key_cols` (`None` on miss), using attribute indexes on 1-key tables when present.
+/// The rows of `right` that have each of its keys, and for every row of `left` the number of its key's list (past the
+/// last list when `right` does not have the key).
+fn key_buckets(left: &[&ColVec], nleft: usize, right: &[&ColVec], nright: usize) -> (Vec<Vec<usize>>, Vec<usize>) {
+    let (probe, keys) = key_ids(left, nleft, right, nright);
+    let mut buckets: Vec<Vec<usize>> = Vec::new();
+    for (r, id) in keys.into_iter().enumerate() {
+        if id == buckets.len() {
+            buckets.push(Vec::new());
+        }
+        buckets[id].push(r);
+    }
+    (buckets, probe)
+}
+
+/// Probe row index in `kt` for each row of `left_key_cols` (`None` on miss).
 fn probe_keyed_table(kt: &KeyedTable, left_key_cols: &[&ColVec], nrows: usize) -> Vec<Option<usize>> {
-    if kt.keys.ncols() == 1 && kt.keys.vals[0].attr() != Attr::None && -kt.keys.vals[0].type_num() == -left_key_cols[0].type_num() {
+    // The index that a key column's attribute gives spares a few probes of a large table from reading every key. A
+    // general list is always looked up that way, as its index may match numbers of unlike types by value.
+    let by_index = |k: &ColVec| nrows.saturating_mul(4) < kt.nrows() || matches!(k, ColVec::General(..));
+    if kt.keys.ncols() == 1 && kt.keys.vals[0].attr() != Attr::None && -kt.keys.vals[0].type_num() == -left_key_cols[0].type_num() && by_index(&kt.keys.vals[0]) {
         let kcol = &kt.keys.vals[0];
         let lcol = left_key_cols[0];
         let klen = kcol.len();
@@ -28,11 +48,9 @@ fn probe_keyed_table(kt: &KeyedTable, left_key_cols: &[&ColVec], nrows: usize) -
             .collect();
     }
     let right_key_cols: Vec<&ColVec> = kt.keys.vals.iter().collect();
-    let mut right_map: HashMap<Vec<u8>, usize> = HashMap::with_capacity(kt.nrows());
-    for r in 0..kt.nrows() {
-        right_map.entry(row_hash(&right_key_cols, r)).or_insert(r);
-    }
-    (0..nrows).map(|r| right_map.get(&row_hash(left_key_cols, r)).copied()).collect()
+    let (probe, keys) = key_ids(left_key_cols, nrows, &right_key_cols, kt.nrows());
+    let first = first_rows(&keys);
+    probe.into_iter().map(|id| first.get(id).copied()).collect()
 }
 
 /// Look up value rows in `kt` for each row of `probe_keys` (returns `kt.vals`-shaped `Flip` with nulls for misses).
@@ -175,19 +193,13 @@ pub fn equi_join(cols_k: &K, lhs: &K, rhs: &K) -> KResult<K> {
         rk.push(&rf.vals[rf.col_idx(c).ok_or_else(|| KError::value(resolve(c)))?]);
     }
 
-    let mut right_buckets: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
-    for r in 0..rf.nrows() {
-        right_buckets.entry(row_hash(&rk, r)).or_default().push(r);
-    }
-
+    let (buckets, probe) = key_buckets(&lk, lf.nrows(), &rk, rf.nrows());
     let mut l_idx = Vec::new();
     let mut r_idx = Vec::new();
-    for r in 0..lf.nrows() {
-        if let Some(matches) = right_buckets.get(&row_hash(&lk, r)) {
-            for &rr in matches {
-                l_idx.push(r);
-                r_idx.push(rr);
-            }
+    for (r, id) in probe.into_iter().enumerate() {
+        for &rr in buckets.get(id).into_iter().flatten() {
+            l_idx.push(r);
+            r_idx.push(rr);
         }
     }
 
@@ -296,13 +308,13 @@ pub fn union_join(lhs: &K, rhs: &K) -> KResult<K> {
             }
             let mut key_rows: Vec<Vec<K>> = Vec::new();
             let mut val_rows: Vec<Vec<K>> = Vec::new();
-            let mut pos_map: HashMap<Vec<u8>, usize> = HashMap::new();
+            let keys: Vec<ColVec> = ka.keys.vals.iter().zip(&kb.keys.vals).map(|(a, b)| a.concat(b)).collect();
+            // the number of each row's key among the rows of both tables, in order of first appearance
+            let mut ids = group_ids(&keys, ka.nrows() + kb.nrows()).into_iter();
 
             for src in [ka.as_ref(), kb.as_ref()] {
-                let kcols: Vec<&ColVec> = src.keys.vals.iter().collect();
-                for r in 0..src.nrows() {
-                    let hk = row_hash(&kcols, r);
-                    if let Some(&idx) = pos_map.get(&hk) {
+                for (r, idx) in (0..src.nrows()).zip(ids.by_ref()) {
+                    if idx < key_rows.len() {
                         for (vi, &vc) in all_vcols.iter().enumerate() {
                             if let Some(sc) = src.vals.col(vc) {
                                 let v = sc.get_atom(r);
@@ -312,8 +324,6 @@ pub fn union_join(lhs: &K, rhs: &K) -> KResult<K> {
                             }
                         }
                     } else {
-                        let idx = key_rows.len();
-                        pos_map.insert(hk, idx);
                         key_rows.push(src.keys.vals.iter().map(|c| c.get_atom(r)).collect());
                         val_rows.push(
                             all_vcols
@@ -394,11 +404,8 @@ pub fn asof_join(cols_k: &K, lhs: &K, rhs: &K, preserve_lhs_time: bool) -> KResu
     let r_time = &rf.vals[rf.col_idx(time_col).ok_or_else(|| KError::value(resolve(time_col)))?];
 
     // Partition RHS row indices by equality key (preserving RHS order; sort each bucket by time if not already sorted)
-    let mut buckets: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
-    for r in 0..rf.nrows() {
-        buckets.entry(row_hash(&r_eq, r)).or_default().push(r);
-    }
-    for rows in buckets.values_mut() {
+    let (mut buckets, probe) = key_buckets(&l_eq, lf.nrows(), &r_eq, rf.nrows());
+    for rows in &mut buckets {
         let sorted = rows.windows(2).all(|w| r_time.get_atom(w[0]).k_cmp(&r_time.get_atom(w[1])) != Ordering::Greater);
         if !sorted {
             rows.sort_by(|&a, &b| r_time.get_atom(a).k_cmp(&r_time.get_atom(b)));
@@ -407,9 +414,9 @@ pub fn asof_join(cols_k: &K, lhs: &K, rhs: &K, preserve_lhs_time: bool) -> KResu
 
     let nrows = lf.nrows();
     let mut matched: Vec<usize> = Vec::with_capacity(nrows);
-    for r in 0..nrows {
+    for (r, &id) in probe.iter().enumerate() {
         let t_probe = l_time.get_atom(r);
-        if let Some(b) = buckets.get(&row_hash(&l_eq, r)) {
+        if let Some(b) = buckets.get(id) {
             // Binary search: last index `m` in `b` where `r_time[b[m]] <= t_probe`
             let mut lo = 0usize;
             let mut hi = b.len();
@@ -557,21 +564,18 @@ pub fn window_join(
     }
     let r_time = &rf.vals[rf.col_idx(time_col).ok_or_else(|| KError::value(resolve(time_col)))?];
 
-    let mut buckets: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
-    for r in 0..rf.nrows() {
-        buckets.entry(row_hash(&r_eq, r)).or_default().push(r);
-    }
-    for rows in buckets.values_mut() {
+    let (mut buckets, probe) = key_buckets(&l_eq, lf.nrows(), &r_eq, rf.nrows());
+    for rows in &mut buckets {
         rows.sort_by(|&a, &b| r_time.get_atom(a).k_cmp(&r_time.get_atom(b)));
     }
 
     let nrows = lf.nrows();
     let mut agg_results: Vec<Vec<K>> = vec![Vec::with_capacity(nrows); aggs.len()];
 
-    for r in 0..nrows {
+    for (r, &id) in probe.iter().enumerate() {
         let lo_t = lo_vec.get_atom(r);
         let hi_t = hi_vec.get_atom(r);
-        let win_rows: Vec<usize> = if let Some(b) = buckets.get(&row_hash(&l_eq, r)) {
+        let win_rows: Vec<usize> = if let Some(b) = buckets.get(id) {
             // First index `s` where `time >= lo_t`
             let mut l0 = 0usize;
             let mut h0 = b.len();
