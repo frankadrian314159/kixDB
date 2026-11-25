@@ -187,26 +187,83 @@ Cluster columns other than "6 proc before" are after the grouping change. Each g
 | Q11 | 136 | 61 | 2.2x | 105 | 85 | 92 | 101 | 90 | 143 | 97 | 1.5x |
 | Q51 | 3 | 1 | 3.0x | 2 | 2 | 2 | 2 | 2 | 4 | 2 | 2.0x |
 
-## What still limits performance
+## Where the time goes
 
-* **Finding the groups** is now most of a simple grouped query: `group` alone on the column with 440,000 distinct
-  values takes 0.31 s.
-* **Aggregates other than `count`, `first` and a long or float `sum`** still copy each group's values.
-* **Other grouped expressions** (lambdas, running verbs such as `sums`, `$[...]`), `update ... by` and `fby` are still
-  evaluated once per group, about 1 µs per group.
-* **TPC-DS is slower on the cluster than on the single node**, so coordination probably costs more than sharding saves
-  there. Where that time goes was not measured. Multi-statement queries, which most are, return intermediate lists to
-  the control node and send them back to the shards. Rollups (DS Q22, Q27, Q36) gather derived tables to union them.
-* **TPC-H Q22** is slower on the cluster than on the single node: `` `$2#'c_phone `` is not pushed down, so `customer`
-  is gathered.
-* **Joins still build a byte key per row** ([joins.rs](../src/engine/joins.rs)), and temporal fields (`.year`) and date
-  arithmetic still make a value per row. Their share of query time was not measured.
+Profile of the grouping change's build, 2026-11-25: temporary timers in a copy of the source, each benchmark run once,
+the cluster as six shards in one process. The timers added little (TPC-H 1.67 s with them, 1.62 s without). Shares are
+of query time.
+
+### Single node
+
+| Work | TPC-H (1.68 s) | TPC-DS (0.59 s) |
+| --- | ---: | ---: |
+| `in` | 29% | 33% |
+| Finding groups | 22% | 20% |
+| Other `where` work (comparisons, `like`, copying kept rows) | 18% | 5% |
+| Aggregating, group by group or all at once | 10% | 12% |
+| Joins | 9% | 13% |
+| Everything else | 12% | 17% |
+
+**Joins are not the main cost.** They matter in single queries: 134 of 355 ms in H Q9, 31 of 110 ms in DS Q87. `in`
+runs on tens of millions of rows at about 15 ns each. It is 118 of 172 ms in H Q21. Finding groups is 134 of 220 ms in
+H Q18.
+
+One timing of each operation on 1,800,000 rows:
+
+| Operation | ns per row |
+| --- | ---: |
+| `lj` to a 450,000-row result of `by` (binary search), keys at random / in order | 279 / 82 |
+| `lj` to a 450,000-row `xkey` table (hash), keys at random / in order | 406 / 226 |
+| `lj` to a 25-row table: result of `by` / `xkey` | 32 / 110 |
+| `lj` on two key columns, 1,800,000-row table | 889 |
+| long `in` 10 / 100,000 longs | 14 / 25 |
+| long `<` long, for scale | 1 |
+
+Hash joins build a byte key in memory for every row ([joins.rs](../src/engine/joins.rs)), likely why the table made by
+`xkey` is slower than the sorted one made by `by`.
+
+### Cluster
+
+| Time (ms) | TPC-H | TPC-DS |
+| --- | ---: | ---: |
+| Single node, same run | 1715 | 572 |
+| **Cluster** | **1459** | **674** |
+| Slowest shard of each request: decoding it, running it, packing the result | 683 | 167 |
+| Rest of each request: transport and unpacking; all of a load or a shuffle | 262 | 172 |
+| Control node: merging shard results | 222 | 117 |
+| Control node: running query parts itself (joins, grouping, `distinct`) | 231 | 173 |
+| Control node: parsing, planning, redistributing assigned tables | 13 | 28 |
+| Not timed | 49 | 17 |
+
+On TPC-DS the shards do their part in under a third of the single node's time, but the control node then spends more
+than that working alone.
+
+* **A request costs 0.2 to 0.3 ms** before any real work: one row of a replicated table takes 0.21 ms, against
+  0.004 ms locally. TPC-DS makes 158 requests (each to one or all shards), so this is about 5 to 7% of its time. Across
+  the suite, short queries lose far more to the other costs here.
+* **The two-phase merge is slow with many groups**, about 1.3 us per group: `sum ... by` with 95,000 groups takes 146 ms
+  on six shards, 123 ms of it merging, against 40 ms on the single node ([exec.rs](../crates/parallel/control/src/exec.rs)).
+  It builds a byte key per partial row and combines each group's values one group at a time.
+* **Merging by key** takes 102 ms of TPC-H. It sorts by comparing atom by atom; the sort's share of the merge was not
+  separated.
+* **Assigned tables travel twice.** A table assigned to a variable in a multi-statement query is sent to the shards, and
+  later statements fetch it back. In DS Q22 this takes 36 of 61 ms.
+* **The control node packs and unpacks one shard at a time.** It encodes the same request once per shard (49 ms of
+  TPC-H) and converts the replies one after another (61 ms on TPC-H, 56 ms on TPC-DS).
+* **TPC-H Q22** takes 115 ms against 51 ms on the single node: `` `$2#'c_phone `` is not pushed down, so `customer` is
+  gathered.
 
 ## Recommended next steps
 
-1. Profile the slowest single-node queries left (H Q9, Q18, Q1 and Q21; DS Q38 and Q87), starting with the joins.
-2. Measure where the cluster spends its time on short queries.
-3. Measure durable and replicated shards and concurrent clients.
+Ordered by the time each one touches. None of the gains has been measured.
+
+1. Make `in`, grouping and `distinct` cheaper: they use the standard library's hasher, and `in` could use a bitmap for
+   integers in a narrow range. They are over half of single-node time, but the profile does not separate hashing from
+   memory access.
+2. Merge two-phase and by-key results with the typed grouping and sorting the engine already has.
+3. Give joins the typed keys that grouping uses.
+4. Encode each request once, and convert replies in parallel.
+5. Keep intermediate tables on the control node. This changes where assigned tables live, so it needs a design decision.
 
 ## Not measured
 
