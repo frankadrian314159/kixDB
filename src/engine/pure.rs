@@ -9,7 +9,7 @@ use crate::sym::{intern, resolve, SymId};
 use crate::types::{Func, K};
 
 /// Verbs that write, reach outside the engine, or run code that is only known when they run.
-const EFFECTS: [&str; 17] = ["insert", "upsert", "set", " set", "system", "value", "get", "eval", "reval", "parse", "hopen", "hclose", "show", "exit", "0:", "1:", "2:"];
+const EFFECTS: [&str; 18] = ["setenv", "insert", "upsert", "set", " set", "system", "value", "get", "eval", "reval", "parse", "hopen", "hclose", "show", "exit", "0:", "1:", "2:"];
 
 struct Reader<'a> {
     ws: &'a Workspace,

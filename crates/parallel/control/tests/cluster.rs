@@ -266,6 +266,29 @@ fn writes_change_the_cluster_as_they_change_one_engine() {
 }
 
 #[test]
+fn tables_named_by_symbols_are_changed_on_the_shards() {
+    let mut p = market(3);
+    for statement in [
+        "`price xasc `trade",
+        "select from trade",
+        "`sym xkey `inst",
+        "inst",
+        "bump: {[t] update size: size + 1 from t}",
+        "bump `trade",
+        "exec sum size from trade",
+        "`time xasc `trade",
+        "trade",
+        "quote: 0#quote",
+        "`quote insert ([] time: 2#09:30:00.000; sym: `IBM`AMD; bid: 1 2f; ask: 3 4f)",
+        "trade,: `time`sym`price`size`ex`trader!(09:45:00.000; `IBM; 1.5; 3; `N; `ann)",
+        "select from trade where sym = `IBM",
+        "quote",
+    ] {
+        p.check(statement);
+    }
+}
+
+#[test]
 fn distribution_modes_and_namespaces() {
     let mut p = market(3);
     p.session.eval("DISTRIBUTE trade PARTITIONED BY time").unwrap();

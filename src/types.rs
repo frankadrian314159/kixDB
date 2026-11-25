@@ -601,6 +601,14 @@ impl ColVec {
     /// Index by signed integer (out of bounds yields typed null, as in kdb+ `v[999]`).
     pub fn get_signed(&self, idx: i64) -> K {
         if idx < 0 || (idx as usize) >= self.len() {
+            // past the end of a list of mixed values: a null like its first item
+            if let ColVec::General(_, items) = self {
+                return match items.first() {
+                    Some(K::Vector(v)) => K::Vector(v.take(0)),
+                    Some(atom) => ColVec::from_atoms(vec![atom.clone()]).null_atom(),
+                    None => self.null_atom(),
+                };
+            }
             self.null_atom()
         } else {
             self.get_atom(idx as usize)
@@ -615,7 +623,11 @@ impl ColVec {
             }};
         }
         match self {
-            ColVec::General(_, v) => pick!(General, v, K::Null),
+            // (a missing item of a list of lists is an empty list like its first)
+            ColVec::General(_, v) => pick!(General, v, match v.first() {
+                Some(K::Vector(first)) => K::Vector(first.take(0)),
+                _ => K::Null,
+            }),
             ColVec::Bool(_, v) => pick!(Bool, v, false),
             ColVec::Guid(_, v) => pick!(Guid, v, NULL_GUID),
             ColVec::Byte(_, v) => pick!(Byte, v, 0),
@@ -652,7 +664,11 @@ impl ColVec {
             }};
         }
         match self {
-            ColVec::General(_, v) => pick!(General, v, K::Null),
+            // (a missing item of a list of lists is an empty list like its first)
+            ColVec::General(_, v) => pick!(General, v, match v.first() {
+                Some(K::Vector(first)) => K::Vector(first.take(0)),
+                _ => K::Null,
+            }),
             ColVec::Bool(_, v) => pick!(Bool, v, false),
             ColVec::Guid(_, v) => pick!(Guid, v, NULL_GUID),
             ColVec::Byte(_, v) => pick!(Byte, v, 0),

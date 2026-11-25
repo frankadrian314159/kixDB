@@ -18,6 +18,8 @@ pub enum Tok {
     Lit(K),
     Ident(String),
     Op(String),
+    /// The `.` of `value.field`, written without spaces.
+    Field,
     Adverb(AdverbKind),
     Colon,       // :
     DoubleColon, // ::
@@ -161,9 +163,9 @@ pub fn tokenize(src: &str) -> KResult<Vec<Tok>> {
         }
 
         // Numeric / temporal / boolean / byte literal (or space-separated vector of them!)
+        let number_at = |j: usize| j < len && (bytes[j].is_ascii_digit() || (bytes[j] == b'.' && j + 1 < len && bytes[j + 1].is_ascii_digit()));
         let neg_num_ok = b == b'-'
-            && i + 1 < len
-            && bytes[i + 1].is_ascii_digit()
+            && number_at(i + 1)
             && (after_ws || prev != PrevKind::Value);
         let point_ok = b == b'.' && i + 1 < len && bytes[i + 1].is_ascii_digit() && (after_ws || prev != PrevKind::Value);
         if b.is_ascii_digit() || neg_num_ok || point_ok {
@@ -332,7 +334,7 @@ pub fn tokenize(src: &str) -> KResult<Vec<Tok>> {
         // Dot field access `.field` immediately after a value (`time.minute`, `t.price`) vs `.` apply operator
         if b == b'.' {
             if !after_ws && prev == PrevKind::Value && i + 1 < len && bytes[i + 1].is_ascii_alphabetic() {
-                out.push(Tok::Op(".".into()));
+                out.push(Tok::Field);
                 i += 1;
                 after_ws = false;
                 prev = PrevKind::Other;
@@ -602,7 +604,8 @@ fn lex_numeric_sequence(src: &str, start: usize) -> KResult<(K, usize)> {
         // Next item is part of the vector if it starts with a digit, OR `-` immediately followed by a digit!
         let next_b = bytes[ws];
         let digit_after = ws + 1 < len && bytes[ws + 1].is_ascii_digit();
-        let starts_num = next_b.is_ascii_digit() || (matches!(next_b, b'-' | b'.') && digit_after);
+        let negative_point = next_b == b'-' && ws + 2 < len && bytes[ws + 1] == b'.' && bytes[ws + 2].is_ascii_digit();
+        let starts_num = next_b.is_ascii_digit() || (matches!(next_b, b'-' | b'.') && digit_after) || negative_point;
         if !starts_num {
             break;
         }

@@ -9,6 +9,8 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::ops::Range;
+use crate::engine::{builtins, rows};
+use crate::engine::rows::Set as SetOp;
 use crate::engine::par;
 use crate::temporal;
 use std::sync::Arc;
@@ -227,6 +229,9 @@ fn md5_op(x: &K) -> KResult<K> {
 // ----- Unary Primitives -----------------------------------------------------
 
 pub fn eval_unary_prim(op: &str, x: &K) -> KResult<K> {
+    if let Some(result) = builtins::unary(op, x) {
+        return result;
+    }
     match op {
         "-" | "neg" => unary_num(x, &|i| if i == NULL_LONG { NULL_LONG } else { i.wrapping_neg() }, &|f| -f),
         "~" | "not" => unary_not(x),
@@ -377,7 +382,27 @@ fn unary_not(x: &K) -> KResult<K> {
     }
 }
 
+/// `f` of every column of a table, or of the values of a dictionary.
+fn over_parts(x: &K, f: &dyn Fn(&K) -> KResult<K>) -> Option<KResult<K>> {
+    let columns = |t: &Flip| -> KResult<Flip> {
+        let column = |c: &ColVec| match f(&K::Vector(c.clone()))? {
+            K::Vector(v) => Ok(v),
+            _ => Err(KError::ty("each column must stay a column")),
+        };
+        Flip::new(t.cols.clone(), t.vals.iter().map(column).collect::<KResult<_>>()?)
+    };
+    Some(match x {
+        K::Dict(d) => f(&d.vals).map(|v| K::Dict(Arc::new(Dict { keys: d.keys.clone(), vals: Box::new(v) }))),
+        K::Table(t) => columns(t).map(|t| K::Table(Arc::new(t))),
+        K::KeyedTable(t) => columns(&t.vals).map(|vals| K::KeyedTable(Arc::new(KeyedTable { keys: t.keys.clone(), vals }))),
+        _ => return None,
+    })
+}
+
 fn unary_null(x: &K) -> KResult<K> {
+    if let Some(parts) = over_parts(x, &unary_null) {
+        return parts;
+    }
     if let K::Vector(cv) = x {
         let flags: Vec<bool> = (0..cv.len()).map(|i| cv.get_atom(i).is_null()).collect();
         Ok(K::Vector(ColVec::Bool(Attr::None, Arc::new(flags))))
@@ -509,6 +534,13 @@ pub fn til_op(n: i64) -> KResult<K> {
 }
 
 fn key_op(x: &K) -> KResult<K> {
+    match x {
+        K::Long(n) => return til_op(*n),
+        K::Int(n) => return til_op(i64::from(*n)),
+        // the type of a simple list
+        K::Vector(v) if !matches!(v, ColVec::General(..)) => return Ok(K::Sym(intern(v.type_name()))),
+        _ => {}
+    }
     match x {
         K::Dict(d) => Ok((*d.keys).clone()),
         K::KeyedTable(kt) => Ok(K::Table(Arc::new(kt.keys.clone()))),
@@ -909,7 +941,9 @@ pub fn raze_op(x: &K) -> KResult<K> {
 }
 
 fn string_op(x: &K) -> KResult<K> {
-    if x.is_atom() {
+    if let Some(parts) = over_parts(x, &string_op) {
+        parts
+    } else if x.is_atom() {
         let s = x.cell_text();
         Ok(K::string(&s))
     } else if let K::Vector(ColVec::Char(_, _)) = x {
@@ -995,6 +1029,9 @@ pub fn sum_op(x: &K) -> KResult<K> {
 }
 
 fn prd_op(x: &K) -> KResult<K> {
+    if let K::Vector(ColVec::General(_, items)) = x {
+        return items.iter().try_fold(K::Long(1), |a, b| arith_op(&a, b, ArithOp::Mul));
+    }
     if x.is_atom() {
         return Ok(x.clone());
     }
@@ -1011,6 +1048,15 @@ fn prd_op(x: &K) -> KResult<K> {
 }
 
 pub fn minmax_op(x: &K, is_min: bool) -> KResult<K> {
+    match x {
+        K::Dict(d) => return minmax_op(&d.vals, is_min),
+        K::Table(t) => {
+            let best: KResult<Vec<K>> = t.vals.iter().map(|c| minmax_op(&K::Vector(c.clone()), is_min)).collect();
+            let keys = Box::new(K::Vector(ColVec::Sym(Attr::None, Arc::new(t.cols.clone()))));
+            return Ok(K::Dict(Arc::new(Dict { keys, vals: Box::new(K::Vector(ColVec::from_atoms(best?))) })));
+        }
+        _ => {}
+    }
     if x.is_atom() {
         return Ok(x.clone());
     }
@@ -1052,6 +1098,9 @@ pub fn minmax_op(x: &K, is_min: bool) -> KResult<K> {
 }
 
 pub fn avg_op(x: &K) -> KResult<K> {
+    if matches!(x, K::Vector(ColVec::General(..))) {
+        return float_arith_op(&sum_op(x)?, &K::Long(x.count() as i64), |a, b| a / b);
+    }
     if x.is_atom() {
         return Ok(K::Float(x.as_f64()?));
     }
@@ -1274,7 +1323,17 @@ pub fn meta_op(x: &K) -> KResult<K> {
     let mut f_syms = Vec::with_capacity(all_cols.len());
     let mut a_syms = Vec::with_capacity(all_cols.len());
     for cv in &all_vals {
-        t_chars.push(cv.meta_type_char() as u8);
+        // a column of lists of one type shows it in upper case
+        let nested = match cv {
+            ColVec::General(_, items) => match items.first() {
+                Some(K::Vector(v)) if !matches!(v, ColVec::General(..)) && items.iter().all(|i| i.type_num() == v.type_num()) => {
+                    Some(v.meta_type_char().to_ascii_uppercase())
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        t_chars.push(nested.unwrap_or_else(|| cv.meta_type_char()) as u8);
         f_syms.push(SymId::EMPTY);
         a_syms.push(cv.attr().char().map(|c| intern(&c.to_string())).unwrap_or(SymId::EMPTY));
     }
@@ -1341,6 +1400,18 @@ fn ungroup_op(x: &K) -> KResult<K> {
 // ----- Binary Primitives ----------------------------------------------------
 
 pub fn eval_binary_prim(op: &str, lhs: &K, rhs: &K) -> KResult<K> {
+    if let Some(result) = builtins::binary(op, lhs, rhs) {
+        return result;
+    }
+    let special = match op {
+        "#" => rows::take_or_drop(lhs, rhs, true),
+        "_" => rows::take_or_drop(lhs, rhs, false).or_else(|| rows::delete(lhs, rhs)),
+        "?" => rows::find(lhs, rhs),
+        _ => None,
+    };
+    if let Some(result) = special {
+        return result;
+    }
     if let (K::Dict(a), K::Dict(b)) = (lhs, rhs) {
         if a.keys != b.keys && ITEMWISE.contains(&op) {
             return dict_op(op, a, b);
@@ -1365,6 +1436,7 @@ pub fn eval_binary_prim(op: &str, lhs: &K, rhs: &K) -> KResult<K> {
         ">" => cmp_op(lhs, rhs, CmpKind::Gt),
         ">=" => cmp_op(lhs, rhs, CmpKind::Ge),
         "~" => Ok(K::Bool(lhs == rhs)),
+        ":" => Ok(rhs.clone()),
         "," => concat_k(lhs, rhs),
         "!" => bang_op(lhs, rhs),
         "#" => take_or_attr_op(lhs, rhs),
@@ -1664,6 +1736,20 @@ fn close(x: f64, y: f64) -> bool {
 
 fn fill_op(lhs: &K, rhs: &K) -> KResult<K> {
     // `lhs ^ rhs`: replace nulls in `rhs` with `lhs`!
+    let filled = |t: &Flip| -> KResult<Flip> {
+        let column = |c: &ColVec| match fill_op(lhs, &K::Vector(c.clone()))? {
+            K::Vector(v) => Ok(v),
+            _ => Err(KError::ty("cannot fill a table with this")),
+        };
+        Flip::new(t.cols.clone(), t.vals.iter().map(column).collect::<KResult<_>>()?)
+    };
+    match (lhs, rhs) {
+        (fill, K::Table(t)) if fill.is_atom() => return Ok(K::Table(Arc::new(filled(t)?))),
+        (fill, K::KeyedTable(t)) if fill.is_atom() => return Ok(K::KeyedTable(Arc::new(KeyedTable { keys: t.keys.clone(), vals: filled(&t.vals)? }))),
+        // (an upsert, in which nulls leave values as they are)
+        (K::KeyedTable(_), K::KeyedTable(_)) => return crate::engine::joins::union_join(lhs, rhs),
+        _ => {}
+    }
     broadcast_atoms(lhs, rhs, |fill_val, v| {
         if v.is_null() {
             Ok(fill_val.clone())
@@ -1884,11 +1970,12 @@ pub fn concat_k(lhs: &K, rhs: &K) -> KResult<K> {
         (K::Vector(a), b) if b.is_atom() => Ok(K::Vector(a.concat(&ColVec::from_atoms(vec![b.clone()])))),
         (a, K::Vector(b)) if a.is_atom() => Ok(K::Vector(ColVec::from_atoms(vec![a.clone()]).concat(b))),
         (a, b) if a.is_atom() && b.is_atom() => Ok(K::Vector(ColVec::from_atoms(vec![a.clone(), b.clone()]))),
-        (K::Table(ta), K::Table(tb)) => Ok(K::Table(Arc::new(ta.concat(tb)?))),
+        (K::Table(ta), K::Table(tb)) if ta.cols == tb.cols => Ok(K::Table(Arc::new(rows::append(ta, tb)?))),
+        (K::Table(_), K::Table(_)) => Err(KError::new("mismatch", "table columns do not match")),
         (K::Table(ta), K::Dict(d)) => {
             let one = enlist_op(&K::Dict(d.clone()));
             if let K::Table(tb) = one {
-                Ok(K::Table(Arc::new(ta.concat(&tb)?)))
+                Ok(K::Table(Arc::new(rows::append(ta, &tb)?)))
             } else {
                 Err(KError::ty("cannot append non-row dictionary to table"))
             }
@@ -2170,6 +2257,12 @@ fn cut_op(lhs: &K, rhs: &K) -> KResult<K> {
 // ----- Cast / Parse / Pad (`$`) ---------------------------------------------
 
 pub fn cast_op(lhs: &K, rhs: &K) -> KResult<K> {
+    // a type by its number: `7h$x`
+    if let K::Short(n) = lhs {
+        let letter = "bg?xhijefcspmdznuvt".chars().nth((*n as usize).wrapping_sub(1)).filter(|&c| c != '?');
+        let name = letter.and_then(type_name_from_char).ok_or_else(|| KError::domain(format!("no type {n}h")))?;
+        return cast_by_name(name, rhs);
+    }
     // 1. Padding `width $ string` (`10$"abc"`, `-10$"abc"`)
     if let Ok(width) = lhs.as_i64() {
         let s = rhs.as_str().unwrap_or_else(|| rhs.cell_text());
@@ -2184,6 +2277,21 @@ pub fn cast_op(lhs: &K, rhs: &K) -> KResult<K> {
         return Ok(K::string(&padded));
     }
 
+    // several types at once: `"ijf"$98.6`
+    let types = match lhs {
+        K::Vector(ColVec::Char(_, cs)) => Some(cs.iter().map(|&c| K::Char(c)).collect::<Vec<_>>()),
+        K::Vector(ColVec::Sym(_, ss)) => Some(ss.iter().map(|&s| K::Sym(s)).collect()),
+        _ => None,
+    };
+    if let Some(types) = types {
+        let each = matches!(rhs, K::Vector(v) if v.len() == types.len());
+        let item = |i: usize| match rhs {
+            K::Vector(v) if each => v.get_atom(i),
+            all => all.clone(),
+        };
+        let cast: KResult<Vec<K>> = types.iter().enumerate().map(|(i, t)| cast_op(t, &item(i))).collect();
+        return Ok(K::Vector(ColVec::from_atoms(cast?)));
+    }
     // 2. Symbol cast `` `int$x ``, `` `float$() ``, `` `$("a";"b") ``, `` `year$date ``
     if let K::Sym(tsym) = lhs {
         let tname = resolve(*tsym);
@@ -2237,6 +2345,11 @@ fn type_name_from_char(c: char) -> Option<&'static str> {
 }
 
 fn cast_by_name(tname: &str, rhs: &K) -> KResult<K> {
+    if let K::Vector(ColVec::General(_, items)) = rhs {
+        if !items.is_empty() && !matches!(tname, "" | "symbol") && items.iter().any(|i| matches!(i, K::Vector(v) if !matches!(v, ColVec::Char(..)))) {
+            return Ok(K::Vector(ColVec::from_atoms(items.iter().map(|i| cast_by_name(tname, i)).collect::<KResult<_>>()?)));
+        }
+    }
     // Empty general list `()` cast to typed empty vector: `` `float$() ``, `` `symbol$() ``!
     if let K::Vector(ColVec::General(_, xs)) = rhs {
         if xs.is_empty() {
@@ -2270,13 +2383,13 @@ fn cast_by_name(tname: &str, rhs: &K) -> KResult<K> {
         return match rhs {
             K::Sym(_) => Ok(rhs.clone()),
             K::Char(c) => Ok(K::Sym(intern(&(*c as char).to_string()))),
-            K::Vector(ColVec::Char(_, bs)) => Ok(K::Sym(intern(&String::from_utf8_lossy(bs)))),
+            K::Vector(ColVec::Char(_, bs)) => Ok(K::Sym(intern(String::from_utf8_lossy(bs).trim()))),
             K::Vector(ColVec::Sym(_, _)) => Ok(rhs.clone()),
             K::Vector(ColVec::General(_, xs)) => {
                 let mut syms = Vec::with_capacity(xs.len());
                 for x in xs.iter() {
                     let s = x.as_str().ok_or_else(|| KError::ty("`$ expects string"))?;
-                    syms.push(intern(&s));
+                    syms.push(intern(s.trim()));
                 }
                 Ok(K::Vector(ColVec::Sym(Attr::None, Arc::new(syms))))
             }
@@ -2296,19 +2409,28 @@ fn cast_by_name(tname: &str, rhs: &K) -> KResult<K> {
 
 fn cast_atom_by_name(tname: &str, v: &K) -> KResult<K> {
     Ok(match tname {
-        "boolean" | "bool" => K::Bool(v.as_i64().map(|n| n != 0 && n != NULL_LONG).unwrap_or(false)),
+        "boolean" | "bool" => K::Bool(match v {
+            K::Char(c) => *c != 0,
+            other => other.as_f64().is_ok_and(|n| n != 0.0 && !n.is_nan()),
+        }),
         "byte" => K::Byte(v.as_i64()? as u8),
         "short" => {
             let n = v.as_f64()?;
-            K::Short(if n.is_nan() { NULL_SHORT } else { n as i16 })
+            K::Short(if n.is_nan() { NULL_SHORT } else { n.round() as i16 })
         }
         "int" => {
             let n = v.as_f64()?;
-            K::Int(if n.is_nan() { NULL_INT } else { n as i32 })
+            K::Int(if n.is_nan() { NULL_INT } else { n.round() as i32 })
         }
         "long" => {
+            if let K::Char(c) = v {
+                return Ok(K::Long(i64::from(*c)));
+            }
+            if let Ok(n) = v.as_i64() {
+                return Ok(K::Long(n));
+            }
             let n = v.as_f64()?;
-            K::Long(if n.is_nan() { NULL_LONG } else { n as i64 })
+            K::Long(if n.is_nan() { NULL_LONG } else { n.round() as i64 })
         }
         "real" => K::Real(v.as_f64()? as f32),
         "datetime" if temporal::nanos(v).is_some() => temporal::convert(v, 15),
@@ -2319,7 +2441,9 @@ fn cast_atom_by_name(tname: &str, v: &K) -> KResult<K> {
             n => K::Char(n.as_i64()? as u8),
         },
         "date" => {
-            if let K::Timestamp(ns) = v {
+            if let (K::Month(_), Some(ns)) = (v, temporal::nanos(v)) {
+                K::Date(ns.div_euclid(NANOS_PER_DAY) as i32)
+            } else if let K::Timestamp(ns) = v {
                 K::Date(if *ns == NULL_LONG { NULL_INT } else { ns.div_euclid(NANOS_PER_DAY) as i32 })
             } else {
                 let n = v.as_i64()?;
@@ -2381,16 +2505,20 @@ pub fn parse_atom_from_str(type_ch: char, s: &str) -> K {
         'c' => K::Char(s.as_bytes().first().copied().unwrap_or(b' ')),
         's' => K::Sym(intern(t)),
         'd' => {
-            let norm = t.replace('-', ".");
-            let parts: Vec<&str> = norm.split('.').collect();
-            if parts.len() == 3 {
-                if let (Ok(y), Ok(m), Ok(d)) = (parts[0].parse(), parts[1].parse(), parts[2].parse()) {
-                    if let Some(days) = date_from_ymd(y, m, d) {
-                        return K::Date(days);
-                    }
-                }
+            let norm = t.replace(['-', '/'], ".");
+            let mut parts: Vec<&str> = norm.split('.').collect();
+            if t.len() == 8 && t.bytes().all(|b| b.is_ascii_digit()) {
+                parts = vec![&t[..4], &t[4..6], &t[6..]];
             }
-            K::Date(NULL_INT)
+            // a year written last follows the month and the day
+            if parts.len() == 3 && parts[2].len() == 4 {
+                parts.rotate_right(1);
+            }
+            let date = match parts.as_slice() {
+                [y, m, d] => y.parse().ok().zip(m.parse().ok()).zip(d.parse().ok()).and_then(|((y, m), d)| date_from_ymd(y, m, d)),
+                _ => None,
+            };
+            K::Date(date.unwrap_or(NULL_INT))
         }
         'm' => {
             let norm = t.trim_end_matches('m').replace('-', ".");
@@ -2689,7 +2817,15 @@ fn ss_op(lhs: &K, rhs: &K) -> KResult<K> {
     if needle.is_empty() {
         return Ok(K::Vector(ColVec::Long(Attr::None, Arc::new(vec![]))));
     }
-    let idx: Vec<i64> = hay.match_indices(&needle).map(|(i, _)| i as i64).collect();
+    let idx: Vec<i64> = match needle.contains(['?', '[']) {
+        // (`?` and `[...]` stand for one character, as in `like`)
+        true => {
+            let pattern = compile_kdb_like(&needle)?;
+            let one = Regex::new(pattern.as_str().trim_start_matches('^').trim_end_matches('$')).map_err(|e| KError::domain(e.to_string()))?;
+            one.find_iter(&hay).map(|m| m.start() as i64).collect()
+        }
+        false => hay.match_indices(&needle).map(|(i, _)| i as i64).collect(),
+    };
     Ok(K::Vector(ColVec::Long(Attr::None, Arc::new(idx))))
 }
 
@@ -2759,9 +2895,18 @@ fn vs_op(lhs: &K, rhs: &K) -> KResult<K> {
 
 fn sv_op(lhs: &K, rhs: &K) -> KResult<K> {
     if let (K::Sym(sep), K::Vector(ColVec::Sym(_, syms))) = (lhs, rhs) {
-        let d = if sep.is_null() { "." } else { &resolve(*sep) };
         let joined: Vec<String> = syms.iter().map(|&s| resolve(s)).collect();
+        // symbols that start with a path are joined into a path
+        let path = joined.first().is_some_and(|s| s.starts_with(':'));
+        let d = if !sep.is_null() { &resolve(*sep) } else if path { "/" } else { "." };
         return Ok(K::Sym(intern(&joined.join(d))));
+    }
+    // lines of text, each ended
+    if let (K::Sym(sep), K::Vector(ColVec::General(_, lines))) = (lhs, rhs) {
+        if sep.is_null() {
+            let text: Option<Vec<String>> = lines.iter().map(|l| l.as_str().map(|s| s + "\n")).collect();
+            return text.map(|t| K::string(&t.concat())).ok_or_else(|| KError::ty("` sv joins strings"));
+        }
     }
     // a number from its bytes, its bits, or its digits in a base or a list of bases
     match (lhs, rhs) {
@@ -2810,6 +2955,12 @@ fn sv_op(lhs: &K, rhs: &K) -> KResult<K> {
 // ----- Time Bucketing (`xbar`), Moving Windows, Weighted Aggs ---------------
 
 fn xbar_op(lhs: &K, rhs: &K) -> KResult<K> {
+    if let K::Float(k) = *lhs {
+        if k <= 0.0 {
+            return Err(KError::domain("xbar interval must be positive"));
+        }
+        return float_arith_op(lhs, rhs, |k, v| k * (v / k).floor());
+    }
     let k = lhs.as_i64()?;
     if k <= 0 {
         return Err(KError::domain("xbar interval must be positive"));
@@ -2973,6 +3124,10 @@ fn ema_op(lhs: &K, rhs: &K) -> KResult<K> {
 }
 
 fn weighted_op(lhs: &K, rhs: &K, divide_by_weights: bool) -> KResult<K> {
+    if [lhs, rhs].iter().any(|x| matches!(x, K::Vector(ColVec::General(..)))) {
+        let sum = sum_op(&arith_op(lhs, rhs, ArithOp::Mul)?)?;
+        return if divide_by_weights { float_arith_op(&sum, &sum_op(lhs)?, |a, b| a / b) } else { Ok(sum) };
+    }
     if lhs.is_atom() && rhs.is_atom() {
         let w = lhs.as_f64()?;
         let x = rhs.as_f64()?;
@@ -3119,12 +3274,15 @@ pub fn table_sort_op(lhs: &K, rhs: &K, desc: bool) -> KResult<K> {
 }
 
 pub fn xkey_op(lhs: &K, rhs: &K) -> KResult<K> {
-    let key_cols = extract_sym_list(lhs)?;
     let flip = match rhs {
         K::Table(t) => (**t).clone(),
         K::KeyedTable(kt) => kt.unkey(),
         _ => return Err(KError::ty("xkey RHS must be a table")),
     };
+    if matches!(lhs, K::Vector(v) if v.is_empty()) {
+        return Ok(K::Table(Arc::new(flip)));
+    }
+    let key_cols = extract_sym_list(lhs)?;
     KeyedTable::from_flip_key_names(&flip, &key_cols)
 }
 
@@ -3215,16 +3373,16 @@ fn xgroup_op(lhs: &K, rhs: &K) -> KResult<K> {
     Ok(K::KeyedTable(Arc::new(KeyedTable { keys: keys_flip, vals: vals_flip })))
 }
 
-#[derive(Clone, Copy)]
-enum SetOp {
-    Inter,
-    Union,
-    Except,
-}
-
 fn set_op(lhs: &K, rhs: &K, kind: SetOp) -> KResult<K> {
-    let a = if lhs.is_atom() { enlist_op(lhs) } else { lhs.clone() };
-    let b = if rhs.is_atom() { enlist_op(rhs) } else { rhs.clone() };
+    if let (K::Table(a), K::Table(b)) = (lhs, rhs) {
+        return rows::set(a, b, kind);
+    }
+    let list = |x: &K| match x {
+        K::Dict(d) => (*d.vals).clone(),
+        atom if atom.is_atom() => enlist_op(atom),
+        other => other.clone(),
+    };
+    let (a, b) = (list(lhs), list(rhs));
     let (K::Vector(va), K::Vector(vb)) = (&a, &b) else {
         return Err(KError::ty("inter/union/except expects vectors"));
     };
@@ -3232,14 +3390,7 @@ fn set_op(lhs: &K, rhs: &K, kind: SetOp) -> KResult<K> {
         SetOp::Union => distinct_op(&K::Vector(va.concat(vb))),
         SetOp::Inter => {
             let bset: HashSet<Vec<u8>> = (0..vb.len()).map(|i| vb.get_atom(i).hash_key()).collect();
-            let mut seen = HashSet::new();
-            let mut keep = Vec::new();
-            for i in 0..va.len() {
-                let hk = va.get_atom(i).hash_key();
-                if bset.contains(&hk) && seen.insert(hk) {
-                    keep.push(i);
-                }
-            }
+            let keep: Vec<usize> = (0..va.len()).filter(|&i| bset.contains(&va.get_atom(i).hash_key())).collect();
             Ok(K::Vector(va.gather(&keep)))
         }
         SetOp::Except => {
@@ -3342,6 +3493,7 @@ pub fn index_k(target: &K, args: &[Option<K>]) -> KResult<K> {
         K::Vector(cv) => match first {
             None | Some(K::Null) => K::Vector(cv.clone()),
             Some(idx_k) if idx_k.is_atom() => cv.get_signed(idx_k.as_i64()?),
+            Some(K::Dict(d)) => K::Dict(Arc::new(Dict { keys: d.keys.clone(), vals: Box::new(index_k(target, &[Some((*d.vals).clone())])?) })),
             Some(K::Vector(ColVec::General(_, parts))) => {
                 let items: KResult<Vec<K>> = parts.iter().map(|p| index_k(target, &[Some(p.clone())])).collect();
                 K::Vector(ColVec::from_atoms(items?))
@@ -3362,6 +3514,10 @@ pub fn index_k(target: &K, args: &[Option<K>]) -> KResult<K> {
                 match first {
                     None | Some(K::Null) => K::Table(t.clone()),
                     Some(K::Sym(col)) => t.col(*col).cloned().map(K::Vector).ok_or_else(|| KError::value(resolve(*col)))?,
+                    Some(K::Vector(ColVec::Sym(_, cols))) => {
+                        let column = |&c| t.col(c).cloned().map(K::Vector).ok_or_else(|| KError::value(resolve(c)));
+                        K::Vector(ColVec::from_atoms(cols.iter().map(column).collect::<KResult<_>>()?))
+                    }
                     Some(row_k) if row_k.is_atom() => {
                         let r = row_k.as_i64()?;
                         if r < 0 || (r as usize) >= t.nrows() {
@@ -3385,7 +3541,10 @@ pub fn index_k(target: &K, args: &[Option<K>]) -> KResult<K> {
                         let r = rk.as_i64()?;
                         let idx = if r >= 0 && (r as usize) < t.nrows() { r as usize } else { usize::MAX };
                         let row_d = K::Dict(Arc::new(t.gather(&[idx]).row_dict(0)));
-                        return index_k(&row_d, rest);
+                        return match rest {
+                            [None] => Ok(row_d),
+                            _ => index_k(&row_d, rest),
+                        };
                     }
                     Some(K::Vector(icv)) => {
                         let is = icv.as_i64_vec().ok_or_else(|| KError::ty("table row index must be integer"))?;
@@ -3404,7 +3563,16 @@ pub fn index_k(target: &K, args: &[Option<K>]) -> KResult<K> {
         }
         K::KeyedTable(kt) => {
             // Indexing a KeyedTable looks up by key (`kt[\`AAPL]` or `kt[([] sym: \`AAPL\`MSFT)]`)!
-            match first {
+            // (a key given by name is the list of its values)
+            let by_name = match first {
+                Some(K::Dict(d)) => {
+                    let values: KResult<Vec<K>> = kt.keys.cols.iter().map(|&c| dict_lookup(d, &K::Sym(c))).collect();
+                    let mut values = values?;
+                    Some(if values.len() == 1 { values.remove(0) } else { K::Vector(ColVec::from_atoms(values)) })
+                }
+                _ => None,
+            };
+            match by_name.as_ref().or(first) {
                 None | Some(K::Null) => K::Table(Arc::new(kt.vals.clone())),
                 Some(K::Table(probe_keys)) => {
                     let joined = crate::engine::joins::lookup_keyed_rows(kt, probe_keys)?;
@@ -3427,7 +3595,13 @@ pub fn index_k(target: &K, args: &[Option<K>]) -> KResult<K> {
                             return Err(KError::ty("invalid keyed table lookup"));
                         }
                     } else if let K::Vector(tuple_cv) = k {
-                        if tuple_cv.len() == kt.keys.ncols() {
+                        let several = match tuple_cv {
+                            ColVec::General(_, items) => rows::from_rows(&kt.keys.cols, &kt.keys.vals, items),
+                            _ => None,
+                        };
+                        if let Some(probe) = several {
+                            K::Table(Arc::new(crate::engine::joins::lookup_keyed_rows(kt, &probe?)?))
+                        } else if tuple_cv.len() == kt.keys.ncols() {
                             let found = (0..kt.nrows()).find(|&r| {
                                 (0..kt.keys.ncols()).all(|c| kt.keys.vals[c].get_atom(r).hash_key() == tuple_cv.get_atom(c).hash_key())
                             });

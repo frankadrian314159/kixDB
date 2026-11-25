@@ -18,6 +18,12 @@ Integer arithmetic and aggregates wrap on overflow.
   `,:`, is `'type`; a general list whose items come to share a type becomes simple.
 * Verbs applied to two dictionaries work key by key over the keys of both; a value only one has is kept, and compared
   with a null by comparisons. `d _ key` and `keys _ d` drop entries.
+* Casting a float to a whole number rounds it. A type can be given by number (`7h$x`), and `"ijf"$x` casts item by item.
+* A table is also a list of its rows: `t _ i`, `t ? row`, `inter`, `union`, `except`, `^` and `,'` work row by row or
+  column by column, a keyed table is looked up, taken from and dropped from by key, and a list of dictionaries with the
+  same keys is a table. `,` of two tables needs the same columns in the same order; `t,:row` keeps the column types.
+* `xasc`, `xdesc`, `xkey`, `xcol` and `xcols` given a table's name change that table. `key` of a name lists a namespace,
+  and `` get `.name `` gives the namespace as a dictionary.
 * `0x0 vs n` and `0b vs n` give a number's bytes or bits and `sv` puts them together; with a base, or a list of bases,
   they work in digits (`24 60 60 vs 3723`).
 
@@ -37,13 +43,15 @@ Integer arithmetic and aggregates wrap on overflow.
 | Group | Verbs |
 | --- | --- |
 | arithmetic | `+ - * % div mod xexp xlog neg abs sqrt exp log sin cos tan asin acos atan floor ceiling reciprocal signum` |
-| comparison, logic | `= <> < <= > >= ~ & \| not and or null within in like` |
-| lists | `til count first last # _ sublist enlist raze flip reverse distinct where group iasc idesc asc desc cut cross inter union except bin binr` |
-| aggregates | `sum prd avg wavg wsum min max med var dev svar sdev cov cor` |
+| comparison, logic | `= <> < <= > >= ~ & \| not and or all any null within in like` |
+| lists | `til count first last # _ sublist enlist raze flip reverse rotate distinct where group iasc idesc asc desc rank xrank xprev cut cross inter union except bin binr` |
+| aggregates | `sum prd avg wavg wsum min max med var dev svar sdev cov scov cor` |
+| matrices | `mmu inv lsq` |
 | running, moving | `sums prds avgs mins maxs deltas ratios differ prev next fills mavg msum mcount mmin mmax mdev ema xbar` |
 | tables | `cols keys meta xasc xdesc xkey xcol xcols xgroup ungroup insert upsert fby tables views` |
 | strings, casts | `string upper lower trim ltrim rtrim ss ssr vs sv $ md5` |
-| system | `get set value parse eval system show hopen hclose hcount 0: 1: -8! -9!` |
+| system | `get set value parse eval attr system show getenv setenv ltime gtime hopen hclose hcount 0: 1: -8! -9!` |
+| iterators | `each peach over scan prior` (`peach` runs as `each`) |
 
 `.z.p .z.P .z.d .z.D .z.t .z.T .z.u .z.i .z.o .z.K` give the time, user and process. Date and time parts are read with
 `` `year$x `` or `x.year`, `.mm`, `.dd`, `.hh`, `.uu`, `.ss`, `.minute`, `.date` and so on.
@@ -56,6 +64,9 @@ exec cols by groups from t where c
 update cols by groups from t where c                    / from `t changes t in place
 delete from t where c                                    / delete c1, c2 from t
 ```
+
+A column without a name takes the first name in its expression (the one after a verb such as `xbar`), otherwise `x`.
+An `update` of some rows takes a value for each of them, of the column's type.
 
 `where` clauses filter one after another: each sees only the rows the previous ones kept. `i` is a row's number in the
 whole table, counted from 0, wherever it is used: also in a later `where` clause, after a filter and within a group.

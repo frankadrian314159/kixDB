@@ -4,7 +4,7 @@
 //! - `wj` / `wj1` (window join aggregating quote windows `[lo; hi]` per trade row!)
 use crate::engine::ops::{first_rows, group_ids};
 use crate::error::{KError, KResult};
-use crate::sym::{resolve, SymId};
+use crate::sym::{intern, resolve, SymId};
 use crate::types::*;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -541,7 +541,13 @@ pub fn window_join(
         if pair.len() != 2 {
             return Err(KError::length("wj agg spec must have 2 elements (func; `col)"));
         }
-        let K::Func(func) = pair.get_atom(0) else {
+        let func = match pair.get_atom(0) {
+            K::Func(func) => Some(func),
+            // `::` keeps the values of the window
+            K::Null => Some(Func::Prim(intern("::"))),
+            _ => None,
+        };
+        let Some(func) = func else {
             return Err(KError::ty("wj agg spec[0] must be a function"));
         };
         let K::Sym(col_sym) = pair.get_atom(1) else {

@@ -168,6 +168,20 @@ impl<'a> Engine<'a> {
             }
             other => self.eval_expr(other)?,
         };
+        // a symbol held in a variable names the table too
+        let source_k = match source_k {
+            K::Sym(name) => {
+                if matches!(q.kind, QSqlKind::Update | QSqlKind::DeleteRows | QSqlKind::DeleteCols) {
+                    inplace_target = Some(name);
+                }
+                // (the name is a global's, whatever locals are called)
+                let locals = std::mem::take(&mut self.locals);
+                let table = self.resolve_table_for_query(name, &q.where_clauses, needed.as_deref());
+                self.locals = locals;
+                table?
+            }
+            table => table,
+        };
 
         let (base_flip, orig_key_cols) = match &source_k {
             K::Table(t) => ((**t).clone(), None),
@@ -619,8 +633,16 @@ impl<'a> Engine<'a> {
             } else {
                 let sub_cv = match val {
                     K::Vector(cv) if cv.len() == active_rows.len() => cv,
+                    K::Vector(cv) if !matches!(cv, ColVec::Char(..)) => {
+                        return Err(KError::length(format!("{} values for {} rows", cv.len(), active_rows.len())));
+                    }
                     atom => ColVec::repeat(atom, active_rows.len()),
                 };
+                if let Some(held) = work.col(cname) {
+                    if !matches!(held, ColVec::General(..)) && held.type_num() != sub_cv.type_num() && !active_rows.is_empty() {
+                        return Err(KError::ty(format!("a {} value in a {} column", sub_cv.type_name(), held.type_name())));
+                    }
+                }
                 let typed_null = sub_cv.null_atom();
                 let mut atoms: Vec<K> = if let Some(ex) = work.col(cname) {
                     (0..total).map(|r| ex.get_atom(r)).collect()
@@ -702,7 +724,18 @@ impl<'a> Engine<'a> {
 
     /// Add rows to the table named `name` (`upsert`: setting those whose keys it has). The rows it had and how many came.
     fn add_rows(&mut self, name: SymId, rows: &K, upsert: bool) -> KResult<(usize, usize)> {
-        let current = self.get_var(name)?;
+        let is_list = |r: &K| matches!(r, K::Vector(ColVec::General(..)));
+        if !upsert && matches!(rows, K::Vector(ColVec::General(_, items)) if !items.is_empty() && items.iter().all(is_list)) {
+            return Err(KError::ty("insert takes columns, a table or dictionaries, not a list of rows"));
+        }
+        let current = match self.get_var(name) {
+            // a table that is not there yet is made of the rows
+            Err(e) if e.signal != "stop" && matches!(rows, K::Table(_) | K::KeyedTable(_)) => {
+                self.set_global(name, rows.clone())?;
+                return Ok((0, rows.count()));
+            }
+            held => held?,
+        };
         // a global is changed where it is: only the rows touched are logged and copied
         if let Some(global) = self.global_to_change(name) {
             let (incoming, start) = incoming_rows(&current, rows)?;
@@ -795,6 +828,11 @@ fn coerce_rows_to_flip(cols: &[SymId], proto: &[ColVec], rows: &K) -> KResult<Fl
             coerce_rows_to_flip(cols, proto, &one)
         }
         K::Vector(cv) => {
+            if let ColVec::General(_, items) = cv {
+                if let Some(rows) = crate::engine::rows::from_rows(cols, proto, items) {
+                    return rows;
+                }
+            }
             if cv.len() != cols.len() {
                 return Err(KError::length("insert list length must equal column count"));
             }
@@ -831,7 +869,12 @@ pub fn exec_by_result(kt: &KeyedTable) -> K {
             K::Table(Arc::new(f.clone()))
         }
     };
-    K::Dict(Arc::new(Dict { keys: Box::new(side(&kt.keys)), vals: Box::new(side(&kt.vals)) }))
+    let values = match side(&kt.vals) {
+        // (dictionaries with the same keys make a table, as in a pivot)
+        K::Vector(ColVec::General(_, items)) => crate::engine::rows::collapse((*items).clone()),
+        other => other,
+    };
+    K::Dict(Arc::new(Dict { keys: Box::new(side(&kt.keys)), vals: Box::new(values) }))
 }
 
 fn restore_keys(flip: Flip, orig_keys: Option<Vec<SymId>>) -> KResult<K> {
@@ -845,8 +888,8 @@ fn restore_keys(flip: Flip, orig_keys: Option<Vec<SymId>>) -> KResult<K> {
 pub fn resolve_col_names(specs: &[ColSpec]) -> Vec<SymId> {
     let mut used: HashMap<SymId, usize> = HashMap::new();
     let mut out = Vec::with_capacity(specs.len());
-    for (idx, cs) in specs.iter().enumerate() {
-        let base = cs.name.or_else(|| infer_col_name(&cs.expr)).unwrap_or_else(|| intern(&format!("x{idx}")));
+    for cs in specs {
+        let base = cs.name.or_else(|| infer_col_name(&cs.expr)).unwrap_or_else(|| intern("x"));
         let cnt = used.entry(base).or_insert(0);
         let chosen = if *cnt == 0 {
             base
