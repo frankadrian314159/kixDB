@@ -2,11 +2,14 @@
 //! - Lossless `K` payload encoder/decoder (`encode_k_payload` / `decode_k_payload`, used by `-8!` / `-9!`, flat/splayed files, and TCP frames)
 //! - TCP handshake (`user:password\x03\x00` -> `\x03`) with optional authentication
 //! - Multi-client `Listener` (`kix-serve`, `kix -p`, `kix-gui`, and `kix-cluster`) and synchronous/async `IpcClient` (`hopen`)
+use crate::engine::tree::func_of;
 use crate::error::{KError, KResult};
 use crate::parser::parse_script;
 use crate::sym::{intern, resolve};
 use crate::types::*;
 use crate::Server;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -428,12 +431,11 @@ fn decode_k_endian(data: &[u8], mut p: usize, le: bool) -> KResult<(K, usize)> {
             let (ns, p1) = read_nul_str(data, p)?;
             let (src_k, p2) = decode_k_endian(data, p1, le)?;
             let src = src_k.as_str().unwrap_or_else(|| "{x}".into());
-            if let Ok(mut exprs) = parse_script(&src) {
-                if let Some(crate::ast::Expr::Lambda { params, implicit, body, source }) = exprs.pop() {
-                    return Ok((K::Func(Func::Lambda(Arc::new(Lambda { params, implicit, body, source, ns }))), p2));
-                }
-            }
-            Ok((K::Func(Func::Prim(intern(&src))), p2))
+            let parsed = parse_script(&src).ok().and_then(|exprs| match exprs.as_slice() {
+                [e] => func_of(e, &ns),
+                _ => None,
+            });
+            Ok((K::Func(parsed.unwrap_or_else(|| Func::Prim(intern(&src)))), p2))
         }
 
         other => Err(KError::ipc(format!("unsupported IPC tag {other}"))),
@@ -461,12 +463,18 @@ fn encode_error_payload(err: &KError) -> Vec<u8> {
     buf
 }
 
-fn write_ipc_frame(stream: &mut TcpStream, msg_type: u8, payload: &[u8]) -> KResult<()> {
+/// Messages longer than this are compressed when the peer is on another machine (as kdb+ does).
+const COMPRESS_OVER: usize = 2000;
+
+fn write_ipc_frame(stream: &mut dyn Wire, msg_type: u8, payload: &[u8], compress: bool) -> KResult<()> {
+    let packed = if compress && payload.len() > COMPRESS_OVER { compress_kdb(payload) } else { None };
+    let compressed = packed.is_some();
+    let payload = packed.as_deref().unwrap_or(payload);
     let total = 8 + payload.len();
     let mut hdr = [0u8; 8];
     hdr[0] = 1; // little-endian
     hdr[1] = msg_type;
-    hdr[2] = 0; // uncompressed
+    hdr[2] = u8::from(compressed);
     hdr[3] = 0;
     hdr[4..8].copy_from_slice(&(total as u32).to_le_bytes());
     stream.write_all(&hdr)?;
@@ -475,7 +483,7 @@ fn write_ipc_frame(stream: &mut TcpStream, msg_type: u8, payload: &[u8]) -> KRes
     Ok(())
 }
 
-fn read_ipc_frame(stream: &mut TcpStream) -> KResult<(u8, bool, Vec<u8>)> {
+fn read_ipc_frame(stream: &mut dyn Wire) -> KResult<(u8, bool, Vec<u8>)> {
     let mut hdr = [0u8; 8];
     stream.read_exact(&mut hdr)?;
     let le = hdr[0] != 0;
@@ -494,7 +502,65 @@ fn read_ipc_frame(stream: &mut TcpStream) -> KResult<(u8, bool, Vec<u8>)> {
     Ok((msg_type, le, body))
 }
 
-/// Decompress kdb+ IPC compressed payload (`-19!` algorithm).
+/// Compress an IPC payload with kdb+'s IPC compression (the result starts with the uncompressed frame length), or `None`
+/// when that does not at least halve it.
+fn compress_kdb(src: &[u8]) -> Option<Vec<u8>> {
+    let limit = src.len() / 2;
+    let mut out = Vec::with_capacity(limit);
+    out.extend_from_slice(&((src.len() + 8) as u32).to_le_bytes());
+    let mut seen = [usize::MAX; 256];
+    let (mut s, mut p) = (0usize, 0usize);
+    let (mut flags, mut flag_at, mut bit) = (0u8, 0usize, 0u8);
+    let mut literal: Option<(u8, usize)> = None;
+    while s < src.len() {
+        if bit == 0 {
+            if out.len() + 17 > limit {
+                return None;
+            }
+            if flag_at != 0 {
+                out[flag_at] = flags;
+            }
+            (flag_at, flags, bit) = (out.len(), 0, 1);
+            out.push(0);
+        }
+        let mut h = 0u8;
+        let mut is_literal = s + 3 > src.len();
+        if !is_literal {
+            h = src[s] ^ src[s + 1];
+            p = seen[h as usize];
+            is_literal = p == usize::MAX || src[s] != src[p];
+        }
+        // a literal's position is remembered one step late, as the decompressor learns it
+        if let Some((h0, s0)) = literal.take() {
+            seen[h0 as usize] = s0;
+        }
+        if is_literal {
+            literal = Some((h, s));
+            out.push(src[s]);
+            s += 1;
+        } else {
+            seen[h as usize] = s;
+            flags |= bit;
+            p += 2;
+            s += 2;
+            let start = s;
+            let end = (s + 255).min(src.len());
+            while s < end && src[p] == src[s] {
+                s += 1;
+                p += 1;
+            }
+            out.push(h);
+            out.push((s - start) as u8);
+        }
+        bit = bit.wrapping_shl(1);
+    }
+    if flag_at != 0 {
+        out[flag_at] = flags;
+    }
+    (out.len() < limit).then_some(out)
+}
+
+/// Decompress a kdb+ IPC compressed payload.
 fn uncompress_kdb(comp: &[u8], le: bool) -> KResult<Vec<u8>> {
     if comp.len() < 4 {
         return Err(KError::ipc("truncated compressed IPC payload"));
@@ -502,61 +568,140 @@ fn uncompress_kdb(comp: &[u8], le: bool) -> KResult<Vec<u8>> {
     let arr: [u8; 4] = comp[0..4].try_into().unwrap();
     let uncomp_total = (if le { u32::from_le_bytes(arr) } else { u32::from_be_bytes(arr) }) as usize;
     let out_len = uncomp_total.saturating_sub(8);
+    let bad = || KError::ipc("corrupt compressed IPC payload");
+    // one control byte covers at most 8 runs of 257 bytes
+    if out_len / 2056 > comp.len() {
+        return Err(bad());
+    }
     let mut dst = vec![0u8; out_len];
     let mut ptrs = [0usize; 256];
-    let mut s = 4usize;
-    let mut d = 0usize;
-    let mut f = 0u8;
-    let mut i = 0u8;
-    let mut p = 0usize;
+    let (mut s, mut d, mut p) = (4usize, 0usize, 0usize);
+    let (mut f, mut bit) = (0u8, 0u8);
+    let next = |s: &mut usize| -> KResult<u8> {
+        let b = *comp.get(*s).ok_or_else(bad)?;
+        *s += 1;
+        Ok(b)
+    };
 
-    while d < out_len && s < comp.len() {
-        if i == 0 {
-            f = comp[s];
-            s += 1;
-            i = 1;
+    while d < out_len {
+        if bit == 0 {
+            f = next(&mut s)?;
+            bit = 1;
         }
-        if (f & i) != 0 {
-            let r = ptrs[comp[s] as usize];
-            s += 1;
-            let cnt = (comp[s] as usize) + 2;
-            s += 1;
-            for k in 0..cnt {
-                if d + k < out_len && r + k < d {
-                    dst[d + k] = dst[r + k];
-                }
+        let mut run = 0;
+        let back = (f & bit) != 0;
+        if back {
+            let r = ptrs[next(&mut s)? as usize];
+            run = next(&mut s)? as usize;
+            if r >= d || d + 2 + run > out_len {
+                return Err(bad());
             }
-            d += cnt;
+            dst[d] = dst[r];
+            dst[d + 1] = dst[r + 1];
+            d += 2;
+            for k in 0..run {
+                dst[d + k] = dst[r + 2 + k];
+            }
         } else {
-            dst[d] = comp[s];
+            dst[d] = next(&mut s)?;
             d += 1;
-            s += 1;
         }
         while p + 1 < d {
             ptrs[(dst[p] ^ dst[p + 1]) as usize] = p;
             p += 1;
         }
-        i = i.wrapping_shl(1);
+        if back {
+            d += run;
+            p = d;
+        }
+        bit = bit.wrapping_shl(1);
     }
     Ok(dst)
 }
 
 // ----- IPC Client (`IpcClient`) ---------------------------------------------
 
+/// A connection's byte stream: plain TCP, or TLS over TCP.
+trait Wire: Read + Write + Send {}
+impl<T: Read + Write + Send> Wire for T {}
+
+fn tls_error(e: impl std::fmt::Display) -> KError {
+    KError::ipc(format!("TLS: {e}"))
+}
+
+/// TLS settings of a listener from a PEM certificate chain and private key.
+pub fn tls_server_config(cert_pem: &[u8], key_pem: &[u8]) -> KResult<Arc<rustls::ServerConfig>> {
+    let certs = CertificateDer::pem_slice_iter(cert_pem).collect::<Result<Vec<_>, _>>().map_err(tls_error)?;
+    let key = PrivateKeyDer::from_pem_slice(key_pem).map_err(tls_error)?;
+    let cfg = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(tls_error)?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(tls_error)?;
+    Ok(Arc::new(cfg))
+}
+
+/// A new self-signed certificate for `host` and the loopback names: `(certificate PEM, key PEM)`.
+pub fn self_signed_cert(host: &str) -> KResult<(String, String)> {
+    let names = vec![host.to_string(), "localhost".into(), "127.0.0.1".into()];
+    let c = rcgen::generate_simple_self_signed(names).map_err(tls_error)?;
+    Ok((c.cert.pem(), c.key_pair.serialize_pem()))
+}
+
+/// A TLS client stream to `host` that trusts the certificates in the PEM file `ca_file`.
+fn tls_client(tcp: TcpStream, host: &str, ca_file: &str) -> KResult<Box<dyn Wire>> {
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in CertificateDer::pem_file_iter(ca_file).map_err(tls_error)? {
+        roots.add(cert.map_err(tls_error)?).map_err(tls_error)?;
+    }
+    let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(tls_error)?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let name = ServerName::try_from(host.to_string()).map_err(tls_error)?;
+    let conn = rustls::ClientConnection::new(Arc::new(cfg), name).map_err(tls_error)?;
+    Ok(Box::new(rustls::StreamOwned::new(conn, tcp)))
+}
+
 pub struct IpcClient {
-    stream: TcpStream,
+    stream: Box<dyn Wire>,
+    compress: bool,
 }
 
 impl IpcClient {
+    /// Connect to `host[:port]`. `tcps://host:port` connects with TLS, trusting the certificates in the file that the
+    /// environment variable `KIX_SSL_CA_CERT_FILE` names.
     pub fn connect_addr(addr: &str, user: &str, password: &str) -> KResult<Self> {
+        match addr.strip_prefix("tcps://") {
+            Some(a) => {
+                let ca = std::env::var("KIX_SSL_CA_CERT_FILE")
+                    .map_err(|_| tls_error("set KIX_SSL_CA_CERT_FILE to the server's CA certificate"))?;
+                Self::connect_tls(a, user, password, &ca)
+            }
+            None => Self::connect(addr, user, password, None),
+        }
+    }
+
+    pub fn connect_tls(addr: &str, user: &str, password: &str, ca_file: &str) -> KResult<Self> {
+        Self::connect(addr, user, password, Some(ca_file))
+    }
+
+    fn connect(addr: &str, user: &str, password: &str, ca_file: Option<&str>) -> KResult<Self> {
         let norm = if addr.starts_with(':') { format!("127.0.0.1{addr}") } else if !addr.contains(':') { format!("{addr}:5000") } else { addr.to_string() };
         let sock = norm
             .to_socket_addrs()
             .map_err(|e| KError::ipc(format!("cannot resolve '{norm}': {e}")))?
             .next()
             .ok_or_else(|| KError::ipc(format!("no address for '{norm}'")))?;
-        let mut stream = TcpStream::connect(sock).map_err(|e| KError::ipc(format!("connect {norm}: {e}")))?;
-        let _ = stream.set_nodelay(true);
+        let tcp = TcpStream::connect(sock).map_err(|e| KError::ipc(format!("connect {norm}: {e}")))?;
+        let _ = tcp.set_nodelay(true);
+        let compress = !sock.ip().is_loopback();
+        let mut stream: Box<dyn Wire> = match ca_file {
+            Some(ca) => tls_client(tcp, norm.rsplit_once(':').map_or(norm.as_str(), |(h, _)| h), ca)?,
+            None => Box::new(tcp),
+        };
 
         // kdb+ v3 handshake: `"user:password\x03\x00"`
         let creds = if password.is_empty() {
@@ -574,7 +719,7 @@ impl IpcClient {
             Err(_) => return Err(KError::new("access", "authentication refused by server")),
         }
 
-        Ok(Self { stream })
+        Ok(Self { stream, compress })
     }
 
     pub fn query_str(&mut self, q_code: &str) -> KResult<K> {
@@ -583,15 +728,15 @@ impl IpcClient {
 
     pub fn query_k(&mut self, msg: &K) -> KResult<K> {
         let payload = encode_k_payload(msg);
-        write_ipc_frame(&mut self.stream, MSG_SYNC, &payload)?;
-        let (_mtype, le, resp) = read_ipc_frame(&mut self.stream)?;
+        write_ipc_frame(&mut *self.stream, MSG_SYNC, &payload, self.compress)?;
+        let (_mtype, le, resp) = read_ipc_frame(&mut *self.stream)?;
         let (k, _) = decode_k_endian(&resp, 0, le)?;
         Ok(k)
     }
 
     pub fn send_async_k(&mut self, msg: &K) -> KResult<()> {
         let payload = encode_k_payload(msg);
-        write_ipc_frame(&mut self.stream, MSG_ASYNC, &payload)
+        write_ipc_frame(&mut *self.stream, MSG_ASYNC, &payload, self.compress)
     }
 }
 
@@ -601,13 +746,15 @@ impl IpcClient {
 pub struct IpcConfig {
     /// Optional `username -> password` map (`None` allows any user, matching kdb+ without `-u`).
     pub users: Option<HashMap<String, String>>,
+    /// Accept TLS connections too (on the same port; plain connections are still accepted).
+    pub tls: Option<Arc<rustls::ServerConfig>>,
 }
 
 impl IpcConfig {
     pub fn with_single_user(user: impl Into<String>, password: impl Into<String>) -> Self {
         let mut m = HashMap::new();
         m.insert(user.into(), password.into());
-        Self { users: Some(m) }
+        Self { users: Some(m), tls: None }
     }
 }
 
@@ -667,11 +814,21 @@ impl Drop for Listener {
 
 fn handle_client(
     server: Server,
-    mut stream: TcpStream,
+    tcp: TcpStream,
     cfg: Arc<RwLock<IpcConfig>>,
     stop: Arc<AtomicBool>,
 ) -> KResult<()> {
-    let _ = stream.set_nodelay(true);
+    let _ = tcp.set_nodelay(true);
+    let compress = tcp.peer_addr().is_ok_and(|a| !a.ip().is_loopback());
+    let tls = cfg.read().unwrap_or_else(|e| e.into_inner()).tls.clone();
+    // a TLS connection starts with a handshake record (0x16), which no IPC handshake does
+    let mut first = [0u8; 1];
+    let mut stream: Box<dyn Wire> = match tls {
+        Some(t) if tcp.peek(&mut first)? == 1 && first[0] == 0x16 => {
+            Box::new(rustls::StreamOwned::new(rustls::ServerConnection::new(t).map_err(tls_error)?, tcp))
+        }
+        _ => Box::new(tcp),
+    };
 
     // Read NUL-terminated handshake `"user[:pass][cap]\x00"`
     let mut hs = Vec::with_capacity(64);
@@ -714,7 +871,7 @@ fn handle_client(
     let mut conn = server.connect_as_trusted(if user.is_empty() { "anonymous" } else { user });
 
     while !stop.load(Ordering::SeqCst) {
-        let (msg_type, le, raw_body) = match read_ipc_frame(&mut stream) {
+        let (msg_type, le, raw_body) = match read_ipc_frame(&mut *stream) {
             Ok(frame) => frame,
             Err(_) => break,
         };
@@ -723,7 +880,7 @@ fn handle_client(
             Err(e) => {
                 if msg_type == MSG_SYNC {
                     let ep = encode_error_payload(&e);
-                    let _ = write_ipc_frame(&mut stream, MSG_RESPONSE, &ep);
+                    let _ = write_ipc_frame(&mut *stream, MSG_RESPONSE, &ep, compress);
                 }
                 continue;
             }
@@ -734,14 +891,46 @@ fn handle_client(
             match res {
                 Ok(val) => {
                     let payload = encode_k_payload(&val);
-                    write_ipc_frame(&mut stream, MSG_RESPONSE, &payload)?;
+                    write_ipc_frame(&mut *stream, MSG_RESPONSE, &payload, compress)?;
                 }
                 Err(err) => {
                     let ep = encode_error_payload(&err);
-                    write_ipc_frame(&mut stream, MSG_RESPONSE, &ep)?;
+                    write_ipc_frame(&mut *stream, MSG_RESPONSE, &ep, compress)?;
                 }
             }
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compression_round_trips_and_rejects_damage() {
+        let mut x = 7u32;
+        let mut rand = move || {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            x >> 16
+        };
+        for len in [2001usize, 4096, 100_000] {
+            // long runs, a repeating pattern, and a little noise
+            let src: Vec<u8> = (0..len)
+                .map(|i| match (i / 700) % 3 {
+                    0 => 0,
+                    1 => (i % 11) as u8,
+                    _ if rand() % 50 == 0 => rand() as u8,
+                    _ => b'a',
+                })
+                .collect();
+            let packed = compress_kdb(&src).expect("compressible");
+            assert!(packed.len() < len / 2);
+            assert_eq!(uncompress_kdb(&packed, true).unwrap(), src);
+            assert!(uncompress_kdb(&packed[..packed.len() / 2], true).is_err());
+        }
+        // random bytes do not compress
+        let noise: Vec<u8> = (0..5000).map(|_| rand() as u8).collect();
+        assert!(compress_kdb(&noise).is_none());
+    }
 }

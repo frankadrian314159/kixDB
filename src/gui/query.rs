@@ -1,6 +1,5 @@
 //! `q` / `qSQL` Query Pad: code editor (`Ctrl+Enter` / `F5` runs selection or script on background `Session`),
 //! `Explain` execution/cluster plan, result grids, console value output, and CSV export.
-use crate::backend::Backend;
 use crate::session::{Finished, Session};
 use crate::ui::{result_grid, Event, ERROR};
 use egui::{Key, RichText, TextEdit};

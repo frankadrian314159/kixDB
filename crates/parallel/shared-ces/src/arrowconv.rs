@@ -25,7 +25,8 @@ const META_COL_ATTR: &str = "kix.attr";
 
 pub fn k_to_batches(val: &K, batch_rows: usize) -> Result<(SchemaRef, Vec<RecordBatch>), String> {
     match val {
-        K::Table(t) => flip_to_batches(t, 0, "table", batch_rows),
+        // (a table without columns cannot be an Arrow batch: it travels packed, like a scalar)
+        K::Table(t) if t.ncols() > 0 => flip_to_batches(t, 0, "table", batch_rows),
         K::KeyedTable(kt) => flip_to_batches(&kt.unkey(), kt.keys.ncols(), "keyed", batch_rows),
         scalar => {
             // Wrap non-table `K` (atom, vector, dict, null) as a 1-row single-column binary batch

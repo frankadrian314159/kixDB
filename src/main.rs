@@ -235,7 +235,7 @@ impl Shell {
                 }
             }
             buf.push_str(&line);
-            if delimiters_balanced(&buf) {
+            if tools::delimiters_balanced(&buf) {
                 let code = std::mem::take(&mut buf);
                 self.run_code(&code);
             }
@@ -445,35 +445,4 @@ impl Shell {
         }
         true
     }
-}
-
-/// Check if `{...}`, `(...)`, and `[...]` delimiters are balanced so multi-line lambdas/tables work naturally in REPL.
-fn delimiters_balanced(src: &str) -> bool {
-    let bytes = src.as_bytes();
-    let mut depth = 0i32;
-    let mut in_str = false;
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if in_str {
-            if b == b'\\' {
-                i += 2;
-                continue;
-            }
-            if b == b'"' {
-                in_str = false;
-            }
-            i += 1;
-            continue;
-        }
-        if b == b'"' {
-            in_str = true;
-        } else if matches!(b, b'(' | b'[' | b'{') {
-            depth += 1;
-        } else if matches!(b, b')' | b']' | b'}') {
-            depth -= 1;
-        }
-        i += 1;
-    }
-    !in_str && depth <= 0
 }

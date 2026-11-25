@@ -1,77 +1,115 @@
-//! Control-plane messages carried over Arrow Flight actions and tickets (`postcard` encoded).
-use kixdb::KError;
+//! Messages carried over Arrow Flight tickets and actions (`postcard` encoded), and errors carried in `tonic::Status`.
+//!
+//! A query is a `DoGet` whose ticket is a [`Fragment`]; its result streams back as Arrow batches. Everything else is an
+//! action.
+use kixdb::ast::Expr;
+use kixdb::ipc::{decode_k_payload, encode_k_payload};
+use kixdb::{KError, K};
 use serde::{Deserialize, Serialize};
+use tonic::{Code, Status};
 
-pub const ACTION_RUN: &str = "run";
 pub const ACTION_LOAD: &str = "load";
+pub const ACTION_MUTATE: &str = "mutate";
 pub const ACTION_SHUFFLE: &str = "shuffle";
 pub const ACTION_STATUS: &str = "status";
 pub const ACTION_METRICS: &str = "metrics";
+pub const ACTION_MEMBERS: &str = "members";
 pub const ACTION_RAFT: &str = "raft";
-pub const ACTION_CLOSE_SESSION: &str = "close_session";
 
-/// Error code prefix returned in `tonic::Status` when a Raft follower redirects to the current leader.
+/// Message prefix of the status with which a Raft follower redirects to the current leader (followed by its address).
 pub const NOT_LEADER_PREFIX: &str = "NOTLEADER|";
+/// Message prefix of the status with which a draining node refuses work.
 pub const SHUTTING_DOWN_PREFIX: &str = "SHUTTING_DOWN|";
+const ERROR_PREFIX: &str = "KIX|";
+
+/// A column the control node adds to a table slice on its way through a join: the row's global ordinal.
+pub const ORD_COL: &str = "kix__ord";
+
+/// The shard variable that holds the global row ordinals of a sharded table, parallel to its rows.
+pub fn ord_var(table: &str) -> String {
+    format!(".kix.ord.{table}")
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Work {
+    /// Evaluate `q` source.
     Q(String),
+    /// Evaluate a parsed expression (free variables already replaced by their values).
+    Eval(Box<Expr>),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Fragment {
-    pub session: u64,
     pub work: Work,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct WireError {
-    pub signal: String,
-    pub detail: String,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LoadMode {
+    /// Make the table exactly these rows.
+    Replace,
+    /// Append the rows to an unkeyed table.
+    Append,
+    /// Upsert the rows into a keyed table (its key columns come first).
+    Upsert,
+    /// Fail with `'insert` if a row's key is already in the keyed table; change nothing.
+    CheckInsert,
+    /// Remove the table.
+    Drop,
 }
 
-impl From<&KError> for WireError {
-    fn from(e: &KError) -> Self {
-        Self {
-            signal: e.signal.clone(),
-            detail: e.detail.clone(),
-        }
-    }
-}
-
-impl From<WireError> for KError {
-    fn from(w: WireError) -> Self {
-        KError::new(w.signal, w.detail)
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RunReply {
-    /// IPC-encoded `K` result when small/non-table, or `None` when callers use `DoGet` for streaming batches.
-    pub ipc_result: Option<Vec<u8>>,
-    pub error: Option<WireError>,
-}
-
-/// Load a serialized `K` table slice directly into `table` on a shard (`replace = true` overwrites, `false` appends/upserts).
+/// Change a table slice on a shard.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LoadReq {
     pub table: String,
-    pub replace: bool,
+    pub mode: LoadMode,
+    /// The IPC-encoded table.
     pub ipc_k: Vec<u8>,
+    /// Global ordinals of those rows (sharded tables only).
+    pub ords: Option<Vec<i64>>,
 }
 
-/// Shard-to-shard exchange: run `scan_q` locally, hash-partition rows by `key_col` (`None` = broadcast all rows to all shards!),
-/// and send each partition directly to its destination shard via `ACTION_LOAD` into `target_table`.
+impl LoadReq {
+    pub fn new(table: impl Into<String>, mode: LoadMode, rows: &K, ords: Option<Vec<i64>>) -> Self {
+        Self { table: table.into(), mode, ipc_k: encode_k_payload(rows), ords }
+    }
+
+    pub fn rows(&self) -> Result<K, KError> {
+        decode_k_payload(&self.ipc_k, 0).map(|(k, _)| k)
+    }
+}
+
+/// Run an `update` / `delete` over a table slice. `query` reads the slice (with its [`ORD_COL`] column when the table
+/// has ordinals) and returns the new one. With `apply` false the query is only evaluated, so that the control node can
+/// find an error on any shard before any shard changes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MutateReq {
+    pub table: String,
+    pub query: Expr,
+    pub apply: bool,
+}
+
+/// Shard-to-shard exchange: evaluate `scan` (a table), partition its rows by the hash of the `key_cols` (none: every
+/// row to every shard), and append each part to `target_table` on its shard.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ShuffleReq {
-    pub scan_q: String,
-    pub key_col: Option<String>,
+    pub scan: Expr,
+    pub key_cols: Vec<String>,
     pub target_table: String,
     pub slots: Vec<u32>,
+    /// Addresses of all shards, by shard index.
     pub peers: Vec<String>,
     pub me: usize,
 }
+
+/// Change (or just list, when both are `None`) the members of a replicated shard.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct MemberReq {
+    pub add: Option<(u64, String)>,
+    pub remove: Option<u64>,
+}
+
+/// `(node id, address, voter)`.
+pub type MemberInfo = (u64, String, bool);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ShardStatus {
@@ -82,4 +120,41 @@ pub struct ShardStatus {
     pub applied_ts: u64,
     pub memory_bytes: usize,
     pub draining: bool,
+}
+
+/// The status that carries a `q` signal back to the caller.
+pub fn status_of(e: &KError) -> Status {
+    Status::new(Code::Aborted, format!("{ERROR_PREFIX}{}\u{1f}{}", e.signal, e.detail))
+}
+
+/// The error a status stands for: the shard's `q` signal, or `'cluster` for a transport failure.
+pub fn error_of(s: &Status) -> KError {
+    match s.message().strip_prefix(ERROR_PREFIX).and_then(|m| m.split_once('\u{1f}')) {
+        Some((signal, detail)) => KError::new(signal, detail),
+        None => KError::new("cluster", s.message()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signals_survive_the_trip_through_a_status() {
+        let e = KError::new("length", "vectors differ");
+        assert_eq!(error_of(&status_of(&e)), e);
+        assert_eq!(error_of(&Status::unavailable("connection refused")).signal, "cluster");
+    }
+
+    #[test]
+    fn load_requests_and_expressions_round_trip() {
+        let rows = K::string("abc");
+        let req = LoadReq::new("t", LoadMode::Append, &rows, Some(vec![1, 2]));
+        let back: LoadReq = postcard::from_bytes(&postcard::to_allocvec(&req).unwrap()).unwrap();
+        assert_eq!(back.rows().unwrap(), rows);
+        let expr = kixdb::parser::parse_script("select max px by sym from t where sym in `a`b").unwrap().remove(0);
+        let frag = Fragment { work: Work::Eval(Box::new(expr.clone())) };
+        let back: Fragment = postcard::from_bytes(&postcard::to_allocvec(&frag).unwrap()).unwrap();
+        assert!(matches!(back.work, Work::Eval(e) if *e == expr));
+    }
 }

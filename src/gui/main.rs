@@ -142,7 +142,6 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod tests {
     use super::*;
     use crate::backend::Backend;
-    use eframe::App as EframeApp;
 
     #[test]
     fn own_ipc_server_accepts_generated_credentials_and_rejects_bad_password() {
@@ -178,19 +177,18 @@ mod tests {
             // Test Datasheet loading, filtering, sorting, and keyed editing over RemoteBackend!
             let mut ds = datasheet::Datasheet::new("instrument".into());
             let mut ev = Vec::new();
-            ds.load(&mut *app.conn_for_test());
+            ds.load(&mut **app.conn_for_test());
             assert_eq!(ds.rows.len(), 5);
             assert!(ds.editable());
-            ds.commit_edit(&mut *app.conn_for_test(), 0, 3, "250").unwrap();
-            ds.load(&mut *app.conn_for_test());
+            ds.commit_edit(&mut **app.conn_for_test(), 0, 3, "250").unwrap();
+            ds.load(&mut **app.conn_for_test());
             assert_eq!(ds.rows[0][3].to_string(), "250");
 
             let mut design_view = design::Design::new("trade".into());
             egui::CentralPanel::default().show(ctx, |ui| {
-                ds.ui(ui, &mut *app.conn_for_test(), &mut ev);
-                design_view.ui(ui, &mut *app.conn_for_test(), &mut ev);
+                ds.ui(ui, &mut **app.conn_for_test(), &mut ev);
+                design_view.ui(ui, &mut **app.conn_for_test(), &mut ev);
             });
-            let _ = EframeApp::update;
         });
     }
 }

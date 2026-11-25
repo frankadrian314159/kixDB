@@ -98,3 +98,71 @@ pub enum Expr {
     /// Empty / no-op expression.
     Nop,
 }
+
+macro_rules! children {
+    ($e:expr, $($m:tt)?) => {{
+        let mut out = Vec::new();
+        match $e {
+            Expr::Lit(_) | Expr::Var(_) | Expr::SysCmd { .. } | Expr::Nop => {}
+            Expr::List(xs) | Expr::Cond(xs) => out.extend(xs),
+            Expr::TableLit { keys, vals } => {
+                out.extend(keys.into_iter().map(|(_, e)| e));
+                out.extend(vals.into_iter().map(|(_, e)| e));
+            }
+            Expr::Field(a, _) | Expr::Return(a) | Expr::Signal(a) => out.push(& $($m)? **a),
+            Expr::Unary { arg, .. } => out.push(& $($m)? **arg),
+            Expr::Adverb { func, .. } => out.push(& $($m)? **func),
+            Expr::Assign { val, .. } => out.push(& $($m)? **val),
+            Expr::Binary { lhs, rhs, .. } => {
+                out.push(& $($m)? **lhs);
+                out.push(& $($m)? **rhs);
+            }
+            Expr::Juxt { func, arg } => {
+                out.push(& $($m)? **func);
+                out.push(& $($m)? **arg);
+            }
+            Expr::Apply { target, args } => {
+                out.push(& $($m)? **target);
+                out.extend(args.into_iter().flatten());
+            }
+            Expr::IndexAssign { indices, val, .. } => {
+                out.extend(indices.into_iter().flatten());
+                out.push(& $($m)? **val);
+            }
+            Expr::Lambda { body, .. } => out.extend(body),
+            Expr::If { cond: head, body } | Expr::While { cond: head, body } | Expr::Do { count: head, body } => {
+                out.push(& $($m)? **head);
+                out.extend(body);
+            }
+            Expr::Query(q) => {
+                let QSql { limit, cols, by, from, where_clauses, .. } = & $($m)? **q;
+                if let Some(l) = limit {
+                    out.push(& $($m)? **l);
+                }
+                out.extend(cols.into_iter().map(|c| & $($m)? c.expr));
+                if let Some(by) = by {
+                    out.extend(by.into_iter().map(|c| & $($m)? c.expr));
+                }
+                out.push(& $($m)? **from);
+                out.extend(where_clauses);
+            }
+        }
+        out
+    }};
+}
+
+impl Expr {
+    /// The direct sub-expressions (lambda bodies included).
+    pub fn children(&self) -> Vec<&Expr> {
+        children!(self,)
+    }
+
+    pub fn children_mut(&mut self) -> Vec<&mut Expr> {
+        children!(self, mut)
+    }
+
+    /// Whether `pred` holds for this expression or any sub-expression.
+    pub fn any(&self, pred: &mut impl FnMut(&Expr) -> bool) -> bool {
+        pred(self) || self.children().into_iter().any(|c| c.any(pred))
+    }
+}

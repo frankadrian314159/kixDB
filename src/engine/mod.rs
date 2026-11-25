@@ -3,6 +3,7 @@
 pub mod joins;
 pub mod ops;
 pub mod qsql;
+pub mod tree;
 
 use crate::ast::Expr;
 use crate::error::{KError, KResult};
@@ -90,6 +91,9 @@ pub enum DistMode {
     Sharded { key: SymId },
     Partitioned { col: SymId },
     Replicated,
+    /// Placed by the values of several columns together, such as `date` and `sym`. (Last, so that saved snapshots
+    /// written before it existed still load.)
+    CoPartitioned { cols: Vec<SymId> },
 }
 
 // ----- Server / Workspace State ---------------------------------------------
@@ -227,7 +231,8 @@ impl<'a> Engine<'a> {
                     for m in self.messages.drain(..) {
                         events.push(Event::Message(m));
                     }
-                    if !matches!(val, K::Null) {
+                    // kdb+ prints nothing for a top-level assignment
+                    if !matches!(val, K::Null) && !matches!(s, Expr::Assign { .. }) {
                         if let Some(rs) = k_to_resultset(&val) {
                             events.push(Event::Rows(rs));
                         } else {
@@ -251,9 +256,9 @@ impl<'a> Engine<'a> {
         self.ws.partitioned.contains_key(&name)
     }
 
-    pub fn resolve_table_for_query(&mut self, name: SymId, where_clauses: &[Expr]) -> KResult<K> {
+    pub fn resolve_table_for_query(&mut self, name: SymId, where_clauses: &[Expr], needed: Option<&[SymId]>) -> KResult<K> {
         if let Some(pt) = self.ws.partitioned.get(&name).cloned() {
-            let flip = storage::load_partitioned_filtered(&pt, where_clauses, |e| self.eval_expr(e))?;
+            let flip = storage::load_partitioned_filtered(&pt, where_clauses, needed, |e| self.eval_expr(e))?;
             return Ok(K::Table(Arc::new(flip)));
         }
         self.get_var(name)
@@ -284,31 +289,54 @@ impl<'a> Engine<'a> {
 
     pub fn set_global(&mut self, name: SymId, val: K) -> KResult<()> {
         let qname = self.qualify(name);
-        self.ws.views.remove(&qname);
+        self.set_globals(vec![(qname, Some(val))])
+    }
+
+    /// Set (`Some`) or drop (`None`) several fully qualified globals as one log record, so that a crash or a replica sees
+    /// all of the changes or none.
+    pub fn set_globals(&mut self, changes: Vec<(SymId, Option<K>)>) -> KResult<()> {
+        let ops = changes
+            .iter()
+            .map(|(name, val)| match val {
+                Some(val) => LogOp::SetVar { name: *name, val: val.clone() },
+                None => LogOp::DropVar { name: *name },
+            })
+            .collect();
+        self.record_ops(ops)?;
         self.ws.invalidate_views();
-        self.ws.vars.insert(qname, val.clone());
-        self.record_op(LogOp::SetVar { name: qname, val })?;
+        for (name, val) in changes {
+            self.ws.views.remove(&name);
+            match val {
+                Some(val) => self.ws.vars.insert(name, val),
+                None => self.ws.vars.remove(&name),
+            };
+        }
         Ok(())
     }
 
-    fn record_op(&mut self, op: LogOp) -> KResult<()> {
+    /// Log (and replicate) a change that the caller makes only if this succeeds.
+    fn record_ops(&mut self, ops: Vec<LogOp>) -> KResult<()> {
         if self.replaying {
             return Ok(());
         }
-        self.ws.clock += 1;
-        self.ws.epoch += 1;
-        let ts = self.ws.clock;
+        let rec = crate::persist::WalRecord { ts: self.ws.clock + 1, ops };
         let rep = self.ws.replicator.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if let Some(r) = rep {
-            let rec = crate::persist::WalRecord { ts, ops: vec![op] };
-            r.propose(&rec)?;
-            if let Some(p) = self.ws.persist.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-                p.append_record(&rec, false)?;
+        let mut persist = self.ws.persist.lock().unwrap_or_else(|e| e.into_inner());
+        // checkpoint before appending: the snapshot holds exactly what the truncated log held
+        if let Some(p) = persist.as_mut() {
+            if p.opts.checkpoint_every > 0 && p.wal_records >= p.opts.checkpoint_every as u64 {
+                p.checkpoint(self.ws)?;
             }
-        } else if let Some(p) = self.ws.persist.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-            let rec = crate::persist::WalRecord { ts, ops: vec![op] };
-            p.append_record(&rec, true)?;
         }
+        if let Some(r) = &rep {
+            r.propose(&rec)?;
+        }
+        if let Some(p) = persist.as_mut() {
+            p.append_record(&rec, rep.is_none())?;
+        }
+        drop(persist);
+        self.ws.clock = rec.ts;
+        self.ws.epoch += 1;
         Ok(())
     }
 
@@ -366,7 +394,7 @@ impl<'a> Engine<'a> {
             return Ok(computed);
         }
         if let Some(pt) = self.ws.partitioned.get(&name).cloned() {
-            let flip = storage::load_partitioned_filtered(&pt, &[], |e| self.eval_expr(e))?;
+            let flip = storage::load_partitioned_filtered(&pt, &[], None, |e| self.eval_expr(e))?;
             return Ok(K::Table(Arc::new(flip)));
         }
 
@@ -540,9 +568,9 @@ impl<'a> Engine<'a> {
                         expr: (**val).clone(),
                         cached: None,
                     };
+                    self.record_ops(vec![LogOp::SetView { def: vdef.clone() }])?;
                     self.ws.vars.remove(&qname);
-                    self.ws.views.insert(qname, vdef.clone());
-                    self.record_op(LogOp::SetView { def: vdef })?;
+                    self.ws.views.insert(qname, vdef);
                     return Ok(K::Null);
                 }
 
@@ -672,7 +700,7 @@ impl<'a> Engine<'a> {
                     }
                     col_vecs.push(cv);
                 }
-                atom => col_vecs.push(ColVec::from_atoms(vec![atom; target_len])),
+                atom => col_vecs.push(ColVec::repeat(atom, target_len)),
             }
         }
         Ok(Flip::new(names, col_vecs)?)
@@ -703,6 +731,8 @@ impl<'a> Engine<'a> {
                 Ok(K::Null)
             }
             "get" => self.eval_get(x),
+            "parse" => self.eval_parse(x),
+            "eval" => self.eval_tree(x),
             "hopen" => self.eval_hopen(x),
             "hclose" => self.eval_hclose(x),
             "hcount" => storage::hcount(x),
@@ -736,6 +766,18 @@ impl<'a> Engine<'a> {
     fn eval_binary_dispatch(&mut self, op: &str, lhs: &K, rhs: &K) -> KResult<K> {
         match op {
             "@" => self.apply_value(lhs, &[Some(rhs.clone())]),
+            "each" | "over" | "scan" | "prior" => {
+                let K::Func(f) = lhs else {
+                    return Err(KError::ty(format!("{op} requires a function on its left")));
+                };
+                let kind = match op {
+                    "each" => AdverbKind::Each,
+                    "over" => AdverbKind::Over,
+                    "scan" => AdverbKind::Scan,
+                    _ => AdverbKind::EachPrior,
+                };
+                self.eval_adverb(kind, f, std::slice::from_ref(rhs))
+            }
             "." => {
                 let K::Vector(cv) = rhs else {
                     return self.apply_value(lhs, &[Some(rhs.clone())]);
@@ -812,6 +854,9 @@ impl<'a> Engine<'a> {
     }
 
     pub fn apply_func_opt(&mut self, func: &Func, args: &[Option<K>]) -> KResult<K> {
+        // `f[]` calls with the generic null rather than making a projection
+        let niladic = [Some(K::Null)];
+        let args = if matches!(args, [None]) { &niladic[..] } else { args };
         let arity = self.func_arity(func);
         // Check for omitted projection slots (`f[1;]` or partial application `+[1]`)!
         let has_missing = args.iter().any(|a| a.is_none() || matches!(a, Some(K::Null)) && args.len() > 1);
@@ -874,6 +919,7 @@ impl<'a> Engine<'a> {
                 match n.as_str() {
                     "aj" | "aj0" | "ej" | "ssr" => 3,
                     "wj" | "wj1" | ".Q.dpft" => 4,
+                    ".Q.s" => 1,
                     ".kix.dist" => 2,
                     _ if is_unary_keyword(&n) => 1,
                     _ => 2,
@@ -893,6 +939,7 @@ impl<'a> Engine<'a> {
             ("wj1", 4) => joins::window_join(&vals[0], &vals[1], &vals[2], &vals[3], false, |f, a| self.apply_func(f, a)),
             (".Q.dpft", 4) => storage::q_dpft(self.ws, &vals[0], &vals[1], &vals[2], &vals[3]),
             (".kix.dist", 2 | 3) => self.eval_kix_dist(vals),
+            ("enlist", 2..) => Ok(K::Vector(ColVec::from_atoms(vals.to_vec()))),
             (_, 1) => self.eval_unary_dispatch(sym, &vals[0]),
             (_, 2) => self.eval_binary_dispatch(&name, &vals[0], &vals[1]),
             _ => Err(KError::rank(format!("wrong number of arguments ({}) to {name}", vals.len()))),
@@ -908,18 +955,29 @@ impl<'a> Engine<'a> {
         };
         let mode = match resolve(mode_s).as_str() {
             "replicated" => DistMode::Replicated,
-            "sharded" => {
-                let key = vals.get(2).and_then(|v| if let K::Sym(s) = v { Some(*s) } else { None }).unwrap_or_else(|| intern("sym"));
-                DistMode::Sharded { key }
-            }
-            "partitioned" => {
-                let col = vals.get(2).and_then(|v| if let K::Sym(s) = v { Some(*s) } else { None }).unwrap_or_else(|| intern("date"));
-                DistMode::Partitioned { col }
-            }
+            "sharded" => match vals.get(2) {
+                None => DistMode::Sharded { key: intern("sym") },
+                Some(K::Sym(key)) => DistMode::Sharded { key: *key },
+                Some(_) => return Err(KError::ty(".kix.dist `sharded takes one column; use `partitioned for several")),
+            },
+            "partitioned" => match vals.get(2) {
+                None => DistMode::Partitioned { col: intern("date") },
+                Some(K::Sym(col)) => DistMode::Partitioned { col: *col },
+                Some(K::Vector(ColVec::Sym(_, cols))) if !cols.is_empty() => {
+                    if cols.iter().enumerate().any(|(i, c)| cols[..i].contains(c)) {
+                        return Err(KError::domain(".kix.dist names a column twice"));
+                    }
+                    match cols.as_slice() {
+                        [col] => DistMode::Partitioned { col: *col },
+                        _ => DistMode::CoPartitioned { cols: (**cols).clone() },
+                    }
+                }
+                Some(_) => return Err(KError::ty(".kix.dist partition columns must be symbols")),
+            },
             other => return Err(KError::domain(format!("unknown distribution mode `{other}"))),
         };
-        self.ws.dist.insert(tbl, mode.clone());
-        self.record_op(LogOp::SetDist { table: tbl, mode })?;
+        self.record_ops(vec![LogOp::SetDist { table: tbl, mode: mode.clone() }])?;
+        self.ws.dist.insert(tbl, mode);
         Ok(K::Sym(tbl))
     }
 
@@ -968,6 +1026,11 @@ impl<'a> Engine<'a> {
         match kind {
             AdverbKind::Each => match vals.len() {
                 1 => {
+                    // over a dictionary, `each` maps the values and keeps the keys
+                    if let K::Dict(d) = &vals[0] {
+                        let mapped = self.eval_adverb(kind, inner, std::slice::from_ref(&d.vals))?;
+                        return Ok(K::Dict(Arc::new(Dict { keys: d.keys.clone(), vals: Box::new(mapped) })));
+                    }
                     let K::Vector(cv) = &vals[0] else {
                         return self.apply_func(inner, vals);
                     };
@@ -1250,6 +1313,17 @@ impl<'a> Engine<'a> {
             let K::Func(f) = &v[2] else {
                 return Err(KError::ty("functional amend third argument must be a function").into());
             };
+            if op == "." {
+                if let K::Vector(path) = &v[1] {
+                    let path: Vec<K> = (0..path.len()).map(|i| path.get_atom(i)).collect();
+                    let updated = self.amend_path(base, &path, f, v.get(3))?;
+                    if let Some(s) = inplace_sym {
+                        self.set_global(s, updated)?;
+                        return Ok(K::Sym(s));
+                    }
+                    return Ok(updated);
+                }
+            }
             let idx_list = vec![Some(v[1].clone())];
             let cur_sub = ops::index_k(&base, &idx_list)?;
             let new_sub = if v.len() >= 4 {
@@ -1265,6 +1339,20 @@ impl<'a> Engine<'a> {
             return Ok(updated);
         }
         Err(KError::rank("invalid @ / . arguments").into())
+    }
+
+    /// Amend the element reached by following `path` into nested lists and dictionaries.
+    fn amend_path(&mut self, target: K, path: &[K], f: &Func, y: Option<&K>) -> KResult<K> {
+        let Some((head, rest)) = path.split_first() else {
+            return match y {
+                Some(y) => self.apply_func(f, &[target, y.clone()]),
+                None => self.apply_func(f, &[target]),
+            };
+        };
+        let idx = [Some(head.clone())];
+        let sub = ops::index_k(&target, &idx)?;
+        let new_sub = self.amend_path(sub, rest, f, y)?;
+        self.amend_in_place(target, &idx, None, &new_sub)
     }
 
     fn amend_in_place(&mut self, target: K, indices: &[Option<K>], op: Option<SymId>, rhs: &K) -> KResult<K> {
@@ -1330,7 +1418,7 @@ impl<'a> Engine<'a> {
                     };
                     let new_cv = match nv {
                         K::Vector(cv) if cv.len() == f.nrows() => cv,
-                        atom => ColVec::from_atoms(vec![atom; f.nrows()]),
+                        atom => ColVec::repeat(atom, f.nrows()),
                     };
                     if let Some(ci) = f.col_idx(*col) {
                         f.vals[ci] = new_cv;
@@ -1346,65 +1434,106 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// Functional select `?[t; c; b; a]` (supports basic list of parse trees or symbols).
+    /// Functional select and exec `?[t; c; b; a]` / `?[t; c; b; a; n]`. `b` is `0b` (no grouping), `1b` (distinct), a
+    /// dictionary of groupings, `()` (exec) or one tree (exec by it); `a` is `()` (all columns), a dictionary of columns
+    /// or one tree (exec of it).
     fn eval_functional_select(&mut self, args: &[Option<Expr>]) -> KResult<K> {
-        let t_expr = args[0].clone().unwrap_or(Expr::Lit(K::Null));
-        let c_val = args.get(1).and_then(|a| a.as_ref()).map(|e| self.eval_expr(e)).transpose()?.unwrap_or(K::Null);
-        let b_val = args.get(2).and_then(|a| a.as_ref()).map(|e| self.eval_expr(e)).transpose()?.unwrap_or(K::Bool(false));
-        let a_val = args.get(3).and_then(|a| a.as_ref()).map(|e| self.eval_expr(e)).transpose()?.unwrap_or(K::Null);
-
-        let where_clauses = parse_functional_where(&c_val)?;
-        let cols = parse_functional_agg_dict(&a_val)?;
-        let (distinct, by) = match &b_val {
-            K::Bool(false) => (false, None),
-            K::Bool(true) => (true, None),
-            K::Dict(_) => (false, Some(parse_functional_agg_dict(&b_val)?)),
-            _ => (false, None),
+        let [c_val, b_val, a_val] = self.functional_args(args)?;
+        let limit = args.get(4).and_then(|a| a.as_ref()).map(|e| self.eval_expr(e)).transpose()?;
+        let one_column = !matches!(a_val, K::Dict(_) | K::Null) && !matches!(&a_val, K::Vector(cv) if cv.is_empty());
+        let (distinct, by, exec) = match &b_val {
+            K::Bool(b) => (*b, None, one_column),
+            K::Dict(_) => (false, Some(tree::col_specs(&b_val)?), one_column),
+            K::Null => (false, None, true),
+            K::Vector(cv) if cv.is_empty() => (false, None, true),
+            _ => (false, Some(tree::col_specs(&b_val)?), true),
         };
         let q = crate::ast::QSql {
-            kind: crate::ast::QSqlKind::Select,
+            kind: if exec { crate::ast::QSqlKind::Exec } else { crate::ast::QSqlKind::Select },
             distinct,
-            limit: None,
-            cols,
+            limit: limit.map(|n| Box::new(Expr::Lit(n))),
+            cols: tree::col_specs(&a_val)?,
             by,
-            from: Box::new(t_expr),
-            where_clauses,
+            from: Box::new(args[0].clone().unwrap_or(Expr::Lit(K::Null))),
+            where_clauses: tree::where_clauses(&c_val)?,
         };
         self.eval_qsql(&q)
     }
 
-    /// Functional update/delete `![t; c; b; a]`.
+    /// Functional update and delete `![t; c; b; a]`: `a` is a dictionary of new columns, the names of columns to delete,
+    /// or no names (delete the rows `c` keeps).
     fn eval_functional_update(&mut self, args: &[Option<Expr>]) -> KResult<K> {
-        let t_expr = args[0].clone().unwrap_or(Expr::Lit(K::Null));
-        let c_val = args.get(1).and_then(|a| a.as_ref()).map(|e| self.eval_expr(e)).transpose()?.unwrap_or(K::Null);
-        let b_val = args.get(2).and_then(|a| a.as_ref()).map(|e| self.eval_expr(e)).transpose()?.unwrap_or(K::Bool(false));
-        let a_val = args.get(3).and_then(|a| a.as_ref()).map(|e| self.eval_expr(e)).transpose()?.unwrap_or(K::Null);
-
-        let where_clauses = parse_functional_where(&c_val)?;
-        if matches!(&a_val, K::Vector(cv) if cv.is_empty()) {
-            let q = crate::ast::QSql {
-                kind: crate::ast::QSqlKind::DeleteRows,
-                distinct: false,
-                limit: None,
-                cols: vec![],
-                by: None,
-                from: Box::new(t_expr),
-                where_clauses,
-            };
-            return self.eval_qsql(&q);
-        }
-        let cols = parse_functional_agg_dict(&a_val)?;
-        let by = if let K::Dict(_) = &b_val { Some(parse_functional_agg_dict(&b_val)?) } else { None };
+        use crate::ast::QSqlKind;
+        let [c_val, b_val, a_val] = self.functional_args(args)?;
+        let (kind, cols) = match &a_val {
+            K::Vector(cv) if cv.is_empty() => (QSqlKind::DeleteRows, vec![]),
+            K::Sym(_) | K::Vector(ColVec::Sym(..)) => {
+                let names = match &a_val {
+                    K::Sym(s) => vec![*s],
+                    K::Vector(ColVec::Sym(_, xs)) => (**xs).clone(),
+                    _ => vec![],
+                };
+                let spec = |n| crate::ast::ColSpec { name: Some(n), expr: Expr::Var(n) };
+                (QSqlKind::DeleteCols, names.into_iter().map(spec).collect())
+            }
+            _ => (QSqlKind::Update, tree::col_specs(&a_val)?),
+        };
         let q = crate::ast::QSql {
-            kind: crate::ast::QSqlKind::Update,
+            kind,
             distinct: false,
             limit: None,
             cols,
-            by,
-            from: Box::new(t_expr),
-            where_clauses,
+            by: if let K::Dict(_) = &b_val { Some(tree::col_specs(&b_val)?) } else { None },
+            from: Box::new(args[0].clone().unwrap_or(Expr::Lit(K::Null))),
+            where_clauses: tree::where_clauses(&c_val)?,
         };
         self.eval_qsql(&q)
+    }
+
+    /// The values of the `c`, `b` and `a` arguments of a functional query.
+    fn functional_args(&mut self, args: &[Option<Expr>]) -> KResult<[K; 3]> {
+        let mut out = [K::Null, K::Bool(false), K::Null];
+        for (slot, arg) in out.iter_mut().zip(args.iter().skip(1)) {
+            if let Some(e) = arg {
+                *slot = self.eval_expr(e)?;
+            }
+        }
+        Ok(out)
+    }
+
+    // ----- Parse trees --------------------------------------------------------
+
+    /// `parse "..."`: the parse tree of the source; several statements are joined by `;`.
+    fn eval_parse(&mut self, x: &K) -> KResult<K> {
+        let source = match x {
+            K::Char(_) | K::Vector(ColVec::Char(..)) => x.as_str().unwrap_or_default(),
+            _ => return Err(KError::ty("parse expects a string")),
+        };
+        let ns = self.session.current_ns.clone();
+        let mut trees = parse_script(&source)?.iter().map(|e| tree::to_tree(e, &ns)).collect::<KResult<Vec<_>>>()?;
+        Ok(match trees.len() {
+            0 => K::Null,
+            1 => trees.remove(0),
+            _ => {
+                trees.insert(0, K::Func(Func::Prim(intern(";"))));
+                K::Vector(ColVec::General(Attr::None, Arc::new(trees)))
+            }
+        })
+    }
+
+    /// `eval tree`
+    fn eval_tree(&mut self, x: &K) -> KResult<K> {
+        if let K::Vector(ColVec::General(_, items)) = x {
+            if matches!(items.first(), Some(K::Func(Func::Prim(s))) if resolve(*s) == ";") {
+                let mut last = K::Null;
+                for statement in &items[1..] {
+                    last = self.eval_tree(statement)?;
+                }
+                return Ok(last);
+            }
+        }
+        let e = tree::to_expr(x)?;
+        self.eval_expr(&e)
     }
 
     // ----- Persistence (`set` / `get`) & IPC handles (`hopen` / `hclose`) ---
@@ -1454,6 +1583,10 @@ impl<'a> Engine<'a> {
     // ----- System Commands (`\a`, `\b`, `\v`, `\f`, `\d`, `\l`, `\t`, `\ts`, `\w`)
 
     fn eval_sys_cmd(&mut self, cmd: &str, arg: &str) -> KResult<K> {
+        // `\t:100 expr` arrives as command `t:100`
+        if let Some((c @ ("t" | "ts"), n)) = cmd.split_once(':') {
+            return self.eval_sys_cmd(c, &format!(":{n} {arg}"));
+        }
         match cmd {
             "a" => self.eval_unary_dispatch(intern("tables"), &K::Null),
             "b" => self.eval_unary_dispatch(intern("views"), &K::Null),
@@ -1570,62 +1703,5 @@ fn is_ambivalent_prim(func: &Func) -> bool {
             AdverbKind::Each | AdverbKind::Over | AdverbKind::Scan | AdverbKind::EachPrior
         ),
         _ => false,
-    }
-}
-
-fn parse_functional_where(c: &K) -> KResult<Vec<Expr>> {
-    match c {
-        K::Null => Ok(vec![]),
-        K::Vector(cv) if cv.is_empty() => Ok(vec![]),
-        K::Vector(cv) => {
-            let mut out = Vec::with_capacity(cv.len());
-            for i in 0..cv.len() {
-                out.push(k_tree_to_expr(&cv.get_atom(i))?);
-            }
-            Ok(out)
-        }
-        _ => Ok(vec![k_tree_to_expr(c)?]),
-    }
-}
-
-fn parse_functional_agg_dict(d: &K) -> KResult<Vec< crate::ast::ColSpec >> {
-    let K::Dict(dict) = d else {
-        return Ok(vec![]);
-    };
-    let K::Vector(ColVec::Sym(_, names)) = &*dict.keys else {
-        return Err(KError::ty("functional query column dict keys must be symbols"));
-    };
-    let mut specs = Vec::with_capacity(names.len());
-    for (i, &nm) in names.iter().enumerate() {
-        let v = ops::index_k(&dict.vals, &[Some(K::Long(i as i64))])?;
-        specs.push(crate::ast::ColSpec { name: Some(nm), expr: k_tree_to_expr(&v)? });
-    }
-    Ok(specs)
-}
-
-fn k_tree_to_expr(k: &K) -> KResult<Expr> {
-    match k {
-        K::Sym(s) => Ok(Expr::Var(*s)),
-        K::Vector(ColVec::General(_, items)) if !items.is_empty() => {
-            // `(op; arg1; arg2)` functional parse tree (`enlist` literal escapes via `(enlist; val)`)!
-            if let K::Func(Func::Prim(op_s)) = &items[0] {
-                if resolve(*op_s) == "enlist" && items.len() == 2 {
-                    return Ok(Expr::Lit(items[1].clone()));
-                }
-                if items.len() == 2 {
-                    return Ok(Expr::Unary { op: *op_s, arg: Box::new(k_tree_to_expr(&items[1])?) });
-                }
-                if items.len() == 3 {
-                    return Ok(Expr::Binary {
-                        op: *op_s,
-                        lhs: Box::new(k_tree_to_expr(&items[1])?),
-                        rhs: Box::new(k_tree_to_expr(&items[2])?),
-                    });
-                }
-            }
-            let args: KResult<Vec<Option<Expr>>> = items[1..].iter().map(|x| k_tree_to_expr(x).map(Some)).collect();
-            Ok(Expr::Apply { target: Box::new(k_tree_to_expr(&items[0])?), args: args? })
-        }
-        other => Ok(Expr::Lit(other.clone())),
     }
 }

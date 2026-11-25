@@ -1,0 +1,25 @@
+[package]
+name = "kix-storage"
+version = "0.1.0"
+edition = "2021"
+description = "A shard node of distributed kixdb: a full engine behind an Arrow Flight service, optionally a Raft replica"
+license = "MIT"
+
+[lib]
+name = "kix_storage"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kix-shard"
+path = "src/main.rs"
+
+[dependencies]
+kixdb = { path = "../../.." }
+kix-shared-ces = { path = "../shared-ces" }
+kix-raft = { path = "../raft" }
+arrow-flight = "60"
+tonic = "0.14"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "signal", "time"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["alloc"] }

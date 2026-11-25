@@ -1,4 +1,4 @@
-use kixdb::Server;
+use kixdb::{Server, StorageOptions};
 use std::fs::OpenOptions;
 use std::io::Write;
 
@@ -84,4 +84,43 @@ fn csv_zero_colon_and_bulk_import() {
     let count = kixdb::tools::bulk_import(&mut c, &csv_path, "bulk_tbl", ',', true, true, 2, None, None).unwrap();
     assert_eq!(count, 3);
     assert_eq!(c.eval("exec sum qty from bulk_tbl").unwrap().to_string(), "60");
+}
+
+#[test]
+fn a_data_directory_is_locked_and_the_log_checkpoints_itself() {
+    let tmp = tempfile::tempdir().unwrap();
+    let opts = StorageOptions { sync_wal: false, checkpoint_every: 3 };
+    let srv = Server::open_with(tmp.path(), opts).unwrap();
+    assert!(Server::open(tmp.path()).is_err(), "a second process must not open the same directory");
+    let mut c = srv.connect();
+    for i in 0..10 {
+        c.eval(&format!("x{i}: {i}")).unwrap();
+    }
+    let stats = srv.storage_stats();
+    assert!(stats.wal_records <= 3 && stats.snap_bytes > 0, "{} records", stats.wal_records);
+    srv.simulate_crash();
+    drop(c);
+    let again = Server::open(tmp.path()).unwrap();
+    assert_eq!(again.connect().eval("x0 + x9").unwrap().to_string(), "9");
+}
+
+#[test]
+fn partitioned_queries_load_only_the_columns_they_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hdb = tmp.path().display().to_string().replace('\\', "/");
+    {
+        let srv = Server::new();
+        let mut c = srv.connect();
+        c.eval("t: ([] sym: `a`b; px: 1.5 2.5; size: 10 20)").unwrap();
+        c.eval(&format!(".Q.dpft[`:{hdb}; 2026.11.24; `sym; `t]")).unwrap();
+    }
+    // damage a column: queries that do not name it still work, those that do fail
+    std::fs::write(tmp.path().join("2026.11.24/t/px"), b"damaged").unwrap();
+    let srv = Server::new();
+    let mut c = srv.connect();
+    c.eval(&format!("\\l {hdb}")).unwrap();
+    assert_eq!(c.eval("exec sum size from t where date = 2026.11.24").unwrap().to_string(), "30");
+    assert_eq!(c.eval("count select i from t").unwrap().to_string(), "2");
+    assert!(c.eval("exec px from t").is_err());
+    assert!(c.eval("select from t").is_err());
 }

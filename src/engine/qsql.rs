@@ -12,17 +12,31 @@ impl<'a> Engine<'a> {
     pub fn eval_qsql(&mut self, q: &QSql) -> KResult<K> {
         // Check if `from` is a symbol `` `table `` (in-place `update` / `delete`, or reading a named table)
         let mut inplace_target: Option<SymId> = None;
+        // the names a `select`/`exec` with an explicit column list mentions: all a partitioned table has to load
+        let needed = (matches!(q.kind, QSqlKind::Select | QSqlKind::Exec) && !q.cols.is_empty()).then(|| {
+            let mut names = Vec::new();
+            for e in q.cols.iter().chain(q.by.iter().flatten()).map(|c| &c.expr).chain(&q.where_clauses) {
+                e.any(&mut |x| {
+                    match x {
+                        Expr::Var(s) | Expr::Field(_, s) => names.push(*s),
+                        _ => {}
+                    }
+                    false
+                });
+            }
+            names
+        });
         let source_k = match &*q.from {
             Expr::Lit(K::Sym(tname)) => {
                 if matches!(q.kind, QSqlKind::Update | QSqlKind::DeleteRows | QSqlKind::DeleteCols) {
                     inplace_target = Some(*tname);
                 }
-                self.resolve_table_for_query(*tname, &q.where_clauses)?
+                self.resolve_table_for_query(*tname, &q.where_clauses, needed.as_deref())?
             }
             Expr::Var(tname) => {
                 // If `tname` is a mounted partitioned HDB table, prune partitions using `where_clauses`!
                 if self.has_partitioned(*tname) {
-                    self.resolve_table_for_query(*tname, &q.where_clauses)?
+                    self.resolve_table_for_query(*tname, &q.where_clauses, needed.as_deref())?
                 } else {
                     self.eval_expr(&q.from)?
                 }
@@ -203,7 +217,7 @@ impl<'a> Engine<'a> {
                                 }
                             }
                             atom => {
-                                out_vals.push(ColVec::from_atoms(vec![atom; target_len]));
+                                out_vals.push(ColVec::repeat(atom, target_len));
                             }
                         }
                     }
@@ -246,7 +260,7 @@ impl<'a> Engine<'a> {
                     let v = self.eval_in_table_scope(filtered, &bs.expr)?;
                     match v {
                         K::Vector(cv) if cv.len() == filtered.nrows() => by_vecs.push(cv),
-                        atom if atom.is_atom() => by_vecs.push(ColVec::from_atoms(vec![atom; filtered.nrows()])),
+                        atom if atom.is_atom() => by_vecs.push(ColVec::repeat(atom, filtered.nrows())),
                         _ => return Err(KError::length("by expression length must match table row count")),
                     }
                 }
@@ -330,18 +344,8 @@ impl<'a> Engine<'a> {
         if let Some(by_specs) = by {
             // `exec val by key from t` -> dictionary `keys ! vals`
             let tbl = self.exec_select(filtered, cols, Some(by_specs), None)?;
-            if let K::KeyedTable(kt) = tbl {
-                let k_part = if kt.keys.ncols() == 1 {
-                    K::Vector(kt.keys.vals[0].clone())
-                } else {
-                    K::Table(Arc::new(kt.keys.clone()))
-                };
-                let v_part = if kt.vals.ncols() == 1 {
-                    K::Vector(kt.vals.vals[0].clone())
-                } else {
-                    K::Table(Arc::new(kt.vals.clone()))
-                };
-                return Ok(K::Dict(Arc::new(Dict { keys: Box::new(k_part), vals: Box::new(v_part) })));
+            if let K::KeyedTable(kt) = &tbl {
+                return Ok(exec_by_result(kt));
             }
             return Ok(tbl);
         }
@@ -386,7 +390,7 @@ impl<'a> Engine<'a> {
             for bs in by_specs {
                 match self.eval_in_table_scope(&sub, &bs.expr)? {
                     K::Vector(cv) if cv.len() == sub.nrows() => by_vecs.push(cv),
-                    atom if atom.is_atom() => by_vecs.push(ColVec::from_atoms(vec![atom; sub.nrows()])),
+                    atom if atom.is_atom() => by_vecs.push(ColVec::repeat(atom, sub.nrows())),
                     _ => return Err(KError::length("update by expression length mismatch")),
                 }
             }
@@ -451,7 +455,7 @@ impl<'a> Engine<'a> {
             if all_selected {
                 let new_cv = match val {
                     K::Vector(cv) if cv.len() == total => cv,
-                    atom => ColVec::from_atoms(vec![atom; total]),
+                    atom => ColVec::repeat(atom, total),
                 };
                 if let Some(pos) = work.col_idx(cname) {
                     work.vals[pos] = new_cv;
@@ -462,7 +466,7 @@ impl<'a> Engine<'a> {
             } else {
                 let sub_cv = match val {
                     K::Vector(cv) if cv.len() == active_rows.len() => cv,
-                    atom => ColVec::from_atoms(vec![atom; active_rows.len()]),
+                    atom => ColVec::repeat(atom, active_rows.len()),
                 };
                 let typed_null = sub_cv.null_atom();
                 let mut atoms: Vec<K> = if let Some(ex) = work.col(cname) {
@@ -658,6 +662,22 @@ fn coerce_rows_to_flip(cols: &[SymId], proto: &[ColVec], rows: &K) -> KResult<Fl
     }
 }
 
+/// What `exec ... by` gives for the keyed table the same `select` gives: a dictionary whose sides are lists where there
+/// is one column. With several on both sides it is that keyed table (in q a dictionary of tables is one).
+pub fn exec_by_result(kt: &KeyedTable) -> K {
+    if kt.keys.ncols() > 1 && kt.vals.ncols() > 1 {
+        return K::KeyedTable(Arc::new(kt.clone()));
+    }
+    let side = |f: &Flip| {
+        if f.ncols() == 1 {
+            K::Vector(f.vals[0].clone())
+        } else {
+            K::Table(Arc::new(f.clone()))
+        }
+    };
+    K::Dict(Arc::new(Dict { keys: Box::new(side(&kt.keys)), vals: Box::new(side(&kt.vals)) }))
+}
+
 fn restore_keys(flip: Flip, orig_keys: Option<Vec<SymId>>) -> KResult<K> {
     match orig_keys {
         Some(ks) if ks.iter().all(|k| flip.col_idx(*k).is_some()) => KeyedTable::from_flip_key_names(&flip, &ks),
@@ -665,7 +685,8 @@ fn restore_keys(flip: Flip, orig_keys: Option<Vec<SymId>>) -> KResult<K> {
     }
 }
 
-fn resolve_col_names(specs: &[ColSpec]) -> Vec<SymId> {
+/// The result column names of a qSQL column list (inferred, with suffixes for repeats).
+pub fn resolve_col_names(specs: &[ColSpec]) -> Vec<SymId> {
     let mut used: HashMap<SymId, usize> = HashMap::new();
     let mut out = Vec::with_capacity(specs.len());
     for (idx, cs) in specs.iter().enumerate() {

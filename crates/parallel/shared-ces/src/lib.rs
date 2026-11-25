@@ -11,4 +11,4 @@ pub mod route;
 pub mod wire;
 
 pub use config::{ClusterConfig, ShardInfo};
-pub use wire::{Fragment, LoadReq, RunReply, ShardStatus, ShuffleReq, WireError, Work};
+pub use wire::{Fragment, LoadMode, LoadReq, MemberReq, MutateReq, ShardStatus, ShuffleReq, Work};

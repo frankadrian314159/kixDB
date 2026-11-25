@@ -383,13 +383,32 @@ pub fn sanitize_ident(raw: &str, fallback_idx: usize) -> String {
     out
 }
 
+/// Whether `{...}`, `(...)`, `[...]` and strings are closed, so that a shell can run what has been typed so far.
+pub fn delimiters_balanced(src: &str) -> bool {
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut bytes = src.bytes();
+    while let Some(b) = bytes.next() {
+        match b {
+            b'\\' if in_str => {
+                bytes.next();
+            }
+            b'"' => in_str = !in_str,
+            b'(' | b'[' | b'{' if !in_str => depth += 1,
+            b')' | b']' | b'}' if !in_str => depth -= 1,
+            _ => {}
+        }
+    }
+    !in_str && depth <= 0
+}
+
 pub trait QSession {
     fn run_q(&mut self, code: &str) -> KResult<()>;
     fn describe_table(&mut self, name: &str) -> Option<TableInfo>;
 }
 
 /// Import CSV text into `table_name` (creating it with inferred types when `create_new` is true).
-pub fn import_csv(sess: &mut dyn QSession, csv_text: &str, table_name: &str, create_new: bool) -> KResult<usize> {
+pub fn import_csv<S: QSession + ?Sized>(sess: &mut S, csv_text: &str, table_name: &str, create_new: bool) -> KResult<usize> {
     let rows = parse_csv(csv_text)?;
     if rows.is_empty() {
         return Ok(0);
@@ -431,8 +450,8 @@ pub fn import_csv(sess: &mut dyn QSession, csv_text: &str, table_name: &str, cre
 }
 
 /// Stream a delimited file of arbitrary size into `table_name` in batches without loading the file into RAM.
-pub fn bulk_import(
-    sess: &mut dyn QSession,
+pub fn bulk_import<S: QSession + ?Sized>(
+    sess: &mut S,
     path: &std::path::Path,
     table_name: &str,
     delimiter: char,

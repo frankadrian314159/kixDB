@@ -52,3 +52,29 @@ fn cli_binary_runs_queries_and_scripts() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(stdout.trim(), "50");
 }
+
+#[test]
+fn tls_and_plain_clients_share_a_port() {
+    let (cert, key) = kixdb::ipc::self_signed_cert("127.0.0.1").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let ca = dir.path().join("ca.pem");
+    std::fs::write(&ca, &cert).unwrap();
+    let mut cfg = IpcConfig::with_single_user("alice", "s3cr3t");
+    cfg.tls = Some(kixdb::ipc::tls_server_config(cert.as_bytes(), key.as_bytes()).unwrap());
+    let listener = Listener::bind(Server::new(), ("127.0.0.1", 0), cfg).unwrap();
+    let addr = listener.local_addr().to_string();
+    let ca = ca.display().to_string();
+
+    let mut secure = IpcClient::connect_tls(&addr, "alice", "s3cr3t", &ca).unwrap();
+    // a large message both ways
+    assert_eq!(secure.query_str("x: til 100000; sum x").unwrap().to_string(), "4999950000");
+    assert_eq!(secure.query_str("x").unwrap().count(), 100_000);
+    assert!(IpcClient::connect_tls(&addr, "alice", "wrong", &ca).is_err());
+    let mut plain = IpcClient::connect_addr(&addr, "alice", "s3cr3t").unwrap();
+    assert_eq!(plain.query_str("count x").unwrap().to_string(), "100000");
+    // a certificate the client does not trust is refused
+    let (other, _) = kixdb::ipc::self_signed_cert("127.0.0.1").unwrap();
+    std::fs::write(dir.path().join("other.pem"), other).unwrap();
+    let other = dir.path().join("other.pem").display().to_string();
+    assert!(IpcClient::connect_tls(&addr, "alice", "s3cr3t", &other).is_err());
+}

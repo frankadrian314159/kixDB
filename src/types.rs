@@ -733,6 +733,14 @@ impl ColVec {
         self.gather(&idx)
     }
 
+    /// `n` copies of an atom as a vector (of the atom's type even when `n` is 0).
+    pub fn repeat(atom: K, n: usize) -> ColVec {
+        if n == 0 {
+            return ColVec::from_atoms(vec![atom]).take(0);
+        }
+        ColVec::from_atoms(vec![atom; n])
+    }
+
     /// Normalize a general list of uniform atoms into a typed vector (kdb+'s auto-collapse rule).
     pub fn from_atoms(items: Vec<K>) -> ColVec {
         if items.is_empty() {

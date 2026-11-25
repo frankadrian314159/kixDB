@@ -167,7 +167,10 @@ pub fn tokenize(src: &str) -> KResult<Vec<Tok>> {
             && (after_ws || prev != PrevKind::Value);
         if b.is_ascii_digit() || neg_num_ok {
             let (k, next_i) = lex_numeric_sequence(src, i)?;
-            out.push(Tok::Lit(k));
+            out.push(match k {
+                K::Func(Func::Prim(s)) => Tok::Op(s.as_str_owned()),
+                k => Tok::Lit(k),
+            });
             i = next_i;
             after_ws = false;
             prev = PrevKind::Value;
@@ -226,7 +229,7 @@ pub fn tokenize(src: &str) -> KResult<Vec<Tok>> {
                 i += 2;
                 after_ws = false;
                 prev = PrevKind::Value;
-            } else if prev == PrevKind::Value && !after_ws {
+            } else if !after_ws && (prev == PrevKind::Value || matches!(out.last(), Some(Tok::Op(_) | Tok::Comma))) {
                 out.push(Tok::Adverb(AdverbKind::Each));
                 i += 1;
                 after_ws = false;
@@ -306,7 +309,6 @@ pub fn tokenize(src: &str) -> KResult<Vec<Tok>> {
 
         // Identifiers & `.namespace.name` (note: `.` followed by letter starts a namespace ident when not directly on a value)
         if b.is_ascii_alphabetic()
-            || b == b'_'
             || (b == b'.' && i + 1 < len && bytes[i + 1].is_ascii_alphabetic() && (after_ws || prev != PrevKind::Value))
         {
             let start = i;

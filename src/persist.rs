@@ -56,6 +56,8 @@ pub trait Replicator: Send + Sync {
 
 pub struct Persist {
     dir: PathBuf,
+    /// Exclusive lock on `kix.lock`, held while the workspace is open.
+    _lock: File,
     wal_file: File,
     pub wal_records: u64,
     pub wal_bytes: u64,
@@ -67,6 +69,10 @@ pub struct Persist {
 impl Persist {
     pub fn open(dir: &Path, opts: StorageOptions) -> KResult<(Persist, Workspace)> {
         fs::create_dir_all(dir)?;
+        let lock = OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("kix.lock"))?;
+        if lock.try_lock().is_err() {
+            return Err(KError::io(format!("data directory '{}' is in use by another kixdb process", dir.display())));
+        }
         let mut ws = Workspace::new();
         ws.data_dir = Some(dir.to_path_buf());
 
@@ -135,6 +141,7 @@ impl Persist {
 
         let p = Persist {
             dir: dir.to_path_buf(),
+            _lock: lock,
             wal_file,
             wal_records: replayed,
             wal_bytes: offset as u64,

@@ -1,0 +1,29 @@
+[package]
+name = "kix-control"
+version = "0.1.0"
+edition = "2021"
+description = "The control node of distributed kixdb: q / qSQL routing, planning and merging over shard nodes, and a kdb+ IPC gateway"
+license = "MIT"
+
+[lib]
+name = "kix_control"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kix-cluster"
+path = "src/main.rs"
+
+[dependencies]
+kixdb = { path = "../../.." }
+kix-shared-ces = { path = "../shared-ces" }
+arrow-flight = "60"
+tonic = "0.14"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time", "signal"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["alloc"] }
+
+[dev-dependencies]
+kix-storage = { path = "../storage" }
+kix-raft = { path = "../raft" }
+tempfile = "3"

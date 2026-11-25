@@ -57,6 +57,18 @@ pub fn shard_for_key(val: &K, slots: &[u32]) -> usize {
     slots.get(sl).copied().unwrap_or(0) as usize
 }
 
+/// The shard of a row placed by several columns together (such as `date` and `sym`): the hash of all their values, in
+/// the order given. One value routes as [`shard_for_key`].
+pub fn shard_for_keys(values: &[K], slots: &[u32]) -> usize {
+    match values {
+        [one] => shard_for_key(one, slots),
+        _ => {
+            let hashes: Vec<u8> = values.iter().flat_map(|v| key_hash(v).to_le_bytes()).collect();
+            slots.get(slot_of(fnv1a64(&hashes))).copied().unwrap_or(0) as usize
+        }
+    }
+}
+
 /// Route a temporal/integer partition value (`date`, `month`, `int`) to a shard index (`val mod nshards`).
 pub fn shard_for_partition(val: &K, nshards: usize) -> usize {
     let n = nshards.max(1) as i64;
@@ -86,5 +98,26 @@ mod tests {
         for c in counts {
             assert!(c > 800 && c < 1200, "skewed distribution: {counts:?}");
         }
+    }
+
+    #[test]
+    fn composite_keys_spread_each_day_and_each_symbol() {
+        let slots = even_slots(4);
+        let at = |day: i32, sym: &str| shard_for_keys(&[K::Date(day), K::Sym(intern(sym))], &slots);
+        assert_eq!(at(1, "AAPL"), at(1, "AAPL"));
+        assert_eq!(shard_for_keys(&[K::Long(42)], &slots), shard_for_key(&K::Long(42), &slots));
+        let mut counts = [0usize; 4];
+        for day in 0..40 {
+            for s in 0..100 {
+                counts[at(day, &format!("S{s}"))] += 1;
+            }
+        }
+        for c in counts {
+            assert!(c > 800 && c < 1200, "skewed distribution: {counts:?}");
+        }
+        // one day lands on every shard, and so does one symbol
+        let spread = |shards: std::collections::HashSet<usize>| shards.len() == 4;
+        assert!(spread((0..100).map(|s| at(7, &format!("S{s}"))).collect()));
+        assert!(spread((0..100).map(|d| at(d, "AAPL")).collect()));
     }
 }

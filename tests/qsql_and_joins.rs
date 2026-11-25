@@ -53,7 +53,7 @@ fn qsql_update_delete_insert_upsert() {
 
     // Grouped `update ... by sym`
     let rel = c.eval("exec diff from update diff: price - avg price by sym from trade where sym = `MSFT").unwrap();
-    assert_eq!(rel.to_string(), "-2 2f");
+    assert_eq!(rel.to_string(), "0n -2 0n 0n 2");
 
     // In-place update, insert, upsert, and delete
     c.eval("update size: size * 2 from `trade where sym = `MSFT").unwrap();

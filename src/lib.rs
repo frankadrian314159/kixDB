@@ -35,6 +35,11 @@ pub use types::{Attr, ColVec, Dict, Flip, Func, KeyedTable, K};
 /// route/scatter/gather them across distributed shard nodes while presenting a standard kdb+ IPC server to clients.
 pub trait Interceptor: Send {
     fn eval_query(&mut self, code: &str) -> Option<KResult<K>>;
+    /// A functional IPC message such as ``(`upsert; `trade; rows)``.
+    fn eval_message(&mut self, msg: &K) -> Option<KResult<K>> {
+        let _ = msg;
+        None
+    }
     fn explain_query(&mut self, code: &str) -> Option<KResult<Vec<String>>> {
         let _ = code;
         None
@@ -186,6 +191,11 @@ impl Server {
         Ok(())
     }
 
+    /// Look at the workspace (variables, views, mounted tables) under the read lock.
+    pub fn read_workspace<R>(&self, f: impl FnOnce(&engine::Workspace) -> R) -> R {
+        f(&self.shared.ws.read().unwrap_or_else(|e| e.into_inner()))
+    }
+
     pub fn checkpoint(&self) -> KResult<()> {
         let g = self.shared.ws.write().unwrap_or_else(|e| e.into_inner());
         let mut p_guard = g.persist.lock().unwrap_or_else(|e| e.into_inner());
@@ -259,6 +269,9 @@ impl Connection {
                 self.eval(&code)
             }
             K::Vector(ColVec::General(_, items)) if !items.is_empty() => {
+                if let Some(res) = self.interceptor.as_mut().and_then(|i| i.eval_message(msg)) {
+                    return res;
+                }
                 let mut ws = self.server.shared.ws.write().unwrap_or_else(|e| e.into_inner());
                 let mut eng = Engine::new(&mut ws, &mut self.session);
                 let head = &items[0];
@@ -305,6 +318,18 @@ impl Connection {
         } else {
             Ok(vec![vec![val]])
         }
+    }
+
+    /// Evaluate an already parsed expression (the cluster sends shards expressions, not source text).
+    pub fn eval_expr(&mut self, expr: &ast::Expr) -> KResult<K> {
+        let mut ws = self.server.shared.ws.write().unwrap_or_else(|e| e.into_inner());
+        Engine::new(&mut ws, &mut self.session).eval_expr(expr)
+    }
+
+    /// Set (`Some`) or drop (`None`) fully qualified globals atomically: one log record.
+    pub fn set_vars(&mut self, changes: Vec<(sym::SymId, Option<K>)>) -> KResult<()> {
+        let mut ws = self.server.shared.ws.write().unwrap_or_else(|e| e.into_inner());
+        Engine::new(&mut ws, &mut self.session).set_globals(changes)
     }
 
     /// Directly store or replace a table/value in the workspace without serializing through `q` text (fast bulk load for shards).

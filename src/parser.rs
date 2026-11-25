@@ -102,6 +102,10 @@ pub fn is_binary_keyword(s: &str) -> bool {
         s,
         "and"
             | "or"
+            | "each"
+            | "over"
+            | "scan"
+            | "prior"
             | "in"
             | "within"
             | "like"
@@ -226,19 +230,7 @@ impl<'a> Parser<'a> {
                 stmts.push(Expr::SysCmd { cmd, arg });
                 continue;
             }
-            // Explicit `:expr` return inside lambda (or `::` null literal!)
-            if inside_lambda && matches!(self.peek(), Tok::Colon) {
-                self.next();
-                if self.is_expr_end() {
-                    stmts.push(Expr::Return(Box::new(Expr::Lit(K::Null))));
-                } else {
-                    let e = self.parse_expr()?;
-                    stmts.push(Expr::Return(Box::new(e)));
-                }
-            } else {
-                let e = self.parse_expr()?;
-                stmts.push(e);
-            }
+            stmts.push(self.parse_expr()?);
             // If a semicolon terminates the last statement at top-level, kdb+ suppresses printing (returns `::` Null)!
             if !inside_lambda && matches!(self.peek(), Tok::Semi) {
                 while matches!(self.peek(), Tok::Semi) {
@@ -269,6 +261,12 @@ impl<'a> Parser<'a> {
                 "select" | "exec" | "update" | "delete" => return self.parse_qsql(),
                 _ => {}
             }
+        }
+
+        // `:expr` returns early from a lambda (also from inside `if[...]` and friends)
+        if matches!(self.peek(), Tok::Colon) {
+            self.next();
+            return Ok(Expr::Return(Box::new(self.parse_expr()?)));
         }
 
         // Prefix signal `'err`
@@ -321,7 +319,8 @@ impl<'a> Parser<'a> {
         // Prefix unary operator (`-x`, `+x` flip, `*x` first, `!x` til/key, `&x` where, `|x` reverse, `<x` iasc, `>x` idesc, `=x` group, `~x` not, `,x` enlist, `#x` count, `_x` floor, `$x` string, `?x` distinct, `@x` type, `.x` value)
         // Note: only if NOT followed immediately by an adverb (`+/`, `,/`, etc.) or `]` / `)` / `;` (bare verb value!)
         if let Some(op_str) = self.peek_prefix_op() {
-            if !matches!(self.peek_n(1), Tok::Adverb(_) | Tok::LBrack) {
+            let adverb_word = matches!(self.peek_n(1), Tok::Ident(s) if matches!(s.as_str(), "each" | "over" | "scan" | "prior"));
+            if !adverb_word && !matches!(self.peek_n(1), Tok::Adverb(_) | Tok::LBrack) {
                 self.next();
                 if self.is_expr_end() {
                     return Ok(Expr::Lit(K::Func(Func::Prim(intern(&op_str)))));

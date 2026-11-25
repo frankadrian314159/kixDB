@@ -78,24 +78,12 @@ impl FileStorage {
         let state_path = dir.join("raft.bin");
         let mem = if state_path.exists() {
             let bytes = fs::read(&state_path).map_err(|e| e.to_string())?;
-            if bytes.len() >= 8 && &bytes[..4] == b"KXRF" {
-                let crc = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-                if crc32fast::hash(&bytes[8..]) == crc {
-                    if let Ok(p) = postcard::from_bytes::<PersistedRaft>(&bytes[8..]) {
-                        MemStorage {
-                            hs: p.hs,
-                            entries: p.entries,
-                            snapshot: p.snapshot,
-                        }
-                    } else {
-                        MemStorage::new()
-                    }
-                } else {
-                    MemStorage::new()
-                }
-            } else {
-                MemStorage::new()
+            let damaged = || format!("{} is damaged", state_path.display());
+            if bytes.len() < 8 || &bytes[..4] != b"KXRF" || crc32fast::hash(&bytes[8..]).to_le_bytes() != bytes[4..8] {
+                return Err(damaged());
             }
+            let p: PersistedRaft = postcard::from_bytes(&bytes[8..]).map_err(|_| damaged())?;
+            MemStorage { hs: p.hs, entries: p.entries, snapshot: p.snapshot }
         } else {
             MemStorage::new()
         };

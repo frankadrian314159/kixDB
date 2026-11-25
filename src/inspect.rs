@@ -147,7 +147,7 @@ impl Connection {
         }
         if let Some(pt) = g.partitioned.get(&sym).cloned() {
             drop(g);
-            let flip = crate::storage::load_partitioned_filtered(&pt, &[], |_| Ok(K::Null)).ok()?;
+            let flip = crate::storage::load_partitioned_filtered(&pt, &[], None, |_| Ok(K::Null)).ok()?;
             let columns = flip
                 .cols
                 .iter()

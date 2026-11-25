@@ -226,7 +226,7 @@ pub fn mount_hdb_dir(ws: &mut Workspace, dir: &Path) -> KResult<()> {
         let entry = entry?;
         let path = entry.path();
         let fname = entry.file_name().to_string_lossy().into_owned();
-        if fname.starts_with('.') || fname == "sym" || fname == "kix.wal" || fname == "kix.snap" {
+        if fname.starts_with('.') || fname == "sym" || fname.starts_with("kix.") {
             continue;
         }
         if path.is_dir() {
@@ -303,8 +303,18 @@ fn parse_partition_dir_name(name: &str) -> Option<(PartKind, SymId, K)> {
 pub fn load_partitioned_filtered(
     pt: &PartitionedTable,
     where_clauses: &[Expr],
+    needed: Option<&[SymId]>,
     mut eval_rhs: impl FnMut(&Expr) -> KResult<K>,
 ) -> KResult<Flip> {
+    // only the referenced columns are read from disk (at least one, to know the number of rows)
+    let needed: Option<Vec<SymId>> = needed.map(|n| {
+        let mut on_disk: Vec<SymId> = pt.cols[1..].iter().copied().filter(|c| n.contains(c)).collect();
+        if on_disk.is_empty() {
+            on_disk.extend(pt.cols.get(1));
+        }
+        on_disk
+    });
+    let needed = needed.as_deref();
     let selected_slices: Vec<&PartitionSlice> = if let Some(first_wc) = where_clauses.first() {
         if let Some(pred) = match_partition_predicate(pt.part_col, first_wc, &mut eval_rhs)? {
             pt.slices.iter().filter(|s| pred(&s.part_val)).collect()
@@ -325,17 +335,18 @@ pub fn load_partitioned_filtered(
         };
         vals.push(p_empty);
         if let Some(sample_slice) = pt.slices.first() {
-            let sf = read_splayed_table(&sample_slice.path, None)?;
-            for v in sf.vals {
-                vals.push(v.take(0));
-            }
+            let sf = read_splayed_table(&sample_slice.path, needed)?;
+            let mut cols = vec![pt.part_col];
+            cols.extend(&sf.cols);
+            vals.extend(sf.vals.iter().map(|v| v.take(0)));
+            return Flip::new(cols, vals);
         }
-        return Flip::new(pt.cols.clone(), vals);
+        return Flip::new(vec![pt.part_col], vals);
     }
 
     let mut acc: Option<Flip> = None;
     for slice in selected_slices {
-        let sf = read_splayed_table(&slice.path, None)?;
+        let sf = read_splayed_table(&slice.path, needed)?;
         let nrows = sf.nrows();
         let mut pcol = ColVec::from_atoms(vec![slice.part_val.clone(); nrows]);
         pcol.set_attr_unchecked(Attr::Sorted);

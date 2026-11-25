@@ -161,6 +161,8 @@ pub struct Raft<S: Storage> {
     next_index: HashMap<NodeId, u64>,
     match_index: HashMap<NodeId, u64>,
     recent_ack: HashSet<NodeId>,
+    /// A majority answered during the last complete election window (or elected us).
+    lease_held: bool,
     outbox: Vec<(NodeId, Msg)>,
     pending_snap: Option<Snapshot>,
 }
@@ -216,6 +218,7 @@ impl<S: Storage> Raft<S> {
             next_index: HashMap::new(),
             match_index: HashMap::new(),
             recent_ack: HashSet::new(),
+            lease_held: false,
             outbox: Vec::new(),
             pending_snap: None,
         };
@@ -268,8 +271,30 @@ impl<S: Storage> Raft<S> {
         if self.conf.voters.len() <= 1 && self.conf.is_voter(self.id) {
             return true;
         }
-        let ack_voters = self.conf.voters.iter().filter(|m| m.id == self.id || self.recent_ack.contains(&m.id)).count();
-        ack_voters >= self.conf.quorum()
+        self.lease_held || self.acked_voters() >= self.conf.quorum()
+    }
+
+    fn acked_voters(&self) -> usize {
+        self.conf.voters.iter().filter(|m| m.id == self.id || self.recent_ack.contains(&m.id)).count()
+    }
+
+    /// Whether a membership change is appended but not yet committed (the next one must wait for it).
+    pub fn has_pending_conf(&self) -> bool {
+        self.log.iter().any(|e| e.index > self.commit_index && e.conf.is_some())
+    }
+
+    /// How far the log of the replica `id` is known to match (leader only).
+    pub fn matched(&self, id: NodeId) -> u64 {
+        self.match_index.get(&id).copied().unwrap_or(0)
+    }
+
+    pub fn snapshot_index(&self) -> u64 {
+        self.snap_index
+    }
+
+    /// The log entry at `index`, if it has not been compacted away.
+    pub fn entry(&self, index: u64) -> Option<&Entry> {
+        self.log.get(index.checked_sub(self.snap_index + 1)? as usize)
     }
 
     pub fn tick(&mut self) {
@@ -278,11 +303,11 @@ impl<S: Storage> Raft<S> {
                 self.ticks_since_leader += 1;
                 if self.ticks_since_leader >= self.election_ticks {
                     // Check lease renewal; if isolated from majority for a full election window, step down!
-                    let ack_voters = self.conf.voters.iter().filter(|m| m.id == self.id || self.recent_ack.contains(&m.id)).count();
-                    if ack_voters < self.conf.quorum() {
+                    if self.acked_voters() < self.conf.quorum() {
                         self.become_follower(self.term, None);
                         return;
                     }
+                    self.lease_held = true;
                     self.recent_ack.clear();
                     self.recent_ack.insert(self.id);
                     self.ticks_since_leader = 0;
@@ -317,7 +342,8 @@ impl<S: Storage> Raft<S> {
     }
 
     fn become_follower(&mut self, term: u64, leader: Option<NodeId>) {
-        let changed = term != self.term || (term > self.term && self.voted_for.is_some());
+        let changed = term != self.term;
+        self.lease_held = false;
         if term > self.term {
             self.term = term;
             self.voted_for = None;
@@ -369,6 +395,7 @@ impl<S: Storage> Raft<S> {
         self.ticks_since_leader = 0;
         self.recent_ack.clear();
         self.recent_ack.insert(self.id);
+        self.lease_held = true;
 
         let next = self.last_index() + 1;
         self.next_index.clear();
@@ -499,11 +526,25 @@ impl<S: Storage> Raft<S> {
                 break;
             }
         }
+        if self.role == Role::Leader && !self.conf.is_voter(self.id) && !self.has_pending_conf() {
+            // tell the others the change is committed, then hand over
+            self.broadcast_append();
+            self.become_follower(self.term, None);
+        }
     }
 
     pub fn step(&mut self, from: NodeId, msg: Msg) {
         match msg {
             Msg::Vote { term, last_index, last_term } => {
+                // a node that is hearing from a live leader ignores elections, so that a removed or cut-off node cannot
+                // disrupt the group
+                let led = match self.role {
+                    Role::Leader => self.has_lease(),
+                    _ => self.leader.is_some_and(|l| l != from) && self.ticks_since_leader < self.election_ticks,
+                };
+                if led {
+                    return;
+                }
                 if term > self.term {
                     self.become_follower(term, None);
                 }
@@ -569,8 +610,9 @@ impl<S: Storage> Raft<S> {
                 }
 
                 let match_idx = entries.last().map(|e| e.index).unwrap_or(prev_index);
-                if commit > self.commit_index {
-                    self.commit_index = commit.min(self.last_index());
+                // entries past `match_idx` may be left over from an old term: only what matched is known to be the leader's
+                if commit.min(match_idx) > self.commit_index {
+                    self.commit_index = commit.min(match_idx);
                 }
                 self.outbox.push((from, Msg::AppendReply { term: self.term, success: true, match_index: match_idx }));
             }
@@ -604,6 +646,8 @@ impl<S: Storage> Raft<S> {
 
             Msg::Snapshot { term, snap } => {
                 if term < self.term {
+                    // tell a stale leader about the newer term
+                    self.outbox.push((from, Msg::SnapshotReply { term: self.term, index: 0 }));
                     return;
                 }
                 self.become_follower(term, Some(from));
@@ -617,7 +661,8 @@ impl<S: Storage> Raft<S> {
                     self.storage.save_snapshot(&snap, &self.log);
                     self.pending_snap = Some(snap.clone());
                 }
-                self.outbox.push((from, Msg::SnapshotReply { term: self.term, index: self.snap_index }));
+                // everything up to the commit index is the leader's, whether or not the snapshot was needed
+                self.outbox.push((from, Msg::SnapshotReply { term: self.term, index: self.commit_index }));
             }
 
             Msg::SnapshotReply { term, index } => {

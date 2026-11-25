@@ -208,6 +208,17 @@ fn minute_part(mins: i32, field: &str) -> Option<K> {
     }
 }
 
+/// `md5 "text"`: the 16-byte digest of a string.
+fn md5_op(x: &K) -> KResult<K> {
+    use md5::{Digest, Md5};
+    let text = match x {
+        K::Char(c) => std::slice::from_ref(c),
+        K::Vector(ColVec::Char(_, bytes)) => bytes.as_slice(),
+        _ => return Err(KError::ty("md5 expects a string")),
+    };
+    Ok(K::Vector(ColVec::Byte(Attr::None, Arc::new(Md5::digest(text).to_vec()))))
+}
+
 // ----- Unary Primitives -----------------------------------------------------
 
 pub fn eval_unary_prim(op: &str, x: &K) -> KResult<K> {
@@ -284,6 +295,7 @@ pub fn eval_unary_prim(op: &str, x: &K) -> KResult<K> {
         "fills" => fills_op(x),
         "meta" => meta_op(x),
         "ungroup" => ungroup_op(x),
+        "md5" => md5_op(x),
         _ => Err(KError::nyi(format!("unknown unary verb '{op}'"))),
     }
 }
@@ -562,7 +574,7 @@ pub fn flip_op(x: &K) -> KResult<K> {
                         col_vecs.push(cv);
                     }
                     atom => {
-                        col_vecs.push(ColVec::from_atoms(vec![atom; target_len]));
+                        col_vecs.push(ColVec::repeat(atom, target_len));
                     }
                 }
             }
@@ -862,6 +874,11 @@ fn str_transform(x: &K, f: &dyn Fn(&str) -> String) -> KResult<K> {
 
 // ----- Vector Aggregations & Running / Moving Windows -----------------------
 
+/// The sum of the non-null values; integer overflow wraps, as in q.
+fn wrapping_total(xs: &[i64]) -> i64 {
+    xs.iter().filter(|&&v| v != NULL_LONG).fold(0, |a, &v| a.wrapping_add(v))
+}
+
 pub fn sum_op(x: &K) -> KResult<K> {
     if x.is_atom() {
         return Ok(x.clone());
@@ -874,8 +891,8 @@ pub fn sum_op(x: &K) -> KResult<K> {
         ColVec::Byte(_, xs) => Ok(K::Long(xs.iter().map(|&v| v as i64).sum())),
         ColVec::Short(_, xs) => Ok(K::Long(xs.iter().filter(|&&v| v != NULL_SHORT).map(|&v| v as i64).sum())),
         ColVec::Int(_, xs) => Ok(K::Long(xs.iter().filter(|&&v| v != NULL_INT).map(|&v| v as i64).sum())),
-        ColVec::Long(_, xs) => Ok(K::Long(xs.iter().filter(|&&v| v != NULL_LONG).copied().sum())),
-        ColVec::Timespan(_, xs) => Ok(K::Timespan(xs.iter().filter(|&&v| v != NULL_LONG).copied().sum())),
+        ColVec::Long(_, xs) => Ok(K::Long(wrapping_total(xs))),
+        ColVec::Timespan(_, xs) => Ok(K::Timespan(wrapping_total(xs))),
         ColVec::Real(_, xs) => Ok(K::Float(xs.iter().filter(|v| !v.is_nan()).map(|&v| v as f64).sum())),
         ColVec::Float(_, xs) => Ok(K::Float(xs.iter().filter(|v| !v.is_nan()).copied().sum())),
         ColVec::General(_, xs) if xs.is_empty() => Ok(K::Long(0)),
@@ -898,7 +915,7 @@ fn prd_op(x: &K) -> KResult<K> {
         return Err(KError::ty("prd requires vector"));
     };
     if let Some(is) = cv.as_i64_vec() {
-        Ok(K::Long(is.into_iter().filter(|&v| v != NULL_LONG).product()))
+        Ok(K::Long(is.into_iter().filter(|&v| v != NULL_LONG).fold(1, i64::wrapping_mul)))
     } else if let Some(fs) = cv.as_f64_vec() {
         Ok(K::Float(fs.into_iter().filter(|v| !v.is_nan()).product()))
     } else {
@@ -1016,7 +1033,7 @@ fn running_sum(x: &K) -> KResult<K> {
         Ok(K::Vector(ColVec::Float(Attr::None, Arc::new(out))))
     } else if let Some(is) = cv.as_i64_vec() {
         let mut s = 0i64;
-        let out: Vec<i64> = is.into_iter().map(|v| { if v != NULL_LONG { s += v; } s }).collect();
+        let out: Vec<i64> = is.into_iter().map(|v| { if v != NULL_LONG { s = s.wrapping_add(v); } s }).collect();
         Ok(K::Vector(ColVec::Long(Attr::None, Arc::new(out))))
     } else {
         Err(KError::ty("sums requires numeric vector"))
@@ -1032,7 +1049,7 @@ fn running_prd(x: &K) -> KResult<K> {
         Ok(K::Vector(ColVec::Float(Attr::None, Arc::new(out))))
     } else if let Some(is) = cv.as_i64_vec() {
         let mut p = 1i64;
-        let out: Vec<i64> = is.into_iter().map(|v| { if v != NULL_LONG { p *= v; } p }).collect();
+        let out: Vec<i64> = is.into_iter().map(|v| { if v != NULL_LONG { p = p.wrapping_mul(v); } p }).collect();
         Ok(K::Vector(ColVec::Long(Attr::None, Arc::new(out))))
     } else {
         Err(KError::ty("prds requires numeric vector"))
@@ -1094,7 +1111,7 @@ fn deltas_op(x: &K) -> KResult<K> {
             } else if is[i] == NULL_LONG || is[i - 1] == NULL_LONG {
                 NULL_LONG
             } else {
-                is[i] - is[i - 1]
+                is[i].wrapping_sub(is[i - 1])
             };
             out.push(v);
         }
@@ -1629,6 +1646,15 @@ fn cmp_op(lhs: &K, rhs: &K, kind: CmpKind) -> KResult<K> {
     broadcast_atoms(lhs, rhs, |a, b| Ok(K::Bool(cmp_atom(a, b, kind)?)))
 }
 
+/// The vector of elementwise results. An empty one keeps the type the verb would give (probed with nulls), so that
+/// aggregates of no rows are typed like aggregates of some.
+fn results(out: Vec<K>, probe: impl FnOnce() -> KResult<K>) -> K {
+    match out.is_empty().then(probe) {
+        Some(Ok(sample)) if sample.is_atom() => K::Vector(ColVec::from_atoms(vec![sample]).take(0)),
+        _ => K::Vector(ColVec::from_atoms(out)),
+    }
+}
+
 /// Elementwise binary broadcast over atoms, vectors, and dicts (matching kdb+'s conformability rules).
 pub fn broadcast_atoms(lhs: &K, rhs: &K, f: impl Fn(&K, &K) -> KResult<K> + Copy) -> KResult<K> {
     match (lhs, rhs) {
@@ -1639,7 +1665,7 @@ pub fn broadcast_atoms(lhs: &K, rhs: &K, f: impl Fn(&K, &K) -> KResult<K> + Copy
                 let bi = vb.get_atom(i);
                 out.push(if bi.is_atom() { f(a, &bi)? } else { broadcast_atoms(a, &bi, f)? });
             }
-            Ok(K::Vector(ColVec::from_atoms(out)))
+            Ok(results(out, || f(a, &vb.null_atom())))
         }
         (K::Vector(va), b) if b.is_atom() => {
             let mut out = Vec::with_capacity(va.len());
@@ -1647,7 +1673,7 @@ pub fn broadcast_atoms(lhs: &K, rhs: &K, f: impl Fn(&K, &K) -> KResult<K> + Copy
                 let ai = va.get_atom(i);
                 out.push(if ai.is_atom() { f(&ai, b)? } else { broadcast_atoms(&ai, b, f)? });
             }
-            Ok(K::Vector(ColVec::from_atoms(out)))
+            Ok(results(out, || f(&va.null_atom(), b)))
         }
         (K::Vector(va), K::Vector(vb)) => {
             if va.len() != vb.len() {
@@ -1659,7 +1685,7 @@ pub fn broadcast_atoms(lhs: &K, rhs: &K, f: impl Fn(&K, &K) -> KResult<K> + Copy
                 let bi = vb.get_atom(i);
                 out.push(broadcast_atoms(&ai, &bi, f)?);
             }
-            Ok(K::Vector(ColVec::from_atoms(out)))
+            Ok(results(out, || f(&va.null_atom(), &vb.null_atom())))
         }
         (K::Dict(da), K::Dict(db)) if da.keys == db.keys => {
             Ok(K::Dict(Arc::new(Dict { keys: da.keys.clone(), vals: Box::new(broadcast_atoms(&da.vals, &db.vals, f)?) })))
@@ -2523,7 +2549,7 @@ fn moving_op(lhs: &K, rhs: &K, kind: MovingKind) -> KResult<K> {
                 let mut out = Vec::with_capacity(n);
                 for i in 0..n {
                     let s = i.saturating_sub(w - 1);
-                    out.push(is[s..=i].iter().filter(|&&v| v != NULL_LONG).sum());
+                    out.push(wrapping_total(&is[s..=i]));
                 }
                 return Ok(K::Vector(ColVec::Long(Attr::None, Arc::new(out))));
             }
