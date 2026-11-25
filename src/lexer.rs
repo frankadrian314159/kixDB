@@ -109,6 +109,18 @@ pub fn tokenize(src: &str) -> KResult<Vec<Tok>> {
             continue;
         }
 
+        if b == b'/' && at_line_start && src[i + 1..].split('\n').next().is_some_and(|rest| rest.trim().is_empty()) {
+            let mut lines = src[i..].split_inclusive('\n');
+            i += lines.next().map_or(0, str::len);
+            for line in lines {
+                i += line.len();
+                if line.trim_end() == "\\" {
+                    break;
+                }
+            }
+            continue;
+        }
+
         // Comments: `/` at line start or preceded by whitespace
         if b == b'/' && (at_line_start || after_ws) {
             // Check if this is `/:` — even after space `x /: y` is each-right!

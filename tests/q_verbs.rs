@@ -32,6 +32,18 @@ fn application_amends_and_adverbs() {
 }
 
 #[test]
+fn blocks_choices_comments_and_self_reference() {
+    check("f: {$[x<2; 1; x * .z.s x - 1]}", &[
+        ("$[1b; [a: 6; b: 7; a * b]; 0]", "42"),
+        ("?[101b; 1 2 3; 0]", "1 0 3"),
+        ("exec ?[c > 1; c; 0] from ([] c: 1 2 3)", "0 2 3"),
+        ("f 5", "120"),
+        ("$[0N; `yes; `no]", "`yes"),
+        ("a: 1\n/\na: 2\n\\\na", "1"),
+    ]);
+}
+
+#[test]
 fn built_in_verbs() {
     check("", &[
         ("(all 101b; any 001b)", "01b"),

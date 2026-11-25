@@ -1517,6 +1517,18 @@ fn dict_op(op: &str, a: &Dict, b: &Dict) -> KResult<K> {
     Ok(K::Dict(Arc::new(Dict { keys: list(names), vals: list(vals) })))
 }
 
+/// `?[c; a; b]`: item by item, `a`'s where `c` holds and `b`'s elsewhere.
+pub fn choose(c: &K, a: &K, b: &K) -> KResult<K> {
+    let K::Vector(ColVec::Bool(_, flags)) = c else { return Err(KError::ty("?[c;a;b] needs booleans to choose by")) };
+    let item = |x: &K, i: usize| match x {
+        K::Vector(v) if v.len() == flags.len() => Ok(v.get_atom(i)),
+        K::Vector(_) => Err(KError::length("?[c;a;b] needs lists as long as the booleans")),
+        atom => Ok(atom.clone()),
+    };
+    let chosen = flags.iter().enumerate().map(|(i, &f)| item(if f { a } else { b }, i)).collect::<KResult<_>>()?;
+    Ok(K::Vector(ColVec::from_atoms(chosen)))
+}
+
 /// Where each of `keys` is among the keys of `d`.
 fn key_positions(d: &Dict, keys: &K) -> KResult<Vec<Option<usize>>> {
     let at = |k: &K, i: usize| index_k(k, &[Some(K::Long(i as i64))]);

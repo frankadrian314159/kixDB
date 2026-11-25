@@ -32,7 +32,8 @@ Integer arithmetic and aggregates wrap on overflow.
 * assignment `:`, global `::`, amend `x[i]:v`, `x+:1`, `@[d;i;f;y]`, deep amend `.[d;path;f;y]`
 * lambdas `{[a;b] ...}` (implicit `x y z`), projections `f[1;]`, early return `:value`
 * adverbs `'` `/` `\` `':` `/:` `\:`, and the words `each`, `over`, `scan`, `prior`
-* `$[c;t;f]`, `if[...]`, `do[...]`, `while[...]`
+* `$[c;t;f]`, `if[...]`, `do[...]`, `while[...]`; a null condition is true; `[a;b;c]` runs expressions in turn
+* `?[c;a;b]` chooses item by item; `.z.s` is the running lambda; lines holding only `/` and `\` enclose a comment
 * signal `'err`, protected evaluation `@[f;x;handler]` and `.[f;args;handler]`
 * views `v::expression`, which read global names only (those of the view's namespace first), never a query's columns or
   a function's variables; `.z.b` lists the views that read each name, and a view that depends on itself is `'loop`

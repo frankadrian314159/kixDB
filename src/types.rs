@@ -1379,9 +1379,9 @@ impl K {
         match self {
             K::Bool(b) => Ok(*b),
             K::Byte(v) => Ok(*v != 0),
-            K::Short(v) => Ok(*v != 0 && *v != NULL_SHORT),
-            K::Int(v) => Ok(*v != 0 && *v != NULL_INT),
-            K::Long(v) => Ok(*v != 0 && *v != NULL_LONG),
+            K::Short(v) => Ok(*v != 0),
+            K::Int(v) => Ok(*v != 0),
+            K::Long(v) => Ok(*v != 0),
             _ => Err(KError::ty("expected boolean condition")),
         }
     }

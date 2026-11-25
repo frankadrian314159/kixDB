@@ -525,6 +525,13 @@ impl<'a> Parser<'a> {
                 parse_lambda(&source, &body_tokens)
             }
             Tok::LParen => self.parse_paren_or_table(),
+            Tok::LBrack => {
+                let saved = (std::mem::replace(&mut self.stop_on_comma, false), std::mem::replace(&mut self.in_qsql, false));
+                let args = self.parse_bracket_args();
+                (self.stop_on_comma, self.in_qsql) = saved;
+                let target = Box::new(Expr::Lit(K::Func(Func::Prim(intern(";")))));
+                Ok(Expr::Apply { target, args: args? })
+            }
             other => Err(KError::syntax(format!("unexpected token {other:?}"))),
         }
     }

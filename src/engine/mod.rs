@@ -245,6 +245,8 @@ pub struct Engine<'a> {
     pub session: &'a mut SessionState,
     pub(crate) locals: Vec<HashMap<SymId, K>>,
     table_scopes: Vec<TableScope>,
+    /// The lambdas being called, innermost last.
+    running: Vec<Arc<Lambda>>,
     /// The views being computed.
     viewing: Vec<SymId>,
     pub messages: Vec<String>,
@@ -270,6 +272,7 @@ impl<'a> Engine<'a> {
             session,
             locals: Vec::new(),
             table_scopes: Vec::new(),
+            running: Vec::new(),
             viewing: Vec::new(),
             messages: Vec::new(),
             replaying: false,
@@ -661,6 +664,7 @@ impl<'a> Engine<'a> {
             }
             ".z.K" => Ok(Some(K::Float(4.1))),
             ".z.b" => Ok(Some(self.dependencies())),
+            ".z.s" => Ok(self.running.last().map(|lam| K::Func(Func::Lambda(lam.clone())))),
             ".z.i" => Ok(Some(K::Int(std::process::id() as i32))),
             ".z.u" => Ok(Some(K::Sym(intern(&self.session.login)))),
             ".z.o" => Ok(Some(K::Sym(intern(if cfg!(windows) { "w64" } else if cfg!(target_os = "macos") { "m64" } else { "l64" })))),
@@ -773,6 +777,13 @@ impl<'a> Engine<'a> {
                     if op_s == "!" && args.len() == 4 {
                         return Ok(self.eval_functional_update(args)?);
                     }
+                    if op_s == ";" {
+                        let mut last = K::Null;
+                        for statement in args.iter().flatten() {
+                            last = self.eval_step(statement)?;
+                        }
+                        return Ok(last);
+                    }
                 }
                 // Evaluate arguments right-to-left (preserving `None` for projection slots!)
                 let mut evaled: Vec<Option<K>> = vec![None; args.len()];
@@ -782,6 +793,11 @@ impl<'a> Engine<'a> {
                     }
                 }
                 let tval = self.eval_step(target)?;
+                if let (K::Func(Func::Prim(s)), [Some(c), Some(a), Some(b)]) = (&tval, evaled.as_slice()) {
+                    if resolve(*s) == "?" {
+                        return Ok(ops::choose(c, a, b)?);
+                    }
+                }
                 Ok(self.apply_value(&tval, &evaled)?)
             }
 
@@ -1155,7 +1171,12 @@ impl<'a> Engine<'a> {
         let vals: Vec<K> = args.iter().map(|a| a.clone().unwrap_or(K::Null)).collect();
         match func {
             Func::Prim(sym) => self.call_prim(*sym, &vals),
-            Func::Lambda(lam) => self.call_lambda(lam, &vals),
+            Func::Lambda(lam) => {
+                self.running.push(lam.clone());
+                let result = self.call_lambda(lam, &vals);
+                self.running.pop();
+                result
+            }
             Func::Proj { func: inner, args: bound, .. } => {
                 let mut merged: Vec<Option<K>> = Vec::with_capacity(bound.len());
                 let mut vi = 0usize;
