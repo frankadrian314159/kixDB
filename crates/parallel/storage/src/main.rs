@@ -28,6 +28,10 @@ use kixdb::Server;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+/// mimalloc runs the engine markedly faster than the system allocator.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn usage() -> ! {
     eprintln!(
         "usage: kix-shard --id N --listen HOST:PORT [--data DIR] [--metrics-listen HOST:PORT] [--drain-secs N]\n       \

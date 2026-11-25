@@ -136,3 +136,7 @@ fn main() {
     }
     std::process::exit(if failures == 0 { 0 } else { 1 });
 }
+
+/// mimalloc runs the engine markedly faster than the system allocator.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;

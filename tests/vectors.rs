@@ -209,3 +209,30 @@ fn queries_see_the_columns_they_name_however_they_name_them() {
         assert_eq!(eval(&mut c, code), expected, "{code}");
     }
 }
+
+#[test]
+fn large_vectors_split_across_threads_give_the_same_answers_in_the_same_order() {
+    // (long enough for every filter, aggregate and grouping to be shared out)
+    let mut c = kixdb::Server::new().connect();
+    c.eval("n: 300000; t: ([] g: (til n) mod 7; h: (til n) mod 100003; s: `a`bb`c ((til n) mod 3); x: til n; f: 0.5 * til n)").unwrap();
+    let n = 300_000i64;
+    let by_group: Vec<i64> = (0..7).map(|g| (0..n).filter(|x| x % 7 == g).sum()).collect();
+    let by_group = by_group.iter().map(i64::to_string).collect::<Vec<_>>().join(" ");
+    for (code, expected) in [
+        ("exec (sum x; sum x + x; min x; max x) from t", format!("({}; {}; 0; {})", n * (n - 1) / 2, n * (n - 1), n - 1)),
+        ("exec (sum f; avg f; min f; max f) from t", format!("({:?}; {:?}; 0.0; {:?})", (n * (n - 1) / 2) as f64 / 2.0, (n - 1) as f64 / 4.0, (n - 1) as f64 / 2.0)),
+        ("(max 0n , 0.5 * til n; min 0N , 5 + til n)", format!("({:?}; 5)", (n - 1) as f64 / 2.0)),
+        ("exec x from t where 5 = x mod 100000", "5 100005 200005".into()),
+        ("count select from t where x >= 1000, x < 201000, s like \"b*\"", "66667".into()),
+        ("exec sum x by g from t", format!("(til 7)!{by_group}")),
+        ("(distinct exec h from t) ~ til 100003", "1b".into()),
+        ("exec (count i; first x; last x) from t where h = 100002", "2 100002 200005".into()),
+        ("count select count i by h from t", "100003".into()),
+        ("exec count i by s from t", "`a`bb`c!100000 100000 100000".into()),
+        ("count select count i by g, s from t", "21".into()),
+        ("(t[`x] iasc exec g from t) 0 1 2", "0 7 14".into()),
+    ] {
+        let got = c.eval(code).unwrap_or_else(|e| panic!("{code}: {e}"));
+        assert_eq!(got, c.eval(&expected).unwrap(), "{code}: {got}");
+    }
+}

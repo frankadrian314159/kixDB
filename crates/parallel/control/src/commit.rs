@@ -9,6 +9,7 @@ use crate::Inner;
 use futures::future::join_all;
 use kix_shared_ces::wire::{TxnOp, TxnReply, TxnReq};
 use kixdb::ipc::decode_k_payload;
+use kixdb::sym::intern;
 use kixdb::{KError, KResult, K};
 use std::collections::BTreeMap;
 use std::hash::BuildHasher;
@@ -43,6 +44,7 @@ impl Inner {
 
     /// Finish or abandon every change the shards hold. The caller has the cluster to itself.
     pub(crate) fn resolve(&self) {
+        self.forget_counts(None);
         let held = self.wait(join_all(self.shards.iter().map(|s| s.txn(&TxnReq::Pending))));
         let mut settled = held.iter().all(Result::is_ok);
         // the shards holding each change
@@ -68,6 +70,17 @@ impl Inner {
         *self.unsettled.lock().unwrap_or_else(|e| e.into_inner()) = (!settled).then(|| Instant::now() + RETRY);
     }
 
+    /// Drop the row counts of the tables the operations change (of all, without any).
+    fn forget_counts(&self, ops: Option<&[(usize, TxnOp)]>) {
+        let mut rows = self.rows.lock().unwrap_or_else(|e| e.into_inner());
+        match ops {
+            Some(ops) => ops.iter().filter(|o| o.1.changes()).for_each(|(_, op)| {
+                rows.remove(&intern(op.table()));
+            }),
+            None => rows.clear(),
+        }
+    }
+
     /// Make the operations, each on its shard: all of them or none. Returns the answers of the mutations, in order. The
     /// caller has the cluster to itself.
     pub(crate) fn commit(&self, ops: Vec<(usize, TxnOp)>) -> KResult<Vec<K>> {
@@ -77,6 +90,7 @@ impl Inner {
         if self.unsettled() {
             self.resolve();
         }
+        self.forget_counts(Some(&ops));
         let mut shards: BTreeMap<usize, Vec<(usize, TxnOp)>> = BTreeMap::new();
         let changing = ops.iter().filter(|(_, op)| op.changes()).count();
         for (n, (shard, op)) in ops.into_iter().enumerate() {

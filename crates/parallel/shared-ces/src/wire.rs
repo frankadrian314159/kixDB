@@ -64,6 +64,7 @@ pub struct LoadReq {
     pub table: String,
     pub mode: LoadMode,
     /// The IPC-encoded table.
+    #[serde(with = "kixdb::bytes")]
     pub ipc_k: Vec<u8>,
     /// Global ordinals of those rows (sharded tables only).
     pub ords: Option<Vec<i64>>,
@@ -87,6 +88,14 @@ pub enum TxnOp {
 }
 
 impl TxnOp {
+    /// The table it is about.
+    pub fn table(&self) -> &str {
+        match self {
+            TxnOp::Load(req) => &req.table,
+            TxnOp::Mutate(req) => &req.table,
+        }
+    }
+
     /// Whether it changes anything (a duplicate check only looks).
     pub fn changes(&self) -> bool {
         !matches!(self, TxnOp::Load(LoadReq { mode: LoadMode::CheckInsert, .. }))

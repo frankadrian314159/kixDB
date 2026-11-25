@@ -10,6 +10,8 @@ pub enum ColChange {
     /// Items added to the end of a column that held `at` items.
     Append { at: u64, tail: ColVec },
     Replace(ColVec),
+    /// The items at some rows set, in a column that keeps its length; `values` carries the column's attribute afterwards.
+    Set { rows: Vec<u64>, values: ColVec },
 }
 
 /// A column's position (keyed tables count their key columns first) and what became of it.
@@ -101,6 +103,23 @@ pub fn removed(old: &K, new: &K) -> Option<Removed> {
     (kept == m).then(|| Removed { at: n as u64, rows, attrs: b.iter().map(|c| c.attr()).collect() })
 }
 
+/// The rows of `a` that differ in `b`, which is no shorter and of its type, if there are at most `limit` of them.
+fn differing(a: &ColVec, b: &ColVec, limit: usize) -> Option<Vec<u64>> {
+    if std::mem::discriminant(a) != std::mem::discriminant(b) || b.len() < a.len() {
+        return None;
+    }
+    let mut rows = vec![];
+    for i in 0..a.len() {
+        if !same_item(a, i, b, i) {
+            if rows.len() == limit {
+                return None;
+            }
+            rows.push(i as u64);
+        }
+    }
+    Some(rows)
+}
+
 /// The changes that turn `old` into `new`, or `None` when `new` is as well written whole: it is not a vector or table
 /// of the same columns, or no column kept anything.
 pub fn diff(old: &K, new: &K) -> Option<Changes> {
@@ -110,14 +129,23 @@ pub fn diff(old: &K, new: &K) -> Option<Changes> {
     }
     let (mut changes, mut kept_any) = (vec![], false);
     for (i, (a, b)) in a.into_iter().zip(b).enumerate() {
-        let kept = begins(a, b);
-        kept_any |= kept;
-        if kept && b.len() > a.len() {
+        // the rows already there that are to be set, when they are few; `None`: the column goes whole
+        let set = if begins(a, b) { Some(vec![]) } else { differing(a, b, a.len() / 8) };
+        let Some(rows) = set else {
+            changes.push((i as u32, ColChange::Replace(b.clone())));
+            continue;
+        };
+        kept_any = true;
+        let (grew, few) = (b.len() > a.len(), !rows.is_empty());
+        if few || (!grew && a.attr() != b.attr()) {
+            let mut values = b.gather(&rows.iter().map(|&r| r as usize).collect::<Vec<_>>());
+            values.set_attr_unchecked(b.attr());
+            changes.push((i as u32, ColChange::Set { rows, values }));
+        }
+        if grew {
             let mut tail = b.drop_n(a.len() as i64);
             tail.set_attr_unchecked(b.attr());
             changes.push((i as u32, ColChange::Append { at: a.len() as u64, tail }));
-        } else if !kept || a.attr() != b.attr() {
-            changes.push((i as u32, ColChange::Replace(b.clone())));
         }
     }
     kept_any.then_some(changes)
@@ -179,11 +207,57 @@ pub fn remove(value: &mut K, removed: &Removed) -> bool {
     true
 }
 
+/// Set rows of a column of the type of `values`.
+fn set(col: &mut ColVec, rows: &[u64], values: &ColVec) -> bool {
+    if rows.len() != values.len() || rows.iter().any(|&r| r >= col.len() as u64) {
+        return false;
+    }
+    macro_rules! on {
+        ($($v:ident)*) => {
+            match (col, values) {
+                $((ColVec::$v(attr, x), ColVec::$v(new, y)) => {
+                    if !rows.is_empty() {
+                        let x = Arc::make_mut(x);
+                        rows.iter().zip(y.iter()).for_each(|(&r, v)| x[r as usize] = v.clone());
+                    }
+                    *attr = *new;
+                    true
+                })*
+                _ => false,
+            }
+        };
+    }
+    on!(General Bool Guid Byte Short Int Long Real Float Char Sym Timestamp Month Date Datetime Timespan Minute Second Time)
+}
+
+/// Whether `changes` were made from a value like `value`: `patch` will then make all of them.
+pub fn fits(value: &K, changes: &Changes) -> bool {
+    let Some((cols, _)) = columns(value) else { return false };
+    let mut lengths: Vec<u64> = cols.iter().map(|c| c.len() as u64).collect();
+    changes.iter().all(|(i, change)| {
+        let Some((col, length)) = cols.get(*i as usize).zip(lengths.get_mut(*i as usize)) else { return false };
+        let like = |other: &ColVec| std::mem::discriminant(*col) == std::mem::discriminant(other);
+        match change {
+            ColChange::Replace(new) => {
+                *length = new.len() as u64;
+                true
+            }
+            ColChange::Append { at, tail } => {
+                let fits = like(tail) && *length == *at;
+                *length += tail.len() as u64;
+                fits
+            }
+            ColChange::Set { rows, values } => like(values) && rows.len() == values.len() && rows.iter().all(|&r| r < *length),
+        }
+    })
+}
+
 /// Make `changes` to `value`; `false` if they were not made from a value like it.
 pub fn patch(value: &mut K, changes: &Changes) -> bool {
     let Some(mut cols) = columns_mut(value) else { return false };
     changes.iter().all(|(i, change)| match (cols.get_mut(*i as usize), change) {
         (Some(col), ColChange::Append { at, tail }) => extend(col, *at, tail),
+        (Some(col), ColChange::Set { rows, values }) => set(col, rows, values),
         (Some(col), ColChange::Replace(new)) => {
             **col = new.clone();
             true

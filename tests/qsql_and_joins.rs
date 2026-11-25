@@ -233,3 +233,51 @@ fn an_attribute_does_not_change_what_a_general_list_matches() {
     }
     assert_eq!(c.eval("exec v from l ij s").unwrap().to_string(), ",30");
 }
+
+#[test]
+fn inserts_and_upserts_change_the_rows_they_touch() {
+    let mut c = Server::new().connect();
+    c.eval("k: ([a: 1 2 3] v: 10 20 30; s: `x`y`z)").unwrap();
+    // a key already there is set (nulls leave values alone); rows with one new key make one row, the later values winning
+    c.eval("`k upsert ([] a: 2 4 4 2; v: 0N 40 41 22; s: `q``r`)").unwrap();
+    assert_eq!(c.eval("(exec a from k; exec v from k; exec s from k)").unwrap(), c.eval("(1 2 3 4; 10 22 30 41; `x`q`z`r)").unwrap());
+    // a refused insert changes nothing
+    assert_eq!(c.eval("`k insert ([] a: 5 1; v: 50 0; s: `m`n)").unwrap_err().signal, "insert");
+    assert_eq!(c.eval("count k").unwrap().to_string(), "4");
+    // two key columns, and a new value for a value (not a name) leaves the table it came from alone
+    c.eval("m: ([a: 1 1 2; b: `x`y`x] v: 1 2 3)").unwrap();
+    c.eval("n: m upsert ([] a: 1 2; b: `y`y; v: 20 40)").unwrap();
+    assert_eq!(c.eval("(exec v from m; exec v from n)").unwrap(), c.eval("(1 2 3; 1 20 3 40)").unwrap());
+    // numbers are converted to the column's type
+    c.eval("t: ([] f: 1.5 2.5); `t insert enlist 3").unwrap();
+    assert_eq!(c.eval("exec f from t").unwrap(), c.eval("1.5 2.5 3.0").unwrap());
+    // a function's own table is not the global one
+    c.eval("f: {[t] t upsert enlist 9.0}; g: f[t]").unwrap();
+    assert_eq!(c.eval("(count t; count g)").unwrap(), c.eval("3 4").unwrap());
+}
+
+#[test]
+fn statements_that_only_read_run_while_others_hold_the_workspace() {
+    let server = Server::new();
+    let mut c = server.connect();
+    c.eval("t: ([] a: 1 2 3); n: 7; f: {n:: 8}; v:: n + 1").unwrap();
+    // held as by another reader: a writer would have to wait, a reader does not
+    let (done, finished) = std::sync::mpsc::channel();
+    server.read_workspace(|_| {
+        let mut other = server.connect();
+        std::thread::spawn(move || done.send(other.eval("(sum exec a from t; select from t where a > 1; n * 2)").is_ok()));
+        assert!(finished.recv_timeout(std::time::Duration::from_secs(10)).unwrap());
+    });
+    // what looks like reading but writes still writes
+    for (code, check, expected) in [
+        ("f[]", "n", "8"),
+        ("update a: 0 from `t where a = 1", "exec a from t", "0 2 3"),
+        ("`t insert enlist 4", "count t", "4"),
+        ("m: select from t", "count m", "4"),
+        ("{[x] `k set x} 5", "k", "5"),
+        ("v", "v", "9"),
+    ] {
+        c.eval(code).unwrap_or_else(|e| panic!("{code}: {e}"));
+        assert_eq!(c.eval(check).unwrap().to_string(), expected, "{code}");
+    }
+}

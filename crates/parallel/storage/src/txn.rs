@@ -4,7 +4,8 @@
 //! like any other, so a restart or a new leader still holds it. Until it is committed or abandoned the shard takes no
 //! other change. **Commit** makes the change and drops the request in one log record. One shard of the change, its
 //! **primary**, also remembers that it committed: it is committed first, so whether it did decides for all of them.
-use crate::{load_changes, mutation_changes, Changes};
+use crate::{load_changes, mutation_changes, staged_value, Changes};
+use kixdb::engine::Write;
 use kix_shared_ces::wire::{TxnOp, TxnReply, TxnReq};
 use kixdb::ipc::encode_k_payload;
 use kixdb::sym::intern;
@@ -47,6 +48,10 @@ pub fn check_free(server: &Server, table: &str) -> KResult<()> {
     }
 }
 
+/// What preparing worked out, kept for the commit: the change's name and its writes. (A shard takes no other change in
+/// between; one that did not prepare, as after a restart or a change of leader, works them out again.)
+pub type Prepared = std::sync::Mutex<Option<(u64, Changes)>>;
+
 /// What the operations would change, each seeing those before it, and the answers of the mutations.
 fn work_out(conn: &mut Connection, ops: &[TxnOp]) -> KResult<(Changes, Vec<Vec<u8>>)> {
     let (mut changes, mut answers): (Changes, _) = (vec![], vec![]);
@@ -59,13 +64,24 @@ fn work_out(conn: &mut Connection, ops: &[TxnOp]) -> KResult<(Changes, Vec<Vec<u
                 new
             }
         };
-        changes.retain(|(name, _)| !new.iter().any(|n| n.0 == *name));
-        changes.extend(new);
+        for (name, write) in new {
+            if changes.iter().any(|c| c.0 == name) {
+                // one write a name: the two make its new value
+                let dropped = matches!(write, Write::Value(None));
+                changes.push((name, write));
+                let value = if dropped { None } else { Some(staged_value(conn, &changes, &kixdb::sym::resolve(name))?) };
+                changes.retain(|c| c.0 != name);
+                changes.push((name, Write::Value(value)));
+            } else {
+                changes.push((name, write));
+            }
+        }
     }
     Ok((changes, answers))
 }
 
-pub fn run(server: &Server, conn: &mut Connection, req: TxnReq) -> KResult<TxnReply> {
+pub fn run(server: &Server, conn: &mut Connection, prepared: &Prepared, req: TxnReq) -> KResult<TxnReply> {
+    let keep = |value| *prepared.lock().unwrap_or_else(|e| e.into_inner()) = value;
     let pending = held(server)?;
     let done: Vec<i64> = match variable(server, DONE) {
         Some(K::Vector(ColVec::Long(_, ids))) => (*ids).clone(),
@@ -77,20 +93,25 @@ pub fn run(server: &Server, conn: &mut Connection, req: TxnReq) -> KResult<TxnRe
             if pending.is_some_and(|p| p.txid != txid) {
                 return Err(busy());
             }
-            let (_, answers) = work_out(conn, &ops)?;
+            let (changes, answers) = work_out(conn, &ops)?;
             let bytes = postcard::to_allocvec(&Pending { txid, primary, ops }).map_err(|e| KError::new("cluster", e.to_string()))?;
             conn.set_vars(vec![(intern(PENDING), Some(K::Vector(ColVec::Byte(Attr::None, Arc::new(bytes)))))])?;
+            keep(Some((txid, changes)));
             TxnReply::Prepared(answers)
         }
         TxnReq::Commit { txid, primary, forget } => match pending.filter(|p| p.txid == txid) {
             Some(p) => {
-                let (mut changes, _) = work_out(conn, &p.ops)?;
-                changes.push((intern(PENDING), None));
+                let kept = prepared.lock().unwrap_or_else(|e| e.into_inner()).take().filter(|k| k.0 == txid);
+                let mut changes = match kept {
+                    Some((_, changes)) => changes,
+                    None => work_out(conn, &p.ops)?.0,
+                };
+                changes.push((intern(PENDING), Write::Value(None)));
                 if primary {
                     let remembered = done.into_iter().filter(|&id| !forget.contains(&(id as u64)));
-                    changes.push((intern(DONE), longs(remembered.chain([txid as i64]).collect())));
+                    changes.push((intern(DONE), Write::Value(longs(remembered.chain([txid as i64]).collect()))));
                 }
-                conn.set_vars(changes)?;
+                conn.write_vars(changes)?;
                 TxnReply::Done
             }
             // a primary asked to commit what it neither holds nor did has abandoned it
@@ -100,6 +121,7 @@ pub fn run(server: &Server, conn: &mut Connection, req: TxnReq) -> KResult<TxnRe
         TxnReq::Abort { txid } => {
             if pending.is_some_and(|p| p.txid == txid) {
                 conn.set_vars(vec![(intern(PENDING), None)])?;
+                keep(None);
             }
             TxnReply::Outcome { committed: done.contains(&(txid as i64)) }
         }

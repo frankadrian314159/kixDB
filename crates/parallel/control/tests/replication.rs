@@ -2,7 +2,7 @@
 //! replica can be added and removed while serving, one that fell behind is sent a snapshot, and a shard drains.
 use kix_control::Cluster;
 use kix_raft::Role;
-use kix_shared_ces::{ClusterConfig, ShardInfo};
+use kix_shared_ces::{ClusterConfig, LoadMode, LoadReq, ShardInfo};
 use kix_storage::{spawn, spawn_on, ReplicaConfig, RunningShard, ShardNode};
 use kixdb::{Server, K};
 use std::net::SocketAddr;
@@ -273,7 +273,7 @@ fn a_leader_whose_engine_is_stuck_hands_over() {
     let cluster = Cluster::connect(&config(&[group.address()])).unwrap();
     let mut s = cluster.session();
     s.eval("t: ([] a: 1 2 3)").unwrap();
-    // something takes the leader's engine and keeps it, with a request waiting for it
+    // something takes the leader's engine and keeps it, with a change waiting for it
     let engine = group.replicas[stuck].as_ref().unwrap().server.clone();
     let (release, held) = std::sync::mpsc::channel::<()>();
     let (holding, now_held) = std::sync::mpsc::channel();
@@ -284,13 +284,18 @@ fn a_leader_whose_engine_is_stuck_hands_over() {
         })
     });
     now_held.recv().unwrap();
-    let mut waiting = cluster.session();
-    let waiting = std::thread::spawn(move || waiting.eval("count t"));
+    // (sent to that replica itself, so that the cluster's own statements go on)
+    let rows = Server::new().connect().eval("([] a: enlist 4)").unwrap();
+    let load = LoadReq::new("t", LoadMode::Append, &rows, None);
+    let addr = group.addrs[stuck].clone();
+    let waiting = group.runtime.spawn(async move { kix_control::client::ShardClient::new(0, &addr, None).unwrap().load(&load).await });
     wait("another leader", || (group.leader() != stuck).then_some(()));
-    assert_eq!(s.eval("count t").unwrap(), K::Long(3));
+    s.eval("`t insert enlist 5").unwrap();
+    assert_eq!(s.eval("count t").unwrap(), K::Long(4));
     release.send(()).unwrap();
     hold.join().unwrap();
-    assert_eq!(waiting.join().unwrap().unwrap(), K::Long(3));
+    // the change that waited is refused: its replica no longer leads
+    assert!(group.runtime.block_on(waiting).unwrap().is_err());
     for i in 0..group.replicas.len() {
         group.kill(i);
     }

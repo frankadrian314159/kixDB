@@ -383,7 +383,7 @@ impl ClusterSession {
     fn with_planner<R>(&mut self, f: impl FnOnce(&mut Planner) -> R) -> R {
         let inner = self.inner.clone();
         let ns = self.conn.current_namespace();
-        let rows = |t: &Table| inner.count(t).unwrap_or(usize::MAX);
+        let rows = |t: &Table| inner.rows_of(t).unwrap_or(usize::MAX);
         let next_temp = || inner.next_temp.fetch_add(1, Ordering::SeqCst);
         f(&mut Planner {
             names: Names { mirror: &inner.mirror, ns },
@@ -689,7 +689,7 @@ impl ClusterSession {
         let K::Table(coerced) = self.conn.eval_expr(&coerce)? else { return Err(KError::ty("rows do not form a table")) };
         let schema = t.schema.concat(&coerced.take(0))?;
         let before = match verb {
-            "insert" => self.inner.count(&t)? as i64,
+            "insert" => self.inner.rows_of(&t)? as i64,
             _ => 0,
         };
         let parts = self.inner.split(&t, &coerced)?;
@@ -704,6 +704,10 @@ impl ClusterSession {
             self.changes.extend(some.map(load));
         }
         self.commit()?;
+        if verb == "insert" {
+            // (an insert that is made adds every row)
+            self.inner.rows.lock().unwrap_or_else(|e| e.into_inner()).insert(t.name, before as usize + coerced.nrows());
+        }
         self.note(format!("{verb}: {} row(s) split over the shards", coerced.nrows()));
         self.conn.set_vars(vec![(t.name, Some(rekey(schema, t.nkeys)))])?;
         Ok(match verb {
@@ -886,6 +890,16 @@ fn same_table(a: &K, b: &K) -> bool {
 type Part = (Flip, Option<Vec<i64>>);
 
 impl Inner {
+    /// The rows of a table as last known, for choices that need not ask the shards again.
+    pub(crate) fn rows_of(&self, t: &Table) -> KResult<usize> {
+        if let Some(&n) = self.rows.lock().unwrap_or_else(|e| e.into_inner()).get(&t.name) {
+            return Ok(n);
+        }
+        let n = self.count(t)?;
+        self.rows.lock().unwrap_or_else(|e| e.into_inner()).insert(t.name, n);
+        Ok(n)
+    }
+
     pub(crate) fn count(&self, t: &Table) -> KResult<usize> {
         let query = Work::Q(format!("count {}", resolve(t.name)));
         if t.mode == DistMode::Replicated {

@@ -31,11 +31,12 @@ path = "src/gui/main.rs"
 required-features = ["gui"]
 
 [features]
-default = []
+default = ["fast-alloc"]
 fast-alloc = ["dep:mimalloc"]
 gui = ["dep:eframe", "dep:egui", "dep:egui_extras", "dep:rfd"]
 
 [dependencies]
+rayon = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -55,6 +56,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 
 [dev-dependencies]
+mimalloc = "0.1"
 tempfile = "3"
 
 [profile.release]

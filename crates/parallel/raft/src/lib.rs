@@ -4,6 +4,7 @@
 //! - Leader read lease (`has_lease`)
 //! - Log compaction & snapshot installation (`compact` / `Msg::Snapshot`), one copy at a time too
 //! - Single-server learner-to-voter membership changes
+mod bytes;
 pub mod storage;
 
 pub use storage::{FileStorage, HardState, MemStorage, Snapshot, Storage};
@@ -82,6 +83,7 @@ impl Conf {
 pub struct Entry {
     pub term: u64,
     pub index: u64,
+    #[serde(with = "bytes")]
     pub data: Vec<u8>,
     pub conf: Option<Conf>,
 }
