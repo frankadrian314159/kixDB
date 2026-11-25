@@ -237,11 +237,13 @@ pub fn mount_hdb_dir(ws: &mut Workspace, dir: &Path) -> KResult<()> {
                 // Top-level splayed table!
                 let flip = read_splayed_table(&path, None)?;
                 ws.vars.insert(intern(&fname), K::Table(Arc::new(flip)));
+                ws.unlogged.insert(intern(&fname));
             }
         } else if fname.ends_with(".q") {
             // Skip auto-running scripts unless `\l script.q` was invoked directly
         } else if let Ok(k) = read_flat_k(&path) {
             ws.vars.insert(intern(&fname), k);
+            ws.unlogged.insert(intern(&fname));
         }
     }
 

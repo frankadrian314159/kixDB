@@ -14,9 +14,16 @@ A change is logged (and by default forced to disk) before it takes effect. The l
 records (`StorageOptions::checkpoint_every`), on `.checkpoint`, and when the server closes. After a crash the snapshot is
 loaded and the log replayed; an incomplete record at the end of the log is discarded.
 
-A log record holds the **whole new value** of each variable it changes, so every write to a large table writes that table
-again. For high write rates, batch rows. `kix-serve --no-sync` skips the flush per record, at the risk of losing the
+For a vector, table or keyed table that keeps its columns, a log record holds **only what changed**: the rows added to
+the end, and whole any column that changed in another way. So an `insert` costs the size of the new rows, and an
+`update` the size of the columns it assigns. Deleting or reordering rows, changing which columns a table has, a first
+assignment, other kinds of value, the first change to a value read from a file and a shard replica's first change to a
+value it held when it started write the whole value. The old and new values are compared to find what changed, which
+takes time in proportion to their size. `kix-serve --no-sync` skips the flush per record, at the risk of losing the
 latest changes in a crash.
+
+Earlier versions cannot read these records. Before going back to one, close the server cleanly, which folds the log into
+the snapshot: an earlier version discards the log from the first record it cannot read.
 
 ## Files and tables on disk
 

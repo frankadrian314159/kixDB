@@ -103,13 +103,20 @@ impl Sim {
         // deliver a random selection of what is on the wire, out of order
         let mut later = vec![];
         for (from, to, m) in std::mem::take(&mut self.wire) {
-            if self.cut.contains(&from) != self.cut.contains(&to) || self.rng.chance(self.loss) {
+            let carries = m.carries();
+            let lost = self.cut.contains(&from) != self.cut.contains(&to) || self.rng.chance(self.loss);
+            if !lost && self.rng.chance(self.loss) {
+                later.push((from, to, m));
                 continue;
             }
-            if self.rng.chance(self.loss) {
-                later.push((from, to, m));
-            } else if let Some(n) = self.nodes.get_mut(&to) {
-                n.step(from, m);
+            if !lost {
+                if let Some(n) = self.nodes.get_mut(&to) {
+                    n.step(from, m);
+                }
+            }
+            // as a transport must: tell the sender what became of what it sent
+            if let (Some(upto), Some(n)) = (carries, self.nodes.get_mut(&from)) {
+                n.sent(to, upto, !lost);
             }
         }
         self.wire = later;
@@ -290,7 +297,7 @@ fn file_storage_survives_reopening_and_refuses_damage() {
     n.tick();
     assert_eq!(n.role, Role::Leader);
 
-    let path = dir.path().join("raft.bin");
+    let path = dir.path().join("raft.snap");
     let mut bytes = std::fs::read(&path).unwrap();
     let last = bytes.len() - 1;
     bytes[last] ^= 1;

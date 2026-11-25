@@ -14,7 +14,7 @@ use crate::sym::{intern, resolve, sym_count, SymId};
 use crate::types::*;
 use chrono::{Datelike, Local, Timelike, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -103,6 +103,8 @@ pub struct Workspace {
     pub views: HashMap<SymId, ViewDef>,
     pub dist: HashMap<SymId, DistMode>,
     pub partitioned: HashMap<SymId, PartitionedTable>,
+    /// Variables whose value readers of the log may not have (read from files): their next change is logged whole.
+    pub unlogged: HashSet<SymId>,
     pub data_dir: Option<PathBuf>,
     pub clock: u64,
     pub epoch: u64,
@@ -123,6 +125,7 @@ impl Workspace {
             views: HashMap::new(),
             dist: HashMap::new(),
             partitioned: HashMap::new(),
+            unlogged: HashSet::new(),
             data_dir: None,
             clock: 0,
             epoch: 0,
@@ -314,11 +317,21 @@ impl<'a> Engine<'a> {
     /// Set (`Some`) or drop (`None`) several fully qualified globals as one log record, so that a crash or a replica sees
     /// all of the changes or none. Ephemeral `.kix.tmp.*` shuffle/broadcast tables stay in memory only.
     pub fn set_globals(&mut self, changes: Vec<(SymId, Option<K>)>) -> KResult<()> {
+        let logged = !self.replaying && (self.ws.persist.get_mut().is_ok_and(|p| p.is_some()) || self.ws.replicator.get_mut().is_ok_and(|r| r.is_some()));
         let ops: Vec<LogOp> = changes
             .iter()
-            .filter(|(name, _)| !is_ephemeral_var(*name))
-            .map(|(name, val)| match val {
-                Some(val) => LogOp::SetVar { name: *name, val: val.clone() },
+            .enumerate()
+            .filter(|(_, (name, _))| !is_ephemeral_var(*name))
+            .map(|(i, (name, val))| match val {
+                Some(val) => {
+                    // only what changed, if every reader of the record has the old value and this record's first change
+                    // to the name is this one
+                    let known = logged && !self.ws.unlogged.contains(name) && !self.ws.views.contains_key(name) && !changes[..i].iter().any(|c| c.0 == *name);
+                    match self.ws.vars.get(name).filter(|_| known).and_then(|old| crate::delta::diff(old, val)) {
+                        Some(changes) => LogOp::ChangeVar { name: *name, changes },
+                        None => LogOp::SetVar { name: *name, val: val.clone() },
+                    }
+                }
                 None => LogOp::DropVar { name: *name },
             })
             .collect();
@@ -328,6 +341,7 @@ impl<'a> Engine<'a> {
         }
         for (name, val) in changes {
             self.ws.views.remove(&name);
+            self.ws.unlogged.remove(&name);
             match val {
                 Some(val) => self.ws.vars.insert(name, val),
                 None => self.ws.vars.remove(&name),

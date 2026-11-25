@@ -8,6 +8,7 @@
 //! assert_eq!(v.to_string(), "55");
 //! ```
 pub mod ast;
+pub mod delta;
 pub mod engine;
 pub mod error;
 pub mod index;
@@ -166,8 +167,26 @@ impl Server {
         if let Some(p) = g.persist.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             p.append_record(rec, false)?;
         }
-        persist::apply_record(&mut g, rec);
+        persist::apply_record(&mut g, rec)?;
         Ok(true)
+    }
+
+    /// Log the next change to each variable the engine now holds as its whole new value: for a new member of a group,
+    /// whose readers may not have the values it read from its own storage.
+    pub fn log_values_whole(&self) {
+        let mut g = self.shared.ws.write().unwrap_or_else(|e| e.into_inner());
+        let names: Vec<_> = g.vars.keys().copied().collect();
+        g.unlogged.extend(names);
+    }
+
+    /// Install a snapshot that holds later changes than the engine does: a replica that lost its latest changes (it does
+    /// not force each to disk) starts again from there, as records that change a value need the value they were made from.
+    pub fn restore_state(&self, data: &[u8]) -> KResult<()> {
+        let snap: persist::SnapshotData = postcard::from_bytes(data).map_err(|e| KError::io(format!("bad snapshot: {e}")))?;
+        if snap.ts > self.applied_ts() {
+            self.install_state(data)?;
+        }
+        Ok(())
     }
 
     pub fn export_state_at(&self, ts: u64) -> KResult<Vec<u8>> {

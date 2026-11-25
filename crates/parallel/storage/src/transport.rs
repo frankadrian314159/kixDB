@@ -1,6 +1,6 @@
-//! Traffic between shard nodes: Raft messages between replicas (fire and forget: Raft tolerates loss) and the table
-//! slices a shuffle sends straight to the shard that owns them.
-use crate::replica::Envelope;
+//! Traffic between shard nodes: Raft messages between replicas (fire and forget: Raft tolerates loss, but is told what
+//! became of a snapshot or a batch of entries) and the table slices a shuffle sends straight to the shard that owns them.
+use crate::replica::{Envelope, Input};
 use arrow_flight::client::FlightClient;
 use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_client::FlightServiceClient;
@@ -10,6 +10,7 @@ use kix_raft::{Msg, NodeId};
 use kix_shared_ces::tls::{self, NodeTls};
 use kix_shared_ces::wire::{self, LoadReq, ACTION_LOAD, ACTION_RAFT};
 use std::collections::HashMap;
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -18,6 +19,9 @@ use tonic::Status;
 
 /// The largest message either side accepts.
 pub const MAX_MESSAGE: usize = 256 * 1024 * 1024;
+
+/// A message gets a second for each this many bytes, beyond the 2 seconds every one gets, before it is given up on.
+const SLOWEST_LINK: u64 = 1_000_000;
 
 /// Where each replica can be reached; kept up to date as the membership changes.
 pub type AddressBook = Arc<Mutex<HashMap<NodeId, String>>>;
@@ -37,20 +41,34 @@ async fn act(ch: Channel, kind: &str, body: Vec<u8>) -> Result<(), Status> {
     Ok(())
 }
 
-pub fn spawn_sender(me: NodeId, book: AddressBook, tls: Option<NodeTls>, mut rx: UnboundedReceiver<(NodeId, Msg)>) {
+pub(crate) fn spawn_sender(me: NodeId, book: AddressBook, tls: Option<NodeTls>, mut rx: UnboundedReceiver<(NodeId, Msg)>, inbox: Sender<Input>) {
     tokio::spawn(async move {
-        // a channel per replica, made again when its address changes
-        let mut channels: HashMap<String, Channel> = HashMap::new();
+        // channels to each replica, made again when its address changes; snapshots and entries have their own, so that
+        // heartbeats and replies do not queue behind them
+        let mut channels: HashMap<(String, bool), Channel> = HashMap::new();
         while let Some((to, msg)) = rx.recv().await {
-            let Some(addr) = book.lock().unwrap_or_else(|e| e.into_inner()).get(&to).cloned() else { continue };
-            if !channels.contains_key(&addr) {
-                let Ok(ch) = channel(&addr, tls.as_ref()) else { continue };
-                channels.insert(addr.clone(), ch);
-            }
-            let ch = channels[&addr].clone();
-            let Ok(body) = postcard::to_allocvec(&Envelope { from: me, msg }) else { continue };
+            let carries = msg.carries();
+            let addr = book.lock().unwrap_or_else(|e| e.into_inner()).get(&to).cloned();
+            let ch = addr.and_then(|addr| {
+                let key = (addr, carries.is_some());
+                if !channels.contains_key(&key) {
+                    channels.insert(key.clone(), channel(&key.0, tls.as_ref()).ok()?);
+                }
+                channels.get(&key).cloned()
+            });
+            let body = postcard::to_allocvec(&Envelope { from: me, msg }).ok();
+            let inbox = inbox.clone();
             tokio::spawn(async move {
-                let _ = tokio::time::timeout(Duration::from_secs(2), act(ch, ACTION_RAFT, body)).await;
+                let delivered = match ch.zip(body) {
+                    Some((ch, body)) => {
+                        let limit = Duration::from_secs(2 + body.len() as u64 / SLOWEST_LINK);
+                        matches!(tokio::time::timeout(limit, act(ch, ACTION_RAFT, body)).await, Ok(Ok(())))
+                    }
+                    None => false,
+                };
+                if let Some(upto) = carries {
+                    let _ = inbox.send(Input::Sent(to, upto, delivered));
+                }
             });
         }
     });

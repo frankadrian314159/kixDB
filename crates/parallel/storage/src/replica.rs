@@ -14,7 +14,7 @@
 //!
 //! The leader serves requests only while a majority has recently heard from it and it has applied everything committed.
 use crate::transport::{self, AddressBook};
-use kix_raft::{Conf, Config, Entry, FileStorage, Member, Msg, NodeId, Raft, Role, Snapshot};
+use kix_raft::{Conf, Config, Entry, FileStorage, Member, Msg, NodeId, Raft, Role, Snapshot, Storage};
 use kix_shared_ces::wire::MemberInfo;
 use kix_shared_ces::NodeTls;
 use kixdb::persist::{Replicator, WalRecord};
@@ -24,6 +24,16 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+
+/// What the protocol thread is woken for.
+pub(crate) enum Input {
+    /// There is something to apply or send.
+    Wake,
+    /// A message from a peer.
+    Message(NodeId, Msg),
+    /// Whether what was sent to this replica, up to an index, was delivered.
+    Sent(NodeId, u64, bool),
+}
 
 /// A Raft message on the wire.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -96,8 +106,8 @@ pub struct Replica {
     raft: Mutex<Raft<FileStorage>>,
     shared: Mutex<Shared>,
     cv: Condvar,
-    /// Messages from peers, for the protocol thread (`None` wakes it).
-    inbox: mpsc::Sender<Option<(NodeId, Msg)>>,
+    /// For the protocol thread.
+    inbox: mpsc::Sender<Input>,
     apply: Mutex<Option<mpsc::Sender<Apply>>>,
     outbox: tokio::sync::mpsc::UnboundedSender<(NodeId, Msg)>,
     server: Server,
@@ -123,6 +133,10 @@ impl Replica {
             seed: cfg.node_id.wrapping_mul(2_654_435_761) ^ std::process::id() as u64,
             join: cfg.join,
         };
+        if let Some(snapshot) = storage.snapshot() {
+            server.restore_state(&snapshot.data).map_err(std::io::Error::other)?;
+        }
+        server.log_values_whole();
         let raft = Raft::new(raft_cfg, storage);
         let (otx, orx) = tokio::sync::mpsc::unbounded_channel();
         let (itx, irx) = mpsc::channel();
@@ -142,7 +156,7 @@ impl Replica {
             commit_timeout: cfg.commit_timeout,
         });
         server.set_replicator(Some(Arc::new(Handle(replica.clone()))));
-        transport::spawn_sender(cfg.node_id, book, cfg.tls.clone(), orx);
+        transport::spawn_sender(cfg.node_id, book, cfg.tls.clone(), orx, replica.inbox.clone());
         let (me, tick) = (replica.clone(), Duration::from_millis(cfg.tick_ms.max(1)));
         std::thread::Builder::new().name(format!("raft-{}", cfg.node_id)).spawn(move || me.run(irx, tick))?;
         let (me, every) = (replica.clone(), cfg.snapshot_every);
@@ -153,7 +167,7 @@ impl Replica {
     /// Stop taking part in the group.
     pub fn stop(&self) {
         lock(&self.apply).take();
-        let _ = self.inbox.send(None);
+        let _ = self.inbox.send(Input::Wake);
         self.cv.notify_all();
         self.server.set_replicator(None);
     }
@@ -164,7 +178,7 @@ impl Replica {
 
     /// A message from a peer.
     pub fn deliver(&self, from: NodeId, msg: Msg) {
-        let _ = self.inbox.send(Some((from, msg)));
+        let _ = self.inbox.send(Input::Message(from, msg));
     }
 
     pub fn role(&self) -> (Role, u64) {
@@ -237,13 +251,17 @@ impl Replica {
         }
     }
 
-    fn run(self: Arc<Self>, inbox: mpsc::Receiver<Option<(NodeId, Msg)>>, tick: Duration) {
+    fn run(self: Arc<Self>, inbox: mpsc::Receiver<Input>, tick: Duration) {
         let mut last_tick = Instant::now();
         while !self.stopped() {
             let first = inbox.recv_timeout(tick.saturating_sub(last_tick.elapsed()));
             let mut raft = lock(&self.raft);
-            for (from, msg) in first.ok().into_iter().chain(inbox.try_iter()).flatten() {
-                raft.step(from, msg);
+            for input in first.ok().into_iter().chain(inbox.try_iter()) {
+                match input {
+                    Input::Message(from, msg) => raft.step(from, msg),
+                    Input::Sent(to, upto, delivered) => raft.sent(to, upto, delivered),
+                    Input::Wake => {}
+                }
             }
             // at most one tick per turn: a thread that was held up must not make up the lost time at once
             if last_tick.elapsed() >= tick {
@@ -393,7 +411,7 @@ impl Replicator for Handle {
             raft.propose(data).map_err(|_| fail(Replica::not_leader(&raft)))?;
             r.pump(&mut raft);
         }
-        let _ = r.inbox.send(None);
+        let _ = r.inbox.send(Input::Wake);
         let deadline = Instant::now() + r.commit_timeout;
         let mut sh = lock(&r.shared);
         loop {

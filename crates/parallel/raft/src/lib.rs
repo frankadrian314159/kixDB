@@ -1,8 +1,8 @@
 //! Pure state-machine Raft consensus core (`Raft<S>`), modeled on `../tsql-server/crates/parallel/raft`:
 //! - Randomized leader election with pre-disruption lease check
-//! - Log replication with fast conflict back-off and current-term majority commitment
+//! - Log replication with fast conflict back-off and current-term majority commitment, one batch at a time to each replica
 //! - Leader read lease (`has_lease`)
-//! - Log compaction & snapshot installation (`compact` / `Msg::Snapshot`)
+//! - Log compaction & snapshot installation (`compact` / `Msg::Snapshot`), one copy at a time too
 //! - Single-server learner-to-voter membership changes
 pub mod storage;
 
@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 pub type NodeId = u64;
+
+/// A batch of entries takes no further entry once it holds this many bytes.
+pub const MAX_BATCH: usize = 4 << 20;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Member {
@@ -109,6 +112,27 @@ pub enum Msg {
     },
 }
 
+impl Msg {
+    /// For a message that carries state (a snapshot, or entries): the last index it carries. The transport reports what
+    /// became of every such message with `Raft::sent`.
+    pub fn carries(&self) -> Option<u64> {
+        match self {
+            Msg::Snapshot { snap, .. } => Some(snap.index),
+            Msg::Append { entries, .. } => entries.last().map(|e| e.index),
+            _ => None,
+        }
+    }
+}
+
+/// A snapshot or batch of entries on its way to a replica.
+#[derive(Debug)]
+struct Sending {
+    /// The last index it carries.
+    upto: u64,
+    /// `None` while the transport has it, then the ticks left before another may be sent.
+    wait: Option<u32>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     Follower,
@@ -165,6 +189,7 @@ pub struct Raft<S: Storage> {
     lease_held: bool,
     outbox: Vec<(NodeId, Msg)>,
     pending_snap: Option<Snapshot>,
+    sending: HashMap<NodeId, Sending>,
 }
 
 impl<S: Storage> Raft<S> {
@@ -221,6 +246,7 @@ impl<S: Storage> Raft<S> {
             lease_held: false,
             outbox: Vec::new(),
             pending_snap: None,
+            sending: HashMap::new(),
         };
         r.reset_election_timeout();
         // Single-voter group elects itself immediately on first tick
@@ -297,7 +323,20 @@ impl<S: Storage> Raft<S> {
         self.log.get(index.checked_sub(self.snap_index + 1)? as usize)
     }
 
+    /// The transport's report on a message that `carries` state up to `upto`: delivered, or given up on. Every one must
+    /// be reported: nothing more is sent to that replica until then, nor, without its reply, for a while after.
+    pub fn sent(&mut self, peer: NodeId, upto: u64, delivered: bool) {
+        let ticks = self.election_ticks * if delivered { 10 } else { 1 };
+        if let Some(s) = self.sending.get_mut(&peer).filter(|s| s.upto == upto) {
+            s.wait = Some(ticks);
+        }
+    }
+
     pub fn tick(&mut self) {
+        self.sending.retain(|_, s| {
+            s.wait = s.wait.map(|t| t.saturating_sub(1));
+            s.wait != Some(0)
+        });
         match self.role {
             Role::Leader => {
                 self.ticks_since_leader += 1;
@@ -396,6 +435,7 @@ impl<S: Storage> Raft<S> {
         self.recent_ack.clear();
         self.recent_ack.insert(self.id);
         self.lease_held = true;
+        self.sending.clear();
 
         let next = self.last_index() + 1;
         self.next_index.clear();
@@ -488,25 +528,29 @@ impl<S: Storage> Raft<S> {
 
     fn send_append(&mut self, peer: NodeId) {
         let next = self.next_index.get(&peer).copied().unwrap_or(self.last_index() + 1);
-        if next <= self.snap_index {
-            let (_, _, Some(snap)) = self.storage.load() else { return };
-            self.outbox.push((peer, Msg::Snapshot { term: self.term, snap }));
-            return;
+        let msg = if self.sending.contains_key(&peer) {
+            // an empty append every log matches: it keeps the replica from calling an election while it waits
+            Msg::Append { term: self.term, prev_index: 0, prev_term: 0, entries: vec![], commit: self.commit_index }
+        } else if next <= self.snap_index {
+            let Some(snap) = self.storage.snapshot() else { return };
+            Msg::Snapshot { term: self.term, snap }
+        } else {
+            let prev_index = next - 1;
+            let prev_term = self.term_at(prev_index).unwrap_or(0);
+            let offset = (next - self.snap_index - 1) as usize;
+            let mut size = 0;
+            let fits = |e: &&Entry| {
+                let room = size < MAX_BATCH;
+                size += e.data.len();
+                room
+            };
+            let entries = self.log.get(offset..).unwrap_or(&[]).iter().take_while(fits).cloned().collect();
+            Msg::Append { term: self.term, prev_index, prev_term, entries, commit: self.commit_index }
+        };
+        if let Some(upto) = msg.carries() {
+            self.sending.insert(peer, Sending { upto, wait: None });
         }
-        let prev_index = next - 1;
-        let prev_term = self.term_at(prev_index).unwrap_or(0);
-        let offset = (next - self.snap_index - 1) as usize;
-        let entries = self.log.get(offset..).unwrap_or(&[]).to_vec();
-        self.outbox.push((
-            peer,
-            Msg::Append {
-                term: self.term,
-                prev_index,
-                prev_term,
-                entries,
-                commit: self.commit_index,
-            },
-        ));
+        self.outbox.push((peer, msg));
     }
 
     fn advance_commit(&mut self) {
@@ -627,6 +671,9 @@ impl<S: Storage> Raft<S> {
                 }
                 self.recent_ack.insert(from);
                 if success {
+                    if self.sending.get(&from).is_some_and(|s| match_index >= s.upto) {
+                        self.sending.remove(&from);
+                    }
                     let prev_m = self.match_index.get(&from).copied().unwrap_or(0);
                     if match_index > prev_m {
                         self.match_index.insert(from, match_index);
@@ -635,11 +682,17 @@ impl<S: Storage> Raft<S> {
                         self.advance_commit();
                         if self.commit_index > old_c {
                             self.broadcast_append();
+                        } else if self.role == Role::Leader {
+                            // the next batch, if there is one, and the commit index this replica may have missed
+                            self.send_append(from);
                         }
                     }
                 } else {
                     let fallback = (match_index + 1).max(1);
-                    self.next_index.insert(from, fallback);
+                    // one that moves nothing is old news: what is on its way is left to arrive
+                    if self.next_index.insert(from, fallback) != Some(fallback) {
+                        self.sending.remove(&from);
+                    }
                     self.send_append(from);
                 }
             }
@@ -672,9 +725,13 @@ impl<S: Storage> Raft<S> {
                 }
                 if self.role == Role::Leader && term == self.term {
                     self.recent_ack.insert(from);
+                    self.sending.remove(&from);
                     self.match_index.insert(from, index);
                     self.next_index.insert(from, index + 1);
                     self.advance_commit();
+                    if self.role == Role::Leader && index < self.last_index() {
+                        self.send_append(from);
+                    }
                 }
             }
         }
@@ -706,6 +763,98 @@ mod tests {
     use super::*;
 
     #[test]
+    fn one_snapshot_at_a_time_goes_to_a_replica_that_is_behind() {
+        let node = |id, peers| Raft::new(Config { id, peers, election_ticks: 8, heartbeat_ticks: 2, seed: id, join: false }, MemStorage::new());
+        // a leader of three whose third replica has answered nothing, with the log cut past it
+        let mut leader = node(1, vec![2, 3]);
+        while leader.role != Role::Candidate {
+            leader.tick();
+        }
+        let term = leader.term;
+        leader.step(2, Msg::VoteReply { term, granted: true });
+        let index = leader.propose(vec![7]).unwrap();
+        let acknowledge = |leader: &mut Raft<MemStorage>| leader.step(2, Msg::AppendReply { term, success: true, match_index: index });
+        acknowledge(&mut leader);
+        leader.compact(index, b"state".to_vec());
+        leader.sent(3, index - 1, false); // what went to it before the log was cut is lost
+        leader.ready();
+        // what the third replica is sent over some ticks: (snapshots, heartbeats)
+        let run = |leader: &mut Raft<MemStorage>, ticks| {
+            let (mut snapshots, mut heartbeats) = (0, 0);
+            for _ in 0..ticks {
+                acknowledge(leader);
+                leader.tick();
+                for (to, m) in leader.ready().messages {
+                    match m {
+                        Msg::Snapshot { .. } if to == 3 => snapshots += 1,
+                        Msg::Append { prev_index: 0, .. } if to == 3 => heartbeats += 1,
+                        _ => {}
+                    }
+                }
+            }
+            (snapshots, heartbeats)
+        };
+        // one copy is on its way, however long that takes
+        let (snapshots, heartbeats) = run(&mut leader, 200);
+        assert_eq!(snapshots, 1);
+        assert!(heartbeats >= 90, "{heartbeats}");
+        // one that was given up on is sent again after a pause; a report about something else changes nothing
+        leader.sent(3, index + 1, false);
+        assert_eq!(run(&mut leader, 20).0, 0);
+        leader.sent(3, index, false);
+        assert_eq!(run(&mut leader, 6).0, 0);
+        assert_eq!(run(&mut leader, 6).0, 1);
+        // so is one that was delivered but never answered
+        leader.sent(3, index, true);
+        assert_eq!(run(&mut leader, 70).0, 0);
+        assert_eq!(run(&mut leader, 30).0, 1);
+        // a replica that gets a heartbeat accepts it, and once its reply arrives it is sent entries
+        let mut behind = node(3, vec![1, 2]);
+        behind.step(1, Msg::Append { term, prev_index: 0, prev_term: 0, entries: vec![], commit: index });
+        assert!(matches!(behind.ready().messages[..], [(1, Msg::AppendReply { success: true, match_index: 0, .. })]));
+        leader.step(3, Msg::SnapshotReply { term, index });
+        assert_eq!(run(&mut leader, 20), (0, 0));
+        assert_eq!(leader.matched(3), index);
+    }
+
+    #[test]
+    fn one_batch_of_entries_at_a_time_goes_to_a_replica() {
+        let mut leader = Raft::new(Config { id: 1, peers: vec![2], election_ticks: 8, heartbeat_ticks: 2, seed: 1, join: false }, MemStorage::new());
+        while leader.role != Role::Candidate {
+            leader.tick();
+        }
+        let term = leader.term;
+        leader.step(2, Msg::VoteReply { term, granted: true });
+        let reply = |leader: &mut Raft<MemStorage>, match_index| leader.step(2, Msg::AppendReply { term, success: true, match_index });
+        // the entries sent since the last call, batch by batch
+        let batches = |leader: &mut Raft<MemStorage>| -> Vec<Vec<u64>> {
+            let all = leader.ready().messages.into_iter();
+            all.filter_map(|(_, m)| match m {
+                Msg::Append { entries, .. } if !entries.is_empty() => Some(entries.iter().map(|e| e.index).collect()),
+                _ => None,
+            })
+            .collect()
+        };
+        assert_eq!(batches(&mut leader), [[1]]);
+        // nothing more goes while that batch is on its way
+        for _ in 0..5 {
+            leader.propose(vec![0; MAX_BATCH / 2]).unwrap();
+            leader.tick();
+        }
+        assert!(batches(&mut leader).is_empty());
+        // its answer brings the next at once, as many entries as make up a batch, and then the rest
+        reply(&mut leader, 1);
+        assert_eq!(batches(&mut leader), [[2, 3]]);
+        reply(&mut leader, 3);
+        assert_eq!(batches(&mut leader), [[4, 5]]);
+        // a refusal that says nothing new does not send the batch twice
+        leader.step(2, Msg::AppendReply { term, success: false, match_index: 3 });
+        assert!(batches(&mut leader).is_empty());
+        reply(&mut leader, 5);
+        assert_eq!(batches(&mut leader), [[6]]);
+    }
+
+    #[test]
     fn three_node_election_replication_partition_and_snapshot() {
         let ids = [1u64, 2, 3];
         let mut nodes: HashMap<NodeId, Raft<MemStorage>> = ids
@@ -728,17 +877,17 @@ mod tests {
                             applied.entry(id).or_default().push(e.data);
                         }
                     }
-                    for (to, m) in rdy.messages {
-                        if !blocked.contains(&(id, to)) && !blocked.contains(&(to, id)) {
-                            msgs.push((id, to, m));
-                        }
-                    }
+                    msgs.extend(rdy.messages.into_iter().map(|(to, m)| (id, to, m)));
                 }
                 if msgs.is_empty() {
                     break;
                 }
                 for (from, to, m) in msgs {
-                    if let Some(dst) = nodes.get_mut(&to) {
+                    let lost = blocked.contains(&(from, to)) || blocked.contains(&(to, from));
+                    if let Some(upto) = m.carries() {
+                        nodes.get_mut(&from).unwrap().sent(to, upto, !lost);
+                    }
+                    if let Some(dst) = nodes.get_mut(&to).filter(|_| !lost) {
                         dst.step(from, m);
                     }
                 }

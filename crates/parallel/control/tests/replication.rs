@@ -7,7 +7,10 @@ use kix_storage::{spawn, spawn_on, ReplicaConfig, RunningShard, ShardNode};
 use kixdb::{Server, K};
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 struct Group {
     runtime: tokio::runtime::Runtime,
@@ -30,8 +33,16 @@ fn replica(runtime: &tokio::runtime::Runtime, dir: &Path, listener: tokio::net::
 
 impl Group {
     fn start(snapshot_every: u64) -> Group {
+        Group::start_with(snapshot_every, "")
+    }
+
+    /// A group whose replicas all begin with the data `preload` makes (it is not in their logs).
+    fn start_with(snapshot_every: u64, preload: &str) -> Group {
         let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
         let dir = tempfile::tempdir().unwrap();
+        for id in (1..=3).filter(|_| !preload.is_empty()) {
+            Server::open(dir.path().join(format!("data{id}"))).unwrap().connect_internal().eval(preload).unwrap();
+        }
         // every replica must know the others' addresses before any starts
         let listeners: Vec<_> = (0..3).map(|_| runtime.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap()).collect();
         let addrs: Vec<String> = listeners.iter().map(|l| l.local_addr().unwrap().to_string()).collect();
@@ -193,6 +204,64 @@ fn without_a_majority_nothing_is_written() {
     wait("the leader to step down", || (group.replicas[leader].as_ref().unwrap().replica.as_ref().unwrap().role().0 != Role::Leader).then_some(()));
     assert_eq!(engine.connect_internal().eval("x: 1").unwrap_err().signal, "cluster");
     group.kill(leader);
+}
+
+/// Forward connections to `to`, passing about `rate` bytes a second towards it and counting them in `sent`.
+async fn slow_link(listener: tokio::net::TcpListener, to: String, rate: usize, sent: Arc<AtomicUsize>) {
+    // when the link is next free
+    let free = Arc::new(tokio::sync::Mutex::new(Instant::now()));
+    while let Ok((from, _)) = listener.accept().await {
+        let (to, free, sent) = (to.clone(), free.clone(), sent.clone());
+        tokio::spawn(async move {
+            let Ok(out) = tokio::net::TcpStream::connect(to).await else { return };
+            let ((mut read, mut write), (mut back, mut forth)) = (from.into_split(), out.into_split());
+            tokio::spawn(async move { tokio::io::copy(&mut back, &mut write).await });
+            let mut buf = vec![0u8; 16 * 1024];
+            while let Ok(n @ 1..) = read.read(&mut buf).await {
+                let mut at = free.lock().await;
+                *at = (*at).max(Instant::now() - Duration::from_millis(50)) + Duration::from_secs_f64(n as f64 / rate as f64);
+                tokio::time::sleep_until((*at).into()).await;
+                sent.fetch_add(n, Relaxed);
+                if forth.write_all(&buf[..n]).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+}
+
+#[test]
+fn a_replica_behind_a_slow_link_is_sent_its_snapshot_once() {
+    // four megabytes on each replica, and then small changes until the log is cut: only a snapshot can pass the data on
+    let mut group = Group::start_with(10, "big: ([] v: 0.5 + til 524288)");
+    let leader = group.leader();
+    let mut engine = group.replicas[leader].as_ref().unwrap().server.connect_internal();
+    for i in 0..12 {
+        engine.eval(&format!("x{i}: {i}")).unwrap();
+    }
+    wait("a snapshot", || (group.replicas[leader].as_ref().unwrap().replica.as_ref().unwrap().snapshot_index() >= 10).then_some(()));
+    // the new replica is reached at 900 kB a second: the snapshot takes longer than other messages are given
+    let bind = || group.runtime.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+    let (listener, front) = (bind(), bind());
+    let (direct, public) = (listener.local_addr().unwrap().to_string(), front.local_addr().unwrap().to_string());
+    let sent = Arc::new(AtomicUsize::new(0));
+    group.runtime.spawn(slow_link(front, direct, 900_000, sent.clone()));
+    let peers = (0..3).map(|p| (p as u64 + 1, group.addrs[p].clone())).collect();
+    let reached_at = public.clone();
+    let joined = replica(&group.runtime, group.dir.path(), listener, |rc| (rc.join, rc.addr) = (true, reached_at), 4, peers);
+    // (adding it waits only as long as the leader's own commit timeout, 3 s: it may give up before the replica is there)
+    let _ = group.replicas[leader].as_ref().unwrap().replica.as_ref().unwrap().add_replica(4, &public);
+    group.replicas.push(Some(joined));
+    group.all_hold("big", 524288);
+    let sent = sent.load(Relaxed);
+    assert!(sent < 6 << 20, "{sent} bytes sent for a snapshot of about 4 MB");
+    // asking again finishes the job: the replica becomes a voter
+    let leading = group.replicas[leader].as_ref().unwrap().replica.as_ref().unwrap();
+    wait("the replica to be added", || leading.add_replica(4, &public).ok());
+    assert!(leading.members().iter().any(|m| m.0 == 4 && m.2));
+    for i in 0..group.replicas.len() {
+        group.kill(i);
+    }
 }
 
 #[test]

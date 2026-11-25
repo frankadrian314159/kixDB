@@ -1,9 +1,10 @@
 //! Durable workspace persistence: checksummed write-ahead log (`kix.wal`), atomic snapshots (`kix.snap`),
 //! crash recovery (discarding torn log tails), and replication hooks for `crates/parallel/`.
+use crate::delta;
 use crate::engine::{DistMode, ViewDef, Workspace};
 use crate::error::{KError, KResult};
 use crate::storage;
-use crate::sym::SymId;
+use crate::sym::{resolve, SymId};
 use crate::types::K;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -33,6 +34,8 @@ pub enum LogOp {
     DropVar { name: SymId },
     SetView { def: ViewDef },
     SetDist { table: SymId, mode: DistMode },
+    /// A new value of a vector or table as what changed in it (see `delta.rs`).
+    ChangeVar { name: SymId, changes: delta::Changes },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -122,7 +125,7 @@ impl Persist {
             }
             if let Ok(rec) = postcard::from_bytes::<WalRecord>(payload) {
                 if rec.ts > ws.clock {
-                    apply_record(&mut ws, &rec);
+                    apply_record(&mut ws, &rec)?;
                 }
                 replayed += 1;
                 offset += 12 + frame_len;
@@ -207,7 +210,7 @@ impl Persist {
     }
 }
 
-pub fn apply_record(ws: &mut Workspace, rec: &WalRecord) {
+pub fn apply_record(ws: &mut Workspace, rec: &WalRecord) -> KResult<()> {
     for op in &rec.ops {
         match op {
             LogOp::SetVar { name, val } => {
@@ -225,11 +228,18 @@ pub fn apply_record(ws: &mut Workspace, rec: &WalRecord) {
             LogOp::SetDist { table, mode } => {
                 ws.dist.insert(*table, mode.clone());
             }
+            LogOp::ChangeVar { name, changes } => {
+                ws.views.remove(name);
+                if !ws.vars.get_mut(name).is_some_and(|v| delta::patch(v, changes)) {
+                    return Err(KError::io(format!("the log changes '{}', whose value is not the one it was made from", resolve(*name))));
+                }
+            }
         }
     }
     ws.invalidate_views();
     ws.clock = ws.clock.max(rec.ts);
     ws.epoch += 1;
+    Ok(())
 }
 
 pub fn export_snapshot(ws: &Workspace, ts: u64) -> SnapshotData {
@@ -248,6 +258,7 @@ pub fn export_snapshot(ws: &Workspace, ts: u64) -> SnapshotData {
 
 pub fn install_snapshot_into(ws: &mut Workspace, snap: SnapshotData) {
     ws.vars.clear();
+    ws.unlogged.clear();
     ws.views.clear();
     ws.dist.clear();
     for (k, v) in snap.vars {

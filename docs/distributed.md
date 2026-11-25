@@ -202,6 +202,19 @@ A replicated shard elects a leader. A change takes effect only after a majority 
 majority writes fail with `'cluster`. When the leader dies the control node finds the new one. Replicas cut their Raft
 log with snapshots (`--snapshot-every`, 5,000 entries), and one that fell behind is sent a snapshot.
 
+The leader has one thing on its way to each replica at a time, a snapshot or a batch of log records (a batch takes no
+further record once it holds 4 MB), over a connection of its own; heartbeats go on meanwhile. It is given 2 seconds and
+a second more for each megabyte before it is sent again. Neither a snapshot nor a record can be larger than 256 MB.
+
+A log record holds what changed ([storage.md](storage.md)): an `insert` replicates its rows, an `update` the columns it
+assigns (the first change to a table after a replica starts replicates it whole). A `delete` or a re-sort always does,
+so on a table of many megabytes it takes correspondingly long, and can time out.
+
+A replica keeps its Raft state in `raft.log`, to which records are added and which is written afresh when it is cut, and
+`raft.snap`, the latest snapshot. It takes over the single `raft.bin` of earlier versions, which cannot read the new
+state or the new log records: **stop all replicas of a shard, upgrade them, and start them again.** Do not run versions
+side by side in one shard.
+
 To add a replica, first make its certificate and start it, with `--join` and the addresses of the others (without
 `--peers` it cannot answer the leader, and adding it fails):
 
@@ -212,7 +225,8 @@ kix-shard --id 0 --listen 10.0.0.5:50051 --data s0r4 --replica 4 --join --addr 1
     --node-ca ca.pem --node-cert s0r4.pem --node-key s0r4.key
 ```
 
-Then tell the control node:
+Then tell the control node (if it answers that the replica did not catch up in time, as it may when the snapshot takes
+long, the replica goes on receiving it; run the command again to finish):
 
 ```
 SHARDS                                  / shard, address, role, term, applied, memory
@@ -242,7 +256,7 @@ shards must match.
 * **The number of shards is fixed** when the cluster is created. There is no rebalancing.
 * **Floating point sums** added in two phases can differ from one server's in the last digits.
 * A shard runs one request at a time.
-* Each change is logged and replicated as the whole new value of the table's slice (see [storage.md](storage.md)), and
-  the Raft log file is rewritten on each append: write throughput falls as tables grow.
+* A change that is not an append or an assignment to some columns (a `delete`, a re-sort) is logged and replicated as the
+  whole new value of the table's slice (see [storage.md](storage.md)). A replica's log is held in memory until it is cut.
 * Tables move between shards (shuffle and broadcast) as kdb+ IPC bytes inside Flight actions; query results stream as
   Arrow batches.
