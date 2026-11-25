@@ -33,6 +33,8 @@ fn flat_splayed_and_partitioned_hdb_pruning() {
     let mut c2 = srv2.connect();
     assert_eq!(c2.eval("count select from t_d").unwrap().to_string(), "5");
     assert_eq!(c2.eval("exec sum size from t_d where date = 2026.11.24").unwrap().to_string(), "700");
+    // a column named only inside a string is loaded too
+    assert_eq!(c2.eval("exec value \"sum size\" from t_d where date = 2026.11.24").unwrap().to_string(), "700");
     assert_eq!(
         c2.eval("exec sum size from t_d where date = 2026.11.23, sym = `AAPL").unwrap().to_string(),
         "300"

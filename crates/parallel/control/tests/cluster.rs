@@ -48,6 +48,12 @@ fn queries_are_pushed_to_the_shards() {
     p.plan("select from acct", "merged in order");
     p.plan("select from trade where time within 09:31:00.000 09:32:00.000", "merged in order");
 
+    // a cast of a constant string is a constant: it filters on the shards and routes like a literal
+    p.plan("select from trade where sym = `$\"AAPL\"", "route");
+    p.plan("exec price from trade where ex in (`N;`$\"B\"), ex <> `$\"Q\"", "merged in order");
+    p.plan("select sum size, avg price from trade where ex = `$\"N\"", "two-phase");
+    p.plan("select time from trade where price > \"F\"$\"110\"", "merged in order");
+
     // grouped by the distribution column: no group spans shards
     p.plan("select vwap: size wavg price, hi: max price, n: count i by sym from trade", "grouped by the distribution column");
     p.plan("select o: first price, h: max price, l: min price, c: last price by sym, bar: 5 xbar time.minute from trade", "grouped by");

@@ -114,6 +114,9 @@ For a gathered query over one sharded table, leading row-by-row filters run on t
 copied. A statement that calls `value`, `get`, `system` or similar may name tables at run time, so every table is
 gathered.
 
+A filter may compare with a literal, a variable or a cast of constants (`` sym = `$"BRK.B" ``, `` d > "D"$"2026.11.24" ``).
+The control node computes the cast, so it filters on the shards and can route like a literal.
+
 Independent subqueries (`where sym in exec sym from inst where ...`) run first and are sent along as values.
 
 ### Joins

@@ -1,5 +1,6 @@
 //! `qSQL` execution (`select`, `exec`, `update`, `delete`), `fby` filter-by-group, and `insert`/`upsert`.
 use crate::ast::{ColSpec, Expr, QSql, QSqlKind};
+use crate::engine::ops::group_rows;
 use crate::engine::Engine;
 use crate::error::{KError, KResult};
 use crate::parser::infer_col_name;
@@ -8,24 +9,50 @@ use crate::types::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Verbs whose argument names things only at run time.
+pub const DYNAMIC: [&str; 5] = ["value", "get", "eval", "reval", "system"];
+
 impl<'a> Engine<'a> {
+    /// The names that `exprs` can read, or `None` when they reach names at run time (through a `DYNAMIC` verb, a view
+    /// or a function variable) and so may read any column.
+    fn names_read<'e>(&self,exprs: impl IntoIterator<Item = &'e Expr>) -> Option<Vec<SymId>> {
+        let mut names = Vec::new();
+        for e in exprs {
+            e.any(&mut |x| {
+                if let Expr::Var(s)
+                | Expr::Field(_, s)
+                | Expr::Unary { op: s, .. }
+                | Expr::Binary { op: s, .. }
+                | Expr::Assign { name: s, .. }
+                | Expr::IndexAssign { name: s, .. }
+                | Expr::Lit(K::Func(Func::Prim(s))) = x
+                {
+                    names.push(*s);
+                }
+                false
+            });
+        }
+        let dynamic = names.iter().any(|&n| DYNAMIC.contains(&resolve(n).as_str()) || self.reaches_names(n));
+        (!dynamic).then_some(names)
+    }
+
+    /// The columns of `flip` that `exprs` can read (shared, not copied); at least one, which gives the row count.
+    fn columns_read<'e>(&self,flip: &Flip, exprs: impl IntoIterator<Item = &'e Expr>) -> Flip {
+        let Some(names) = self.names_read(exprs) else { return flip.clone() };
+        let mut keep: Vec<usize> = (0..flip.ncols()).filter(|&c| names.contains(&flip.cols[c])).collect();
+        if keep.is_empty() && flip.ncols() > 0 {
+            keep.push(0);
+        }
+        Flip { cols: keep.iter().map(|&c| flip.cols[c]).collect(), vals: keep.iter().map(|&c| flip.vals[c].clone()).collect() }
+    }
+
     pub fn eval_qsql(&mut self, q: &QSql) -> KResult<K> {
         // Check if `from` is a symbol `` `table `` (in-place `update` / `delete`, or reading a named table)
         let mut inplace_target: Option<SymId> = None;
         // the names a `select`/`exec` with an explicit column list mentions: all a partitioned table has to load
-        let needed = (matches!(q.kind, QSqlKind::Select | QSqlKind::Exec) && !q.cols.is_empty()).then(|| {
-            let mut names = Vec::new();
-            for e in q.cols.iter().chain(q.by.iter().flatten()).map(|c| &c.expr).chain(&q.where_clauses) {
-                e.any(&mut |x| {
-                    match x {
-                        Expr::Var(s) | Expr::Field(_, s) => names.push(*s),
-                        _ => {}
-                    }
-                    false
-                });
-            }
-            names
-        });
+        let outputs = || q.cols.iter().chain(q.by.iter().flatten()).map(|c| &c.expr);
+        let reads_listed = matches!(q.kind, QSqlKind::Select | QSqlKind::Exec) && !q.cols.is_empty();
+        let needed = if reads_listed { self.names_read(outputs().chain(&q.where_clauses)) } else { None };
         let source_k = match &*q.from {
             Expr::Lit(K::Sym(tname)) => {
                 if matches!(q.kind, QSqlKind::Update | QSqlKind::DeleteRows | QSqlKind::DeleteCols) {
@@ -100,7 +127,7 @@ impl<'a> Engine<'a> {
                     active_rows = Some(extract_where_indices(&pred_k, total_nrows)?);
                 }
                 Some(cur) => {
-                    let sub_flip = base_flip.gather(cur);
+                    let sub_flip = self.columns_read(&base_flip, [wc]).gather(cur);
                     let pred_k = self.eval_in_table_scope(&sub_flip, wc)?;
                     let keep_local = extract_where_indices(&pred_k, sub_flip.nrows())?;
                     active_rows = Some(keep_local.into_iter().map(|li| cur[li]).collect());
@@ -147,28 +174,17 @@ impl<'a> Engine<'a> {
                 Ok(out_k)
             }
 
-            QSqlKind::Exec => {
-                let sub_buf;
+            QSqlKind::Select | QSqlKind::Exec => {
+                // without a column list the result has every column
+                let read = if q.cols.is_empty() { base_flip.clone() } else { self.columns_read(&base_flip, outputs()) };
                 let filtered = match &active_rows {
-                    None => &base_flip,
-                    Some(r) => {
-                        sub_buf = base_flip.gather(r);
-                        &sub_buf
-                    }
+                    None => read,
+                    Some(rows) => read.gather(rows),
                 };
-                self.exec_query_exec(filtered, &q.cols, q.by.as_deref())
-            }
-
-            QSqlKind::Select => {
-                let sub_buf;
-                let filtered = match &active_rows {
-                    None => &base_flip,
-                    Some(r) => {
-                        sub_buf = base_flip.gather(r);
-                        &sub_buf
-                    }
-                };
-                let mut res = self.exec_select(filtered, &q.cols, q.by.as_deref(), orig_key_cols)?;
+                if q.kind == QSqlKind::Exec {
+                    return self.exec_query_exec(&filtered, &q.cols, q.by.as_deref());
+                }
+                let mut res = self.exec_select(&filtered, &q.cols, q.by.as_deref(), orig_key_cols)?;
                 if q.distinct {
                     if let K::Table(_) = &res {
                         res = crate::engine::ops::distinct_op(&res)?;
@@ -316,7 +332,7 @@ impl<'a> Engine<'a> {
                 }
 
                 // Group row indices by composite `by` key
-                let (first_rows, mut groups) = group_rows_by_cols(&by_vecs, filtered.nrows());
+                let (first_rows, mut groups) = group_rows(&by_vecs, filtered.nrows());
 
                 // Sort groups ascending by `by_vecs` keys (matching kdb+ `select ... by k from t`!)
                 let mut group_order: Vec<usize> = (0..first_rows.len()).collect();
@@ -422,10 +438,10 @@ impl<'a> Engine<'a> {
         let total = work.nrows();
         let all_selected = active_rows.len() == total;
 
-        let sub = if all_selected { work.clone() } else { work.gather(active_rows) };
-
         if let Some(by_specs) = by {
             // Grouped `update` (`update vwap: size wavg price by sym from t`): evaluate per group and scatter back!
+            let read = self.columns_read(&work, cols.iter().chain(by_specs).map(|c| &c.expr));
+            let sub = if all_selected { read } else { read.gather(active_rows) };
             let mut by_vecs = Vec::with_capacity(by_specs.len());
             for bs in by_specs {
                 match self.eval_in_table_scope(&sub, &bs.expr)? {
@@ -434,7 +450,7 @@ impl<'a> Engine<'a> {
                     _ => return Err(KError::length("update by expression length mismatch")),
                 }
             }
-            let (_first, groups) = group_rows_by_cols(&by_vecs, sub.nrows());
+            let (_first, groups) = group_rows(&by_vecs, sub.nrows());
             for (cname, cs) in col_names.into_iter().zip(cols) {
                 let existing = work.col(cname).cloned();
                 let mut full_atoms: Vec<K> = if let Some(ref ex) = existing {
@@ -490,7 +506,8 @@ impl<'a> Engine<'a> {
 
         // Ungrouped `update`
         for (cname, cs) in col_names.into_iter().zip(cols) {
-            let sub_cur = if all_selected { work.clone() } else { work.gather(active_rows) };
+            let read = self.columns_read(&work, [&cs.expr]);
+            let sub_cur = if all_selected { read } else { read.gather(active_rows) };
             let val = self.eval_in_table_scope_with_orig_i(&sub_cur, active_rows, &cs.expr)?;
             if all_selected {
                 let new_cv = match val {
@@ -561,7 +578,7 @@ impl<'a> Engine<'a> {
             _ => return Err(KError::ty("fby RHS must be a vector or table")),
         };
 
-        let (_first, groups) = group_rows_by_cols(&grp_cols, nrows);
+        let (_first, groups) = group_rows(&grp_cols, nrows);
         let mut out = vec![K::Null; nrows];
         for grp in groups {
             let slice = K::Vector(data.gather(&grp));
@@ -767,25 +784,4 @@ fn extract_where_indices(pred: &K, nrows: usize) -> KResult<Vec<usize>> {
         }
         _ => Err(KError::ty("where clause must evaluate to boolean vector")),
     }
-}
-
-fn group_rows_by_cols(cols: &[ColVec], nrows: usize) -> (Vec<usize>, Vec<Vec<usize>>) {
-    let mut map: HashMap<Vec<u8>, usize> = HashMap::new();
-    let mut first_rows = Vec::new();
-    let mut groups: Vec<Vec<usize>> = Vec::new();
-    for r in 0..nrows {
-        let mut hk = Vec::with_capacity(cols.len() * 10);
-        for c in cols {
-            hk.extend_from_slice(&c.get_atom(r).hash_key());
-        }
-        if let Some(&gid) = map.get(&hk) {
-            groups[gid].push(r);
-        } else {
-            let gid = groups.len();
-            map.insert(hk, gid);
-            first_rows.push(r);
-            groups.push(vec![r]);
-        }
-    }
-    (first_rows, groups)
 }

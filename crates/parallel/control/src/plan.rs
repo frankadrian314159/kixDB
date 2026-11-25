@@ -585,6 +585,12 @@ impl Planner<'_> {
                     let replaced = self.subst(child, scope)?;
                     *child = replaced;
                 }
+                // a cast of constants (`` `$"text" ``) is a constant: computed here, it filters and routes like a literal
+                if let Expr::Binary { op, lhs, rhs } = &out {
+                    if resolve(*op) == "$" && matches!((&**lhs, &**rhs), (Expr::Lit(_), Expr::Lit(_))) {
+                        return self.mirror.eval_expr(&out).ok().map(Expr::Lit);
+                    }
+                }
                 Some(out)
             }
         }

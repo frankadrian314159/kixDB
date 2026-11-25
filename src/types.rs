@@ -889,6 +889,30 @@ impl ColVec {
         Ok(())
     }
 
+    /// Each element of a fixed-width vector as 64 bits, two being equal exactly when the elements' `hash_key`s are
+    /// (so all NaNs are one value, as are both zeros).
+    pub fn key_bits(&self) -> Option<Vec<u64>> {
+        fn float(v: f64) -> u64 {
+            if v.is_nan() { f64::NAN.to_bits() } else if v == 0.0 { 0 } else { v.to_bits() }
+        }
+        Some(match self {
+            ColVec::Bool(_, v) => v.iter().map(|&x| u64::from(x)).collect(),
+            ColVec::Byte(_, v) | ColVec::Char(_, v) => v.iter().map(|&x| u64::from(x)).collect(),
+            ColVec::Short(_, v) => v.iter().map(|&x| x as u64).collect(),
+            ColVec::Int(_, v)
+            | ColVec::Month(_, v)
+            | ColVec::Date(_, v)
+            | ColVec::Minute(_, v)
+            | ColVec::Second(_, v)
+            | ColVec::Time(_, v) => v.iter().map(|&x| x as u64).collect(),
+            ColVec::Long(_, v) | ColVec::Timestamp(_, v) | ColVec::Timespan(_, v) => v.iter().map(|&x| x as u64).collect(),
+            ColVec::Real(_, v) => v.iter().map(|&x| float(f64::from(x))).collect(),
+            ColVec::Float(_, v) | ColVec::Datetime(_, v) => v.iter().map(|&x| float(x)).collect(),
+            ColVec::Sym(_, v) => v.iter().map(|&x| u64::from(x.0)).collect(),
+            ColVec::General(..) | ColVec::Guid(..) => return None,
+        })
+    }
+
     pub fn is_numeric(&self) -> bool {
         matches!(
             self,

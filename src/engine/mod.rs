@@ -287,6 +287,14 @@ impl<'a> Engine<'a> {
         r
     }
 
+    /// Whether using `name` can reach other names at run time: it is a view, or a variable holding a function that is
+    /// not a lambda (such as an alias of `value`).
+    fn reaches_names(&self, name: SymId) -> bool {
+        let keys = [self.qualify(name), name];
+        let held = self.locals.last().and_then(|f| f.get(&name)).or_else(|| keys.iter().find_map(|k| self.ws.vars.get(k)));
+        matches!(held, Some(K::Func(f)) if !matches!(f, Func::Lambda(_))) || keys.iter().any(|k| self.ws.views.contains_key(k))
+    }
+
     fn qualify(&self, name: SymId) -> SymId {
         let s = resolve(name);
         if s.starts_with('.') || self.session.current_ns.is_empty() {

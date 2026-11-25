@@ -10,6 +10,8 @@ in memory as columnar vectors, selected answers are recomputed independently in 
 cluster runners require every query's distributed answer to match a single-node engine. Each binary exits non-zero on
 any query error or answer mismatch.
 
+Measured timings and their analysis are in [Benchmark results: scale factor 0.3](benchmark-results.md).
+
 ## Commands
 
 | Benchmark | Command | Description |

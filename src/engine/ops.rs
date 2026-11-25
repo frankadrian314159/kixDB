@@ -4,8 +4,10 @@ use crate::sym::{intern, resolve, SymId};
 use crate::types::*;
 use chrono::Datelike;
 use regex::Regex;
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::sync::Arc;
 
 // ----- Temporal / Dict / Table `.field` Extraction --------------------------
@@ -629,32 +631,50 @@ fn reverse_op(x: &K) -> KResult<K> {
     }
 }
 
+/// A group number for every row: rows alike in all of `cols` share one, numbered in order of first appearance.
+fn group_ids(cols: &[ColVec], nrows: usize) -> Vec<usize> {
+    // split the groups made so far by one more column
+    fn refine<T: Hash + Eq>(ids: &mut [usize], keys: impl Iterator<Item = T>) {
+        let mut seen = HashMap::new();
+        for (id, key) in ids.iter_mut().zip(keys) {
+            let next = seen.len();
+            *id = *seen.entry((*id, key)).or_insert(next);
+        }
+    }
+    let mut ids = vec![0; nrows];
+    for c in cols {
+        match c.key_bits() {
+            Some(keys) => refine(&mut ids, keys.into_iter()),
+            None => refine(&mut ids, (0..nrows).map(|r| c.get_atom(r).hash_key())),
+        }
+    }
+    ids
+}
+
+/// The first row of every group that `group_ids` numbered.
+fn first_rows(ids: &[usize]) -> Vec<usize> {
+    let mut found = Vec::new();
+    for (r, &id) in ids.iter().enumerate() {
+        if id == found.len() {
+            found.push(r);
+        }
+    }
+    found
+}
+
+/// Group rows by `cols`: the first row of each group and all of its rows, groups in order of first appearance.
+pub fn group_rows(cols: &[ColVec], nrows: usize) -> (Vec<usize>, Vec<Vec<usize>>) {
+    let ids = group_ids(cols, nrows);
+    let first = first_rows(&ids);
+    let mut groups = vec![Vec::new(); first.len()];
+    ids.into_iter().enumerate().for_each(|(r, id)| groups[id].push(r));
+    (first, groups)
+}
+
 pub fn distinct_op(x: &K) -> KResult<K> {
     match x {
-        K::Vector(v) => {
-            let mut seen = HashSet::with_capacity(v.len());
-            let mut keep = Vec::new();
-            for i in 0..v.len() {
-                if seen.insert(v.get_atom(i).hash_key()) {
-                    keep.push(i);
-                }
-            }
-            Ok(K::Vector(v.gather(&keep)))
-        }
-        K::Table(t) => {
-            let mut seen = HashSet::with_capacity(t.nrows());
-            let mut keep = Vec::new();
-            for r in 0..t.nrows() {
-                let mut key = Vec::new();
-                for c in &t.vals {
-                    key.extend_from_slice(&c.get_atom(r).hash_key());
-                }
-                if seen.insert(key) {
-                    keep.push(r);
-                }
-            }
-            Ok(K::Table(Arc::new(t.gather(&keep))))
-        }
+        K::Vector(v) => Ok(K::Vector(v.gather(&first_rows(&group_ids(std::slice::from_ref(v), v.len()))))),
+        K::Table(t) => Ok(K::Table(Arc::new(t.gather(&first_rows(&group_ids(&t.vals, t.nrows())))))),
         _ => Err(KError::ty("distinct requires list or table")),
     }
 }
@@ -693,24 +713,11 @@ pub fn group_op(x: &K) -> KResult<K> {
     let K::Vector(cv) = x else {
         return Err(KError::ty("group requires a vector"));
     };
-    let mut map: HashMap<Vec<u8>, usize> = HashMap::new();
-    let mut ukeys: Vec<usize> = Vec::new();
-    let mut groups: Vec<Vec<i64>> = Vec::new();
-    for i in 0..cv.len() {
-        let hk = cv.get_atom(i).hash_key();
-        if let Some(&gid) = map.get(&hk) {
-            groups[gid].push(i as i64);
-        } else {
-            let gid = groups.len();
-            map.insert(hk, gid);
-            ukeys.push(i);
-            groups.push(vec![i as i64]);
-        }
-    }
+    let (ukeys, groups) = group_rows(std::slice::from_ref(cv), cv.len());
     let key_vec = cv.gather(&ukeys);
     let val_vecs: Vec<K> = groups
         .into_iter()
-        .map(|g| K::Vector(ColVec::Long(Attr::None, Arc::new(g))))
+        .map(|g| K::Vector(ColVec::Long(Attr::None, Arc::new(g.into_iter().map(|r| r as i64).collect()))))
         .collect();
     Ok(K::Dict(Arc::new(Dict {
         keys: Box::new(K::Vector(key_vec)),
@@ -1395,89 +1402,30 @@ fn arith_atom(a: &K, b: &K, op: ArithOp) -> KResult<K> {
 }
 
 fn arith_op(lhs: &K, rhs: &K, op: ArithOp) -> KResult<K> {
-    // Fast contiguous vector paths for Long and Float!
-    match (lhs, rhs) {
-        (K::Vector(ColVec::Long(_, a)), K::Vector(ColVec::Long(_, b))) => {
-            if a.len() != b.len() {
-                return Err(KError::length("vector length mismatch"));
-            }
-            let out: Vec<i64> = a
-                .iter()
-                .zip(b.iter())
-                .map(|(&x, &y)| {
-                    if x == NULL_LONG || y == NULL_LONG {
-                        NULL_LONG
-                    } else {
-                        match op {
-                            ArithOp::Add => x.wrapping_add(y),
-                            ArithOp::Sub => x.wrapping_sub(y),
-                            ArithOp::Mul => x.wrapping_mul(y),
-                        }
-                    }
-                })
-                .collect();
-            return Ok(K::Vector(ColVec::Long(Attr::None, Arc::new(out))));
-        }
-        (K::Vector(ColVec::Float(_, a)), K::Vector(ColVec::Float(_, b))) => {
-            if a.len() != b.len() {
-                return Err(KError::length("vector length mismatch"));
-            }
-            let out: Vec<f64> = a
-                .iter()
-                .zip(b.iter())
-                .map(|(&x, &y)| match op {
+    // Typed loops: floats with any number, and longs with longs
+    match operands(lhs, rhs) {
+        Some((a, b)) if is_float(&a) || is_float(&b) => {
+            if let (Some(x), Some(y)) = (floats(&a), floats(&b)) {
+                return Ok(float_vec(zip(&x, &y, |&x, &y| match op {
                     ArithOp::Add => x + y,
                     ArithOp::Sub => x - y,
                     ArithOp::Mul => x * y,
-                })
-                .collect();
-            return Ok(K::Vector(ColVec::Float(Attr::None, Arc::new(out))));
+                })));
+            }
         }
-        (K::Long(x), K::Vector(ColVec::Long(_, b))) => {
-            let x = *x;
-            let out: Vec<i64> = b
-                .iter()
-                .map(|&y| {
-                    if x == NULL_LONG || y == NULL_LONG {
-                        NULL_LONG
-                    } else {
-                        match op {
-                            ArithOp::Add => x.wrapping_add(y),
-                            ArithOp::Sub => x.wrapping_sub(y),
-                            ArithOp::Mul => x.wrapping_mul(y),
-                        }
+        Some((ColVec::Long(_, a), ColVec::Long(_, b))) => {
+            let out = zip(&a, &b, |&x, &y| {
+                if x == NULL_LONG || y == NULL_LONG {
+                    NULL_LONG
+                } else {
+                    match op {
+                        ArithOp::Add => x.wrapping_add(y),
+                        ArithOp::Sub => x.wrapping_sub(y),
+                        ArithOp::Mul => x.wrapping_mul(y),
                     }
-                })
-                .collect();
+                }
+            });
             return Ok(K::Vector(ColVec::Long(Attr::None, Arc::new(out))));
-        }
-        (K::Vector(ColVec::Long(_, a)), K::Long(y)) => {
-            let y = *y;
-            let out: Vec<i64> = a
-                .iter()
-                .map(|&x| {
-                    if x == NULL_LONG || y == NULL_LONG {
-                        NULL_LONG
-                    } else {
-                        match op {
-                            ArithOp::Add => x.wrapping_add(y),
-                            ArithOp::Sub => x.wrapping_sub(y),
-                            ArithOp::Mul => x.wrapping_mul(y),
-                        }
-                    }
-                })
-                .collect();
-            return Ok(K::Vector(ColVec::Long(Attr::None, Arc::new(out))));
-        }
-        (K::Float(x), K::Vector(ColVec::Float(_, b))) => {
-            let x = *x;
-            let out: Vec<f64> = b.iter().map(|&y| match op { ArithOp::Add => x + y, ArithOp::Sub => x - y, ArithOp::Mul => x * y }).collect();
-            return Ok(K::Vector(ColVec::Float(Attr::None, Arc::new(out))));
-        }
-        (K::Vector(ColVec::Float(_, a)), K::Float(y)) => {
-            let y = *y;
-            let out: Vec<f64> = a.iter().map(|&x| match op { ArithOp::Add => x + y, ArithOp::Sub => x - y, ArithOp::Mul => x * y }).collect();
-            return Ok(K::Vector(ColVec::Float(Attr::None, Arc::new(out))));
         }
         _ => {}
     }
@@ -1485,13 +1433,9 @@ fn arith_op(lhs: &K, rhs: &K, op: ArithOp) -> KResult<K> {
 }
 
 fn float_arith_op(lhs: &K, rhs: &K, f: impl Fn(f64, f64) -> f64 + Copy) -> KResult<K> {
-    if let (K::Vector(ca), K::Vector(cb)) = (lhs, rhs) {
-        if let (Some(fa), Some(fb)) = (ca.as_f64_vec(), cb.as_f64_vec()) {
-            if fa.len() != fb.len() {
-                return Err(KError::length("vector length mismatch"));
-            }
-            let out: Vec<f64> = fa.into_iter().zip(fb).map(|(x, y)| f(x, y)).collect();
-            return Ok(K::Vector(ColVec::Float(Attr::None, Arc::new(out))));
+    if let Some((a, b)) = operands(lhs, rhs) {
+        if let (Some(x), Some(y)) = (floats(&a), floats(&b)) {
+            return Ok(float_vec(zip(&x, &y, |&x, &y| f(x, y))));
         }
     }
     broadcast_atoms(lhs, rhs, |a, b| Ok(K::Float(f(a.as_f64()?, b.as_f64()?))))
@@ -1586,64 +1530,97 @@ fn cmp_atom(a: &K, b: &K, kind: CmpKind) -> KResult<bool> {
     Ok(res)
 }
 
-fn cmp_op(lhs: &K, rhs: &K, kind: CmpKind) -> KResult<K> {
-    // Fast vector comparison paths for Sym, Long, Int/Date, Float!
-    match (lhs, rhs) {
-        (K::Vector(ColVec::Sym(_, a)), K::Sym(s)) => {
-            let s = *s;
-            let out: Vec<bool> = a
-                .iter()
-                .map(|&x| match kind {
-                    CmpKind::Eq => x == s,
-                    CmpKind::Ne => x != s,
-                    CmpKind::Lt => x < s,
-                    CmpKind::Le => x <= s,
-                    CmpKind::Gt => x > s,
-                    CmpKind::Ge => x >= s,
-                })
-                .collect();
-            return Ok(K::Vector(ColVec::Bool(Attr::None, Arc::new(out))));
-        }
-        (K::Sym(s), K::Vector(ColVec::Sym(_, b))) => {
-            let s = *s;
-            let out: Vec<bool> = b
-                .iter()
-                .map(|&y| match kind {
-                    CmpKind::Eq => s == y,
-                    CmpKind::Ne => s != y,
-                    CmpKind::Lt => s < y,
-                    CmpKind::Le => s <= y,
-                    CmpKind::Gt => s > y,
-                    CmpKind::Ge => s >= y,
-                })
-                .collect();
-            return Ok(K::Vector(ColVec::Bool(Attr::None, Arc::new(out))));
-        }
-        (K::Vector(ColVec::Long(_, a)), K::Long(n)) => {
-            let n = *n;
-            let out: Vec<bool> = a
-                .iter()
-                .map(|&x| match kind {
-                    CmpKind::Eq => x == n,
-                    CmpKind::Ne => x != n,
-                    CmpKind::Lt => x < n,
-                    CmpKind::Le => x <= n,
-                    CmpKind::Gt => x > n,
-                    CmpKind::Ge => x >= n,
-                })
-                .collect();
-            return Ok(K::Vector(ColVec::Bool(Attr::None, Arc::new(out))));
-        }
-        (K::Vector(ColVec::Float(_, a)), K::Float(f)) => {
-            let kf = K::Float(*f);
-            let out: Vec<bool> = a.iter().map(|&x| cmp_atom(&K::Float(x), &kf, kind).unwrap_or(false)).collect();
-            return Ok(K::Vector(ColVec::Bool(Attr::None, Arc::new(out))));
-        }
-        _ => {}
+/// Compare vectors of one type, or numbers of any, in a typed loop; `None` leaves the operands to the general path.
+fn cmp_typed(lhs: &K, rhs: &K, kind: CmpKind) -> Option<Vec<bool>> {
+    let (a, b) = operands(lhs, rhs)?;
+    // whether the comparison holds when the left side is less than, equal to, or greater than the right
+    let accept = match kind {
+        CmpKind::Eq => [false, true, false],
+        CmpKind::Ne => [true, false, true],
+        CmpKind::Lt => [true, false, false],
+        CmpKind::Le => [true, true, false],
+        CmpKind::Gt => [false, false, true],
+        CmpKind::Ge => [false, true, true],
+    };
+    let holds = |o: Ordering| accept[(o as i8 + 1) as usize];
+    macro_rules! same_type {
+        ($($t:ident)*) => {
+            match (&a, &b) {
+                $((ColVec::$t(_, x), ColVec::$t(_, y)) => return Some(zip(x, y, |x, y| holds(x.cmp(y)))),)*
+                _ => {}
+            }
+        };
     }
+    same_type!(Bool Byte Short Int Long Char Timestamp Month Date Timespan Minute Second Time);
+    if let (ColVec::Sym(_, x), ColVec::Sym(_, y)) = (&a, &b) {
+        // symbols are ordered by their names, but equality needs no look at them
+        return Some(match kind {
+            CmpKind::Eq => zip(x, y, |x, y| x == y),
+            CmpKind::Ne => zip(x, y, |x, y| x != y),
+            _ => zip(x, y, |x, y| holds(x.cmp(y))),
+        });
+    }
+    Some(if is_float(&a) || is_float(&b) {
+        // a null sorts before every number; computed without branches, which random data would mispredict
+        zip(&floats(&a)?, &floats(&b)?, |x, y| {
+            let order = i8::from(x > y) - i8::from(x < y) + i8::from(y.is_nan()) - i8::from(x.is_nan());
+            accept[(order + 1) as usize]
+        })
+    } else {
+        zip(&a.as_i64_vec()?, &b.as_i64_vec()?, |x, y| holds(x.cmp(y)))
+    })
+}
 
+fn cmp_op(lhs: &K, rhs: &K, kind: CmpKind) -> KResult<K> {
+    if let Some(out) = cmp_typed(lhs, rhs, kind) {
+        return Ok(bool_vec(out));
+    }
     // Notice in kdb+: `"abc" = "abd"` compares elementwise (`110b`), NOT string atom equality!
     broadcast_atoms(lhs, rhs, |a, b| Ok(K::Bool(cmp_atom(a, b, kind)?)))
+}
+
+// ----- Typed loops over whole vectors ---------------------------------------
+
+/// Both operands as vectors, an atom as one of length 1; `None` for two atoms, other shapes or different lengths.
+fn operands(lhs: &K, rhs: &K) -> Option<(ColVec, ColVec)> {
+    let one = |k: &K| k.is_atom().then(|| ColVec::from_atoms(vec![k.clone()]));
+    match (lhs, rhs) {
+        (K::Vector(a), K::Vector(b)) => (a.len() == b.len()).then(|| (a.clone(), b.clone())),
+        (K::Vector(a), b) => Some((a.clone(), one(b)?)),
+        (a, K::Vector(b)) => Some((one(a)?, b.clone())),
+        _ => None,
+    }
+}
+
+/// `f` of two operands element by element, one of length 1 serving every element of the other.
+fn zip<A, B, T>(x: &[A], y: &[B], f: impl Fn(&A, &B) -> T) -> Vec<T> {
+    if x.len() == y.len() {
+        x.iter().zip(y).map(|(x, y)| f(x, y)).collect()
+    } else if y.len() == 1 {
+        x.iter().map(|x| f(x, &y[0])).collect()
+    } else {
+        y.iter().map(|y| f(&x[0], y)).collect()
+    }
+}
+
+fn is_float(c: &ColVec) -> bool {
+    matches!(c, ColVec::Real(..) | ColVec::Float(..) | ColVec::Datetime(..))
+}
+
+/// A numeric or temporal vector as floats, nulls as NaN.
+fn floats(c: &ColVec) -> Option<Cow<'_, [f64]>> {
+    match c {
+        ColVec::Float(_, v) => Some(Cow::Borrowed(v.as_slice())),
+        other => other.as_f64_vec().map(Cow::Owned),
+    }
+}
+
+fn float_vec(v: Vec<f64>) -> K {
+    K::Vector(ColVec::Float(Attr::None, Arc::new(v)))
+}
+
+fn bool_vec(v: Vec<bool>) -> K {
+    K::Vector(ColVec::Bool(Attr::None, Arc::new(v)))
 }
 
 /// The vector of elementwise results. An empty one keeps the type the verb would give (probed with nulls), so that
@@ -2336,13 +2313,30 @@ fn find_or_roll_op(lhs: &K, rhs: &K) -> KResult<K> {
 }
 
 fn in_op(lhs: &K, rhs: &K) -> KResult<K> {
+    // fixed-width values of one type compare as bits, without a key per element
+    if let K::Vector(have) = lhs {
+        let want = match rhs {
+            K::Vector(v) => v.clone(),
+            atom => ColVec::from_atoms(vec![atom.clone()]),
+        };
+        if have.type_num() == want.type_num() {
+            if let (Some(have), Some(want)) = (have.key_bits(), want.key_bits()) {
+                // a short list is quicker to scan than to hash into
+                return Ok(bool_vec(if want.len() <= 8 {
+                    have.iter().map(|x| want.contains(x)).collect()
+                } else {
+                    let set: HashSet<u64> = want.into_iter().collect();
+                    have.iter().map(|x| set.contains(x)).collect()
+                }));
+            }
+        }
+    }
     let set: HashSet<Vec<u8>> = match rhs {
         K::Vector(cv) => (0..cv.len()).map(|i| cv.get_atom(i).hash_key()).collect(),
         atom => [atom.hash_key()].into_iter().collect(),
     };
     if let K::Vector(cv) = lhs {
-        let out: Vec<bool> = (0..cv.len()).map(|i| set.contains(&cv.get_atom(i).hash_key())).collect();
-        Ok(K::Vector(ColVec::Bool(Attr::None, Arc::new(out))))
+        Ok(bool_vec((0..cv.len()).map(|i| set.contains(&cv.get_atom(i).hash_key())).collect()))
     } else {
         Ok(K::Bool(set.contains(&lhs.hash_key())))
     }
@@ -2357,14 +2351,21 @@ fn within_op(lhs: &K, rhs: &K) -> KResult<K> {
     }
     let lo = bounds.get_atom(0);
     let hi = bounds.get_atom(1);
+    // a null sorts before a lower bound that is not null, so such a range leaves nulls out by itself
+    if !lo.is_null() && !matches!(lo, K::Char(_)) {
+        if let (Some(from), Some(to)) = (cmp_typed(lhs, &lo, CmpKind::Ge), cmp_typed(lhs, &hi, CmpKind::Le)) {
+            return Ok(bool_vec(zip(&from, &to, |&from, &to| from && to)));
+        }
+    }
     if let K::Vector(cv) = lhs {
-        let out: Vec<bool> = (0..cv.len())
-            .map(|i| {
-                let a = cv.get_atom(i);
-                !a.is_null() && a.k_cmp(&lo) != Ordering::Less && a.k_cmp(&hi) != Ordering::Greater
-            })
-            .collect();
-        Ok(K::Vector(ColVec::Bool(Attr::None, Arc::new(out))))
+        Ok(bool_vec(
+            (0..cv.len())
+                .map(|i| {
+                    let a = cv.get_atom(i);
+                    !a.is_null() && a.k_cmp(&lo) != Ordering::Less && a.k_cmp(&hi) != Ordering::Greater
+                })
+                .collect(),
+        ))
     } else {
         Ok(K::Bool(!lhs.is_null() && lhs.k_cmp(&lo) != Ordering::Less && lhs.k_cmp(&hi) != Ordering::Greater))
     }

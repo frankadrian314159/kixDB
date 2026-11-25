@@ -1,6 +1,7 @@
 //! What the control node knows about names: which are distributed tables (every table of the mirror is one), how each
 //! is distributed, and what an expression refers to.
 use kixdb::ast::{ColSpec, Expr, QSql, QSqlKind};
+use kixdb::engine::qsql::DYNAMIC;
 use kixdb::engine::{DistMode, Workspace};
 use kixdb::parser::is_builtin_verb;
 use kixdb::sym::{intern, resolve, SymId};
@@ -8,8 +9,6 @@ use kixdb::{ColVec, Connection, Flip, Func, KeyedTable, Server, K};
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
-/// Verbs whose argument names things only at run time.
-const DYNAMIC: [&str; 5] = ["value", "get", "eval", "reval", "system"];
 /// Verbs with effects: an expression that uses one is never pushed down.
 pub const EFFECTS: [&str; 12] = ["insert", "upsert", "set", "system", "value", "get", "eval", "hopen", "hclose", "show", ".Q.dpft", ".kix.dist"];
 /// Verbs that need only a table's schema.
