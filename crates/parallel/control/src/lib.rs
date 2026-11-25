@@ -19,6 +19,7 @@ pub use session::ClusterSession;
 
 use client::ShardClient;
 use futures::future::{join_all, try_join_all};
+use kix_shared_ces::NodeTls;
 use kix_shared_ces::metrics::{render_prometheus, NodeMetrics};
 use kix_shared_ces::route::even_slots;
 use kix_shared_ces::wire::{ord_var, MemberInfo, MemberReq, ShardStatus, Work};
@@ -100,15 +101,25 @@ pub struct Cluster {
 }
 
 impl Cluster {
-    /// Start a control node for the shards of `config`, with no state file.
+    /// Start a control node for the shards of `config`, with no state file, over unprotected connections.
     pub fn connect(config: &ClusterConfig) -> KResult<Cluster> {
-        Self::build(config.shards.clone(), even_slots(config.shards.len()), None, None, None)
+        Self::connect_with(config, None)
+    }
+
+    /// `connect`, proving who the control node is with `tls` and accepting only shards that can do the same.
+    pub fn connect_with(config: &ClusterConfig, tls: Option<NodeTls>) -> KResult<Cluster> {
+        Self::build(config.shards.clone(), even_slots(config.shards.len()), tls, None, None, None)
     }
 
     /// Start a control node that keeps its state in `path`. An existing file picks the cluster up where it was: it
     /// decides the number of shards and their addresses (which follow membership changes), to which a `config` with as
     /// many shards adds any other replica addresses.
     pub fn open(path: impl AsRef<Path>, config: &ClusterConfig) -> KResult<Cluster> {
+        Self::open_with(path, config, None)
+    }
+
+    /// `open`, over connections protected by `tls` (as for `connect_with`).
+    pub fn open_with(path: impl AsRef<Path>, config: &ClusterConfig, tls: Option<NodeTls>) -> KResult<Cluster> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -121,7 +132,7 @@ impl Cluster {
             return Err(KError::io(format!("cluster state '{}' is in use by another process", path.display())));
         }
         if !path.exists() {
-            let c = Self::build(config.shards.clone(), even_slots(config.shards.len()), None, Some(path), Some(lock_file))?;
+            let c = Self::build(config.shards.clone(), even_slots(config.shards.len()), tls, None, Some(path), Some(lock_file))?;
             c.inner.save_state()?;
             return Ok(c);
         }
@@ -151,12 +162,13 @@ impl Cluster {
                 }
             }
         }
-        Self::build(shards, state.slots, Some(state.mirror), Some(path), Some(lock_file))
+        Self::build(shards, state.slots, tls, Some(state.mirror), Some(path), Some(lock_file))
     }
 
     fn build(
         info: Vec<ShardInfo>,
         slots: Vec<u32>,
+        tls: Option<NodeTls>,
         mirror_state: Option<Vec<u8>>,
         state_path: Option<PathBuf>,
         state_lock: Option<std::fs::File>,
@@ -167,7 +179,7 @@ impl Cluster {
         let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?;
         let shards = {
             let _in_runtime = runtime.enter();
-            info.iter().map(|s| ShardClient::new(s.id, &s.addr)).collect::<KResult<Vec<_>>>()?
+            info.iter().map(|s| ShardClient::new(s.id, &s.addr, tls.clone())).collect::<KResult<Vec<_>>>()?
         };
         let mirror = Server::new();
         if let Some(state) = &mirror_state {

@@ -4,11 +4,14 @@
 //! - [`arrowconv`]: lossless columnar `Flip` <-> Apache Arrow `RecordBatch` conversion
 //! - [`wire`]: Flight action and ticket messages encoded with `postcard`
 //! - [`metrics`]: node resource & engine telemetry with Prometheus exposition
+//! - [`tls`]: mutual TLS between nodes, and the certificates for it
 pub mod arrowconv;
 pub mod config;
 pub mod metrics;
 pub mod route;
+pub mod tls;
 pub mod wire;
 
 pub use config::{ClusterConfig, ShardInfo};
+pub use tls::NodeTls;
 pub use wire::{Fragment, LoadMode, LoadReq, MemberReq, MutateReq, ShardStatus, ShuffleReq, Work};

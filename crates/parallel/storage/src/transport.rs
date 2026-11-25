@@ -7,12 +7,13 @@ use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::Action;
 use futures::TryStreamExt;
 use kix_raft::{Msg, NodeId};
+use kix_shared_ces::tls::{self, NodeTls};
 use kix_shared_ces::wire::{self, LoadReq, ACTION_LOAD, ACTION_RAFT};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedReceiver;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
 use tonic::Status;
 
 /// The largest message either side accepts.
@@ -21,10 +22,8 @@ pub const MAX_MESSAGE: usize = 256 * 1024 * 1024;
 /// Where each replica can be reached; kept up to date as the membership changes.
 pub type AddressBook = Arc<Mutex<HashMap<NodeId, String>>>;
 
-fn channel(addr: &str) -> Result<Channel, Status> {
-    let endpoint = Endpoint::from_shared(format!("http://{addr}"))
-        .map_err(|e| Status::invalid_argument(format!("bad node address {addr}: {e}")))?;
-    Ok(endpoint.tcp_nodelay(true).connect_timeout(Duration::from_millis(500)).connect_lazy())
+fn channel(addr: &str, tls: Option<&NodeTls>) -> Result<Channel, Status> {
+    tls::channel(addr, tls, Duration::from_millis(500)).map_err(Status::invalid_argument)
 }
 
 async fn act(ch: Channel, kind: &str, body: Vec<u8>) -> Result<(), Status> {
@@ -38,14 +37,14 @@ async fn act(ch: Channel, kind: &str, body: Vec<u8>) -> Result<(), Status> {
     Ok(())
 }
 
-pub fn spawn_sender(me: NodeId, book: AddressBook, mut rx: UnboundedReceiver<(NodeId, Msg)>) {
+pub fn spawn_sender(me: NodeId, book: AddressBook, tls: Option<NodeTls>, mut rx: UnboundedReceiver<(NodeId, Msg)>) {
     tokio::spawn(async move {
         // a channel per replica, made again when its address changes
         let mut channels: HashMap<String, Channel> = HashMap::new();
         while let Some((to, msg)) = rx.recv().await {
             let Some(addr) = book.lock().unwrap_or_else(|e| e.into_inner()).get(&to).cloned() else { continue };
             if !channels.contains_key(&addr) {
-                let Ok(ch) = channel(&addr) else { continue };
+                let Ok(ch) = channel(&addr, tls.as_ref()) else { continue };
                 channels.insert(addr.clone(), ch);
             }
             let ch = channels[&addr].clone();
@@ -60,6 +59,8 @@ pub fn spawn_sender(me: NodeId, book: AddressBook, mut rx: UnboundedReceiver<(No
 #[derive(Default)]
 pub struct Peers {
     channels: Mutex<HashMap<String, Channel>>,
+    /// How the node proves who it is, to its peers and to its callers; `None`: unprotected connections.
+    pub tls: Option<NodeTls>,
 }
 
 impl Peers {
@@ -74,7 +75,7 @@ impl Peers {
                 let ch = match cached {
                     Some(c) => c,
                     None => {
-                        let c = channel(addr)?;
+                        let c = channel(addr, self.tls.as_ref())?;
                         self.channels.lock().unwrap_or_else(|e| e.into_inner()).insert(addr.to_string(), c.clone());
                         c
                     }

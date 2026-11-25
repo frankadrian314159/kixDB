@@ -396,9 +396,22 @@ None of the gains has been measured.
 2. Profile the control node's merging by key and ordering of rows.
 3. Keep intermediate tables on the control node. This changes where assigned tables live, so it needs a design decision.
 
+## Cost of TLS between nodes
+
+Measured after mutual TLS was added: six shards in one process on one machine, one run each, with everything else as above.
+
+| | Unprotected | Mutual TLS |
+| --- | ---: | ---: |
+| TPC-H, load | 4.17 s | 4.20 s |
+| TPC-H, 22 queries | 1.08 s | 1.07 s |
+| TPC-DS, load | 0.78 s | 0.77 s |
+| TPC-DS, 24 queries | 0.39 s | 0.39 s |
+
+No difference was measurable. A network between machines was not tested.
+
 ## Not measured
 
-Durability (`--durable`, `--data`), replicated shards, TLS, more than one machine, concurrent load, and any comparison
+Durability (`--durable`, `--data`), replicated shards, client TLS, more than one machine, concurrent load, and any comparison
 with another database.
 
 ## Reproducing
@@ -412,6 +425,7 @@ target/release/examples/tpch_cluster --sf 0.3 --shards 6
 target/release/examples/tpcds_cluster --sf 0.3 --shards 6
 ```
 
-For shard processes, start `kix-shard --id N --listen 127.0.0.1:PORT` for each shard, list them in a file such as
+For shard processes, start `kix-shard --id N --listen 127.0.0.1:PORT --insecure` for each shard (the benchmark
+programs connect without TLS), list them in a file such as
 `{"shards":[{"id":0,"addr":"127.0.0.1:52050"}]}`, and pass `--config FILE` to the cluster program. Restart the shards
 between runs.

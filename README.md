@@ -35,16 +35,19 @@ assert_eq!(conn.eval("sum 1 + til 10")?.to_string(), "55");
 
 ```
 cargo build --release --workspace
-kix-shard --id 0 --listen 127.0.0.1:50051
-kix-shard --id 1 --listen 127.0.0.1:50052
+kix-cluster --make-certs certs control shard0 shard1      # a certificate authority and one certificate per node
+kix-shard --id 0 --listen 127.0.0.1:50051 --node-ca certs/ca.pem --node-cert certs/shard0.pem --node-key certs/shard0.key
+kix-shard --id 1 --listen 127.0.0.1:50052 --node-ca certs/ca.pem --node-cert certs/shard1.pem --node-key certs/shard1.key
 echo '{"shards":[{"id":0,"addr":"127.0.0.1:50051"},{"id":1,"addr":"127.0.0.1:50052"}]}' > cluster.json
-kix-cluster --config cluster.json --state cluster.state --listen 5000
+kix-cluster --config cluster.json --state cluster.state --listen 5000 \
+    --node-ca certs/ca.pem --node-cert certs/control.pem --node-key certs/control.key
 kix --connect 127.0.0.1:5000
 ```
 
 Tables are spread over the shards and queries give the answers one server would give. Shards can be replicated with
 Raft. Read [what the cluster does not guarantee](docs/distributed.md#limits) before relying on it: in particular a write
-that spans shards is not atomic, and traffic between nodes is neither authenticated nor encrypted.
+that spans shards is not atomic. Nodes talk over [mutual TLS](docs/distributed.md#security), unless started with
+`--insecure`.
 
 ## Layout
 

@@ -6,6 +6,7 @@ use arrow_flight::{Action, Ticket};
 use futures::TryStreamExt;
 use kix_shared_ces::arrowconv;
 use kix_shared_ces::metrics::NodeMetrics;
+use kix_shared_ces::tls::{self, NodeTls};
 use kix_shared_ces::wire::{self, Fragment, LoadReq, MemberInfo, MemberReq, MutateReq, ShardStatus, ShuffleReq, Work};
 use kixdb::ipc::decode_k_payload;
 use kixdb::{KError, KResult, K};
@@ -13,7 +14,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
 use tonic::{Code, Status};
 
 const MAX_MESSAGE: usize = 256 * 1024 * 1024;
@@ -30,11 +31,13 @@ pub struct ShardClient {
     channels: RwLock<Vec<(String, Channel)>>,
     /// The replica that served last (the leader, as far as is known).
     current: AtomicUsize,
+    /// How the control node proves who it is to the replicas; `None`: unprotected connections.
+    tls: Option<NodeTls>,
 }
 
-fn channel(addr: &str) -> KResult<(String, Channel)> {
-    let endpoint = Endpoint::from_shared(format!("http://{addr}")).map_err(|e| KError::new("cluster", format!("bad shard address {addr}: {e}")))?;
-    Ok((addr.to_string(), endpoint.tcp_nodelay(true).connect_timeout(Duration::from_secs(2)).connect_lazy()))
+fn channel(addr: &str, tls: Option<&NodeTls>) -> KResult<(String, Channel)> {
+    let channel = tls::channel(addr, tls, Duration::from_secs(2)).map_err(|e| KError::new("cluster", e))?;
+    Ok((addr.to_string(), channel))
 }
 
 fn status_of(e: FlightError) -> Status {
@@ -68,12 +71,13 @@ pub fn ticket(work: Work) -> KResult<Ticket> {
 
 impl ShardClient {
     /// The connections are made on first use. Must be called inside a tokio runtime.
-    pub fn new(id: u32, addr: &str) -> KResult<ShardClient> {
-        let channels = addr.split(',').map(str::trim).filter(|a| !a.is_empty()).map(channel).collect::<KResult<Vec<_>>>()?;
+    pub fn new(id: u32, addr: &str, tls: Option<NodeTls>) -> KResult<ShardClient> {
+        let addrs = addr.split(',').map(str::trim).filter(|a| !a.is_empty());
+        let channels = addrs.map(|a| channel(a, tls.as_ref())).collect::<KResult<Vec<_>>>()?;
         if channels.is_empty() {
             return Err(KError::new("cluster", "a shard needs an address"));
         }
-        Ok(ShardClient { id, channels: RwLock::new(channels), current: AtomicUsize::new(0) })
+        Ok(ShardClient { id, channels: RwLock::new(channels), current: AtomicUsize::new(0), tls })
     }
 
     fn replicas(&self) -> Vec<(String, Channel)> {
@@ -91,7 +95,7 @@ impl ShardClient {
         if let Some(i) = channels.iter().position(|(a, _)| a == addr) {
             return Some(i);
         }
-        channels.push(channel(addr).ok()?);
+        channels.push(channel(addr, self.tls.as_ref()).ok()?);
         Some(channels.len() - 1)
     }
 
@@ -118,6 +122,13 @@ impl ShardClient {
             if !replicated || !retry || started.elapsed() >= FAILOVER {
                 let mut e = wire::error_of(&s);
                 if e.signal == "cluster" {
+                    // what lies under a failed connection, such as a certificate that is refused
+                    for cause in std::iter::successors(std::error::Error::source(&s), |cause| cause.source()) {
+                        let cause = cause.to_string();
+                        if !e.detail.contains(&cause) {
+                            e.detail = format!("{}: {cause}", e.detail);
+                        }
+                    }
                     e.detail = format!("shard {} ({}): {}", self.id, replicas[i].0, e.detail);
                 }
                 return Err(e);
@@ -199,7 +210,8 @@ impl ShardClient {
     /// Change or list the members of the group; the answer replaces the addresses known.
     pub async fn members(&self, req: &MemberReq) -> KResult<Vec<MemberInfo>> {
         let members: Vec<MemberInfo> = reply(&self.send(false, wire::ACTION_MEMBERS, body(req)?).await?)?;
-        let channels = members.iter().filter(|m| !m.1.is_empty()).map(|m| channel(&m.1)).collect::<KResult<Vec<_>>>()?;
+        let named = members.iter().filter(|m| !m.1.is_empty());
+        let channels = named.map(|m| channel(&m.1, self.tls.as_ref())).collect::<KResult<Vec<_>>>()?;
         if !channels.is_empty() {
             *self.channels.write().unwrap_or_else(|e| e.into_inner()) = channels;
             self.current.store(0, Ordering::Relaxed);

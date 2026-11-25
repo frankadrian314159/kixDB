@@ -13,9 +13,14 @@
 //! HOST:PORT` (serve `/metrics` in the Prometheus text format and `/health`). The node stops gracefully on SIGTERM and
 //! Ctrl-C: it refuses new work, lets requests finish, forces the log and writes a checkpoint, then closes its listener.
 //!
+//! Connections between nodes use mutual TLS: give `--node-ca FILE --node-cert FILE --node-key FILE` (made by
+//! `kix-cluster --make-certs`), or `--insecure` to leave them unprotected, so that anyone who reaches the port can run
+//! any `q` on the shard.
+//!
 //! Without `--data` the shard keeps its data in memory; with it the shard is durable (write-ahead log and checkpoints in
 //! DIR, exactly like `kix-serve DIR`).
 use kix_shared_ces::metrics::{render_prometheus, serve_http};
+use kix_shared_ces::tls::TlsFlags;
 use kix_storage::{spawn, ReplicaConfig, ShardNode};
 use kixdb::Server;
 use std::net::SocketAddr;
@@ -25,7 +30,8 @@ fn usage() -> ! {
     eprintln!(
         "usage: kix-shard --id N --listen HOST:PORT [--data DIR] [--metrics-listen HOST:PORT] [--drain-secs N]\n       \
          kix-shard --id N --listen HOST:PORT --data DIR --replica R --peers R2=HOST:PORT,R3=HOST:PORT\n                 \
-         [--raft-dir DIR] [--join] [--addr HOST:PORT] [--snapshot-every N]"
+         [--raft-dir DIR] [--join] [--addr HOST:PORT] [--snapshot-every N]\n\
+         both need --node-ca FILE --node-cert FILE --node-key FILE, or --insecure"
     );
     std::process::exit(2);
 }
@@ -45,8 +51,12 @@ async fn main() {
     let mut peers: Vec<(u64, String)> = vec![];
     let (mut raft_dir, mut addr, mut metrics_listen) = (None::<String>, None::<String>, None::<String>);
     let (mut join, mut snapshot_every, mut drain_secs) = (false, None::<u64>, 15u64);
+    let mut tls = TlsFlags::default();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
+        if tls.take(&a, &mut args) {
+            continue;
+        }
         match a.as_str() {
             "--id" => id = Some(parsed(args.next())),
             "--listen" => listen = Some(parsed(args.next())),
@@ -68,6 +78,10 @@ async fn main() {
         }
     }
     let (Some(id), Some(listen)) = (id, listen) else { usage() };
+    let tls = tls.load().unwrap_or_else(|e| fail(e));
+    if tls.is_none() {
+        eprintln!("kix-shard {id}: WARNING: connections are neither encrypted nor authenticated (--insecure)");
+    }
     let server = match &data {
         Some(dir) => Server::open(dir).unwrap_or_else(|e| fail(format!("cannot open {dir}: {e}"))),
         None => Server::new(),
@@ -78,13 +92,14 @@ async fn main() {
             let dir = raft_dir.unwrap_or_else(|| format!("{d}.raft"));
             let mut rc = ReplicaConfig::new(r, peers, dir);
             rc.join = join;
+            rc.tls = tls;
             rc.addr = addr.unwrap_or_else(|| listen.to_string());
             if let Some(n) = snapshot_every {
                 rc.snapshot_every = n;
             }
             ShardNode::replicated(id, server, rc).unwrap_or_else(|e| fail(format!("cannot start the replica: {e}")))
         }
-        None => ShardNode::new(id, server),
+        None => ShardNode::new(id, server).with_tls(tls),
     };
     if let Some(at) = &metrics_listen {
         let control = node.control();

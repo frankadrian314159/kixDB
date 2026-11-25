@@ -2,6 +2,10 @@
 //!
 //!   kix-cluster --config cluster.json [--state FILE] --listen PORT [--bind ADDR] [-u USER:PASS] [--metrics-listen HOST:PORT]
 //!   kix-cluster --config cluster.json [--state FILE] [--plan] < script.q
+//!   kix-cluster --make-certs DIR NAME...
+//!
+//! Connections to the shards use mutual TLS: give `--node-ca FILE --node-cert FILE --node-key FILE`, or `--insecure` to
+//! leave them unprotected. `--make-certs` writes a certificate authority and a certificate for every node into DIR.
 //!
 //! With `--listen` it serves kdb+ IPC clients (`kix --connect`, `kix-gui --connect`, `hopen`) as one database. Without
 //! it, it runs `q` from standard input against the cluster; `--plan` shows on standard error how each statement ran.
@@ -12,6 +16,7 @@
 //! largest table a join copies to every shard rather than shuffling.
 use kix_control::Cluster;
 use kix_shared_ces::metrics::serve_http;
+use kix_shared_ces::tls::{make_certs, TlsFlags};
 use kix_shared_ces::ClusterConfig;
 use kixdb::ipc::{self_signed_cert, tls_server_config, IpcConfig, Listener};
 use kixdb::{tools, Event};
@@ -23,7 +28,9 @@ fn usage() -> ! {
     eprintln!(
         "usage: kix-cluster --config cluster.json [--state FILE] --listen PORT [--bind ADDR] [-u USER:PASSWORD]\n                   \
          [--tls-cert FILE --tls-key FILE | --tls] [--force-tls] [--metrics-listen HOST:PORT] [--wait-shards SECS] [--broadcast-limit ROWS]\n       \
-         kix-cluster --config cluster.json [--state FILE] [--plan] < script.q"
+         kix-cluster --config cluster.json [--state FILE] [--plan] < script.q\n       \
+         kix-cluster --make-certs DIR NAME...\n\
+         connections to the shards need --node-ca FILE --node-cert FILE --node-key FILE, or --insecure"
     );
     std::process::exit(2);
 }
@@ -43,9 +50,20 @@ fn main() -> ExitCode {
     let (mut metrics_listen, mut broadcast_limit) = (None::<String>, None::<usize>);
     let (mut show_plan, mut wait_shards) = (false, 30u64);
     let (mut cert, mut key, mut self_signed, mut force_tls) = (None::<String>, None::<String>, false, false);
+    let mut tls = TlsFlags::default();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
+        if tls.take(&a, &mut args) {
+            continue;
+        }
         match a.as_str() {
+            "--make-certs" => {
+                let Some(dir) = args.next() else { usage() };
+                let names: Vec<String> = args.collect();
+                make_certs(&dir, &names).unwrap_or_else(|e| fail(e));
+                eprintln!("kix-cluster: certificates in {dir}; keep ca.key away from the nodes");
+                return ExitCode::SUCCESS;
+            }
             "--config" => config = args.next(),
             "--state" => state = args.next(),
             "--listen" | "-p" => listen = Some(parsed(args.next())),
@@ -69,9 +87,13 @@ fn main() -> ExitCode {
         None if known => ClusterConfig::default(),
         None => usage(),
     };
+    let tls = tls.load().unwrap_or_else(|e| fail(e));
+    if tls.is_none() {
+        eprintln!("kix-cluster: WARNING: connections to the shards are neither encrypted nor authenticated (--insecure)");
+    }
     let cluster = match &state {
-        Some(path) => Cluster::open(path, &config),
-        None => Cluster::connect(&config),
+        Some(path) => Cluster::open_with(path, &config, tls),
+        None => Cluster::connect_with(&config, tls),
     }
     .unwrap_or_else(|e| fail(e.to_string()));
     if let Some(rows) = broadcast_limit {
@@ -79,7 +101,9 @@ fn main() -> ExitCode {
     }
     if wait_shards > 0 {
         if let Err(down) = cluster.wait_for_shards(Duration::from_secs(wait_shards)) {
-            fail(format!("shards {down:?} do not answer after {wait_shards}s"));
+            let why: String = cluster.status().into_iter().filter_map(Result::err).map(|e| format!("
+  {e}")).collect();
+            fail(format!("shards {down:?} do not answer after {wait_shards}s{why}"));
         }
     }
     if let Some(at) = &metrics_listen {

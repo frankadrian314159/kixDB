@@ -16,6 +16,7 @@
 use crate::transport::{self, AddressBook};
 use kix_raft::{Conf, Config, Entry, FileStorage, Member, Msg, NodeId, Raft, Role, Snapshot};
 use kix_shared_ces::wire::MemberInfo;
+use kix_shared_ces::NodeTls;
 use kixdb::persist::{Replicator, WalRecord};
 use kixdb::{KError, KResult, Server};
 use serde::{Deserialize, Serialize};
@@ -51,6 +52,8 @@ pub struct ReplicaConfig {
     pub snapshot_every: u64,
     /// How long a change waits for a majority.
     pub commit_timeout: Duration,
+    /// Mutual TLS between the replicas and towards callers; `None`: unprotected connections.
+    pub tls: Option<NodeTls>,
 }
 
 impl ReplicaConfig {
@@ -67,6 +70,7 @@ impl ReplicaConfig {
             join: false,
             snapshot_every: 5000,
             commit_timeout: Duration::from_secs(10),
+            tls: None,
         }
     }
 }
@@ -138,7 +142,7 @@ impl Replica {
             commit_timeout: cfg.commit_timeout,
         });
         server.set_replicator(Some(Arc::new(Handle(replica.clone()))));
-        transport::spawn_sender(cfg.node_id, book, orx);
+        transport::spawn_sender(cfg.node_id, book, cfg.tls.clone(), orx);
         let (me, tick) = (replica.clone(), Duration::from_millis(cfg.tick_ms.max(1)));
         std::thread::Builder::new().name(format!("raft-{}", cfg.node_id)).spawn(move || me.run(irx, tick))?;
         let (me, every) = (replica.clone(), cfg.snapshot_every);

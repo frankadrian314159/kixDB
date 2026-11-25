@@ -1,6 +1,7 @@
 //! A cluster of in-process shard nodes, and comparison of its answers with one engine's.
 #![allow(dead_code)]
 use kix_control::{Cluster, ClusterSession};
+use kix_shared_ces::tls::{make_certs, NodeTls};
 use kix_shared_ces::{ClusterConfig, ShardInfo};
 use kix_storage::{spawn, RunningShard, ShardNode};
 use kixdb::{ColVec, Connection, Server, K};
@@ -12,9 +13,17 @@ pub struct Shards {
 
 impl Shards {
     pub fn start(n: u32) -> Shards {
+        Shards::start_with(n, None)
+    }
+
+    /// Shards that require mutual TLS when `tls` holds certificates.
+    pub fn start_with(n: u32, tls: Option<NodeTls>) -> Shards {
         let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
         let nodes = (0..n)
-            .map(|id| runtime.block_on(spawn(ShardNode::new(id, Server::new()), "127.0.0.1:0".parse().unwrap())).unwrap())
+            .map(|id| {
+                let node = ShardNode::new(id, Server::new()).with_tls(tls.clone());
+                runtime.block_on(spawn(node, "127.0.0.1:0".parse().unwrap())).unwrap()
+            })
             .collect();
         Shards { runtime, nodes }
     }
@@ -57,8 +66,12 @@ pub struct Pair {
 
 impl Pair {
     pub fn new(shards: u32) -> Pair {
-        let shards = Shards::start(shards);
-        let cluster = Cluster::connect(&shards.config()).unwrap();
+        Pair::with_tls(shards, None)
+    }
+
+    pub fn with_tls(shards: u32, tls: Option<NodeTls>) -> Pair {
+        let shards = Shards::start_with(shards, tls.clone());
+        let cluster = Cluster::connect_with(&shards.config(), tls).unwrap();
         let session = cluster.session();
         Pair { single: Server::new().connect(), cluster, session, shards }
     }
@@ -96,11 +109,20 @@ pub const MARKET: [&str; 6] = [
 ];
 
 pub fn market(shards: u32) -> Pair {
-    let mut p = Pair::new(shards);
+    load_market(Pair::new(shards))
+}
+
+pub fn load_market(mut p: Pair) -> Pair {
     // `acct` is keyed by a column that is not what trades are sharded by
     for statement in MARKET {
         p.single.eval(statement).unwrap_or_else(|e| panic!("{statement}: {e}"));
         p.session.eval(statement).unwrap_or_else(|e| panic!("{statement}: {e}"));
     }
     p
+}
+
+/// A new certificate authority in `dir` with a certificate for each name, and what each of those nodes would load.
+pub fn certificates<const N: usize>(dir: &std::path::Path, names: [&str; N]) -> [NodeTls; N] {
+    make_certs(dir, &names.map(String::from)).unwrap();
+    names.map(|n| NodeTls::from_files(dir.join("ca.pem"), dir.join(format!("{n}.pem")), dir.join(format!("{n}.key"))).unwrap())
 }

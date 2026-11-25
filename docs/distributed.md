@@ -12,13 +12,21 @@ data. Clients use the same kdb+ IPC protocol as with one server. The control nod
 
 ## Running
 
+Make the certificates first (see [Security](#security)), and copy to each node `ca.pem` and its own `.pem` and `.key`:
+
+```
+kix-cluster --make-certs certs control s0r1 s0r2 s0r3 s1
+```
+
+Each command below also takes `--node-ca ca.pem --node-cert NAME.pem --node-key NAME.key`, written `TLS` here:
+
 ```
 # shard 0 with three replicas: --id is the shard, --replica the member of its group
-kix-shard --id 0 --listen 10.0.0.1:50051 --data s0r1 --replica 1 --peers 2=10.0.0.2:50051,3=10.0.0.3:50051
-kix-shard --id 0 --listen 10.0.0.2:50051 --data s0r2 --replica 2 --peers 1=10.0.0.1:50051,3=10.0.0.3:50051
-kix-shard --id 0 --listen 10.0.0.3:50051 --data s0r3 --replica 3 --peers 1=10.0.0.1:50051,2=10.0.0.2:50051
+kix-shard --id 0 --listen 10.0.0.1:50051 --data s0r1 --replica 1 --peers 2=10.0.0.2:50051,3=10.0.0.3:50051 TLS
+kix-shard --id 0 --listen 10.0.0.2:50051 --data s0r2 --replica 2 --peers 1=10.0.0.1:50051,3=10.0.0.3:50051 TLS
+kix-shard --id 0 --listen 10.0.0.3:50051 --data s0r3 --replica 3 --peers 1=10.0.0.1:50051,2=10.0.0.2:50051 TLS
 # shard 1, not replicated (in memory without --data)
-kix-shard --id 1 --listen 10.0.0.4:50051 --data s1
+kix-shard --id 1 --listen 10.0.0.4:50051 --data s1 TLS
 ```
 
 `cluster.json` lists the shards in order; the replicas of a shard share one address string:
@@ -31,16 +39,47 @@ kix-shard --id 1 --listen 10.0.0.4:50051 --data s1
 ```
 
 ```
-kix-cluster --config cluster.json --state cluster.state --listen 5000 -u ann:secret [--tls] [--force-tls]
-kix-cluster --config cluster.json --state cluster.state --plan < script.q             # or run a script
+kix-cluster --config cluster.json --state cluster.state --listen 5000 -u ann:secret [--tls] [--force-tls] TLS
+kix-cluster --config cluster.json --state cluster.state --plan TLS < script.q         # or run a script
 ```
 
-From Rust: `Cluster::connect(&config)` or `Cluster::open(state_file, &config)`, then `cluster.session()`,
+`--tls` and `--force-tls` concern the clients' connections to the control node; the `--node-` flags concern the
+connections between nodes.
+
+From Rust: `Cluster::connect_with(&config, tls)` or `Cluster::open_with(state_file, &config, tls)`, where `tls` is a
+`NodeTls::from_files(..)` (`connect` and `open` use unprotected connections), then `cluster.session()`,
 `session.eval(q)` and `session.last_plan()`. Do not call these from inside a tokio runtime.
 
 **Keep the state file.** It is checksummed (`KXCS` + CRC32), locked against concurrent processes (`cluster.state.lock`),
 and records the shards, table schemas, distribution, and the variables, functions and views of the control node. A control
 node started without it does not know about data already on the shards.
+
+## Security
+
+All connections between nodes (control node to shard, shard to shard, and replica to replica) use **mutual TLS**: both
+ends show a certificate signed by the cluster's certificate authority, and refuse the connection otherwise. `kix-shard`
+and `kix-cluster` do not start without `--node-ca`, `--node-cert` and `--node-key`. `--insecure` starts them without
+protection, with a warning: then anyone who reaches a shard's port can run any q on it. The two kinds of node cannot be
+mixed.
+
+```
+kix-cluster --make-certs certs control shard0 shard1     # ca.pem, ca.key, and NAME.pem and NAME.key for each name
+kix-cluster --make-certs certs shard2                    # later: another node, signed by the same authority
+```
+
+* **Guard `ca.key`.** It is only needed to make certificates; do not copy it to the nodes. Whoever holds it, or any
+  certificate it signed with its key, can run any q on every shard.
+* Every certificate of the authority gives the same access, and none can be revoked: if a key leaks, make a new
+  authority in an empty directory and give every node a new certificate.
+* Key files are readable only by their owner on Unix. On Windows they take the folder's permissions: restrict them.
+* Made certificates expire on 1 January ten years after the year they were made. Replace them before then and restart
+  the nodes.
+* **Your own certificates** work too (PEM files). The authority must sign nothing but this cluster's nodes. Every node's
+  certificate needs the DNS name `kix-node` (callers check for that name, not for the host, so a node can move) and,
+  if it restricts key usage, both server and client authentication.
+
+Clients reach the control node over kdb+ IPC, whose TLS and passwords are set separately ([ipc.md](ipc.md)). The
+`--metrics-listen` pages are plain HTTP without authentication.
 
 ## Distribution
 
@@ -157,7 +196,7 @@ log with snapshots (`--snapshot-every`, 5,000 entries), and one that fell behind
 ```
 SHARDS                                  / shard, address, role, term, applied, memory
 REPLICAS 0                              / members of shard 0
-ADD REPLICA 0 4 10.0.0.5:50051          / first start: kix-shard ... --replica 4 --join --addr 10.0.0.5:50051
+ADD REPLICA 0 4 10.0.0.5:50051          / first start: kix-shard ... --replica 4 --join --addr 10.0.0.5:50051 TLS
 REMOVE REPLICA 0 1
 ```
 
@@ -176,8 +215,8 @@ shards must match.
 
 * **A write that spans shards is not atomic.** There is no two-phase commit: if a shard fails while a statement is being
   applied, other shards keep their part. This includes the redistribution after a gathered change.
-* **The shard service has no authentication or encryption.** Anyone who can reach a shard's port can run any q on it.
-  Use a private network.
+* **Every node is trusted fully.** A certificate of the cluster's authority gives full access to every shard, and
+  certificates cannot be revoked one by one (see [Security](#security)).
 * **The control node is a single point of failure**, and gathering needs memory there for the whole table.
 * **The number of shards is fixed** when the cluster is created. There is no rebalancing.
 * **Floating point sums** added in two phases can differ from one server's in the last digits.

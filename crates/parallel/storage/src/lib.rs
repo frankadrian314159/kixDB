@@ -15,6 +15,7 @@ use futures::{StreamExt, TryStreamExt};
 use kix_shared_ces::arrowconv;
 use kix_shared_ces::metrics::NodeMetrics;
 use kix_shared_ces::route::shard_for_keys;
+use kix_shared_ces::NodeTls;
 use kix_shared_ces::wire::{self, ord_var, Fragment, LoadMode, LoadReq, MemberReq, MutateReq, ShardStatus, ShuffleReq, Work};
 use kixdb::engine::joins::union_join;
 use kixdb::ipc::encode_k_payload;
@@ -319,8 +320,16 @@ impl ShardNode {
     /// A node that is one replica of a replicated shard: `server` must be a persistent engine; the replica keeps its Raft
     /// log in `cfg.dir`. Must be called inside a tokio runtime.
     pub fn replicated(shard_id: u32, server: Server, cfg: ReplicaConfig) -> std::io::Result<ShardNode> {
+        let tls = cfg.tls.clone();
         let replica = Replica::start(cfg, server.clone())?;
-        Ok(ShardNode::build(shard_id, server, Some(replica)))
+        Ok(ShardNode::build(shard_id, server, Some(replica)).with_tls(tls))
+    }
+
+    /// Require mutual TLS of every caller and use it towards the other shards (`None`: unprotected connections). A
+    /// replica takes this from its configuration. Call before the node serves.
+    pub fn with_tls(mut self, tls: Option<NodeTls>) -> ShardNode {
+        Arc::get_mut(&mut self.core).expect("a node is configured before it serves").peers.tls = tls;
+        self
     }
 
     fn build(shard_id: u32, server: Server, replica: Option<Arc<Replica>>) -> ShardNode {
@@ -521,11 +530,15 @@ pub async fn spawn_on(node: ShardNode, listener: tokio::net::TcpListener) -> std
     let addr = listener.local_addr()?;
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let incoming = tonic::transport::server::TcpIncoming::from(listener).with_nodelay(Some(true));
+    let mut builder = tonic::transport::Server::builder();
+    if let Some(tls) = &node.core.peers.tls {
+        builder = builder.tls_config(tls.server()).map_err(std::io::Error::other)?;
+    }
     let control = node.control();
     let (server, replica) = (node.core.server.clone(), node.core.replica.clone());
     let service = node.into_service();
     let join = tokio::spawn(async move {
-        let _ = tonic::transport::Server::builder()
+        let _ = builder
             .max_concurrent_streams(Some(1024))
             .add_service(service)
             .serve_with_incoming_shutdown(incoming, async {
