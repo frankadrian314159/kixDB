@@ -3,6 +3,8 @@
 //! ```text
 //! kix-serve [DATA_DIR] [-p|--port N] [--bind ADDR] [-u USER:PASS] [--tls-cert FILE --tls-key FILE | --tls] [--no-sync]
 //! ```
+//!
+//! An address other machines can reach needs `-u` and `--force-tls`, or `--insecure-clients` to listen unprotected.
 use kixdb::ipc::{self_signed_cert, tls_server_config, IpcConfig, Listener};
 use kixdb::{Server, StorageOptions};
 
@@ -17,6 +19,7 @@ fn usage() -> ! {
          --tls-key FILE   PEM private key of that certificate\n\
          --tls           accept TLS with a new self-signed certificate, written to kix-cert.pem\n\
          --force-tls     reject plaintext connections (requires --tls or --tls-cert/--tls-key)\n\
+         --insecure-clients  listen beyond this machine without both -u and --force-tls\n\
          --no-sync       disable per-write fsync on WAL appends"
     );
     std::process::exit(2)
@@ -38,6 +41,7 @@ fn main() {
     let mut auth = std::env::var("KIX_AUTH").ok();
     let mut opts = StorageOptions::default();
     let (mut cert, mut key, mut self_signed, mut force_tls) = (None::<String>, None::<String>, false, false);
+    let mut insecure_clients = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -50,6 +54,7 @@ fn main() {
             "--tls-key" => key = Some(args.next().unwrap_or_else(|| usage())),
             "--tls" => self_signed = true,
             "--force-tls" => force_tls = true,
+            "--insecure-clients" => insecure_clients = true,
             "-h" | "--help" => usage(),
             other if !other.starts_with('-') && dir.is_none() => dir = Some(other.to_string()),
             _ => usage(),
@@ -94,6 +99,12 @@ fn main() {
         ipc_cfg.force_tls = force_tls;
     } else if force_tls {
         fail("--force-tls requires --tls or --tls-cert/--tls-key");
+    }
+
+    match ipc_cfg.check_exposure(&bind) {
+        Err(why) if insecure_clients => eprintln!("kix-serve: WARNING: {why}; continuing (--insecure-clients)"),
+        Err(why) => fail(&format!("{why}, or --insecure-clients to listen unprotected")),
+        Ok(()) => {}
     }
 
     let listener = match Listener::bind(server, (bind.as_str(), port), ipc_cfg) {

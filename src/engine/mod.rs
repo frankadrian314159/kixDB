@@ -289,12 +289,12 @@ impl<'a> Engine<'a> {
         r
     }
 
-    /// Whether using `name` can reach other names at run time: it is a view, or a variable holding a function that is
-    /// not a lambda (such as an alias of `value`).
+    /// Whether using `name` can reach other names at run time: it is a variable holding a function that is not a lambda
+    /// (such as an alias of `value`).
     fn reaches_names(&self, name: SymId) -> bool {
         let keys = [self.qualify(name), name];
         let held = self.locals.last().and_then(|f| f.get(&name)).or_else(|| keys.iter().find_map(|k| self.ws.vars.get(k)));
-        matches!(held, Some(K::Func(f)) if !matches!(f, Func::Lambda(_))) || keys.iter().any(|k| self.ws.views.contains_key(k))
+        matches!(held, Some(K::Func(f)) if !matches!(f, Func::Lambda(_)))
     }
 
     fn qualify(&self, name: SymId) -> SymId {
@@ -409,7 +409,7 @@ impl<'a> Engine<'a> {
             if let Some(cached) = vdef.cached {
                 return Ok(cached);
             }
-            let computed = self.eval_expr(&vdef.expr)?;
+            let computed = self.eval_view(&vdef)?;
             if let Some(slot) = self.ws.views.get_mut(&vdef.name) {
                 slot.cached = Some(computed.clone());
             }
@@ -421,6 +421,19 @@ impl<'a> Engine<'a> {
         }
 
         Err(KError::value(s))
+    }
+
+    /// A view's value, which is kept for every reader. So it is computed from global names only, those of the view's own
+    /// namespace first: the columns of a query or the variables of a function that reads it first play no part.
+    fn eval_view(&mut self, view: &ViewDef) -> KResult<K> {
+        let name = resolve(view.name);
+        let ns = name.rfind('.').filter(|_| name.starts_with('.')).map_or("", |dot| &name[..dot]);
+        let saved_ns = std::mem::replace(&mut self.session.current_ns, ns.to_string());
+        let saved = (std::mem::take(&mut self.table_scopes), std::mem::take(&mut self.locals));
+        let value = self.eval_expr(&view.expr);
+        (self.table_scopes, self.locals) = saved;
+        self.session.current_ns = saved_ns;
+        value
     }
 
     fn eval_builtin_ns(&self, s: &str) -> KResult<Option<K>> {

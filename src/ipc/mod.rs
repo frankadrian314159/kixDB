@@ -758,6 +758,23 @@ impl IpcConfig {
         m.insert(user.into(), password.into());
         Self { users: Some(m), tls: None, force_tls: false }
     }
+
+    /// Whether it is safe to listen on `bind`. Beyond this machine every client must give a password, over TLS: else
+    /// whoever reaches the port can run any `q`, or read passwords off the network.
+    pub fn check_exposure(&self, bind: &str) -> Result<(), String> {
+        let local = (bind, 0).to_socket_addrs().is_ok_and(|found| {
+            let found: Vec<_> = found.collect();
+            !found.is_empty() && found.iter().all(|a| a.ip().is_loopback())
+        });
+        let passwords = self.users.as_ref().is_some_and(|u| !u.is_empty() && u.values().all(|p| !p.is_empty()));
+        if local || (passwords && self.tls.is_some() && self.force_tls) {
+            return Ok(());
+        }
+        Err(format!(
+            "listening on {bind}, beyond this machine, needs a password (-u USER:PASSWORD) and TLS for every client \
+             (--force-tls with --tls or --tls-cert and --tls-key)"
+        ))
+    }
 }
 
 pub struct Listener {

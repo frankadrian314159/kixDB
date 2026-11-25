@@ -137,3 +137,46 @@ fn remote_introspection_does_not_eval_views_and_cli_connect_supports_dot_command
     assert!(stdout.contains("qSQL SELECT"), "stdout: {stdout}");
     assert!(stdout.contains("35"), "stdout: {stdout}");
 }
+
+#[test]
+fn listening_beyond_this_machine_needs_a_password_over_tls() {
+    let (cert, key) = kixdb::ipc::self_signed_cert("db").unwrap();
+    let mut safe = IpcConfig::with_single_user("alice", "s3cr3t");
+    safe.tls = Some(kixdb::ipc::tls_server_config(cert.as_bytes(), key.as_bytes()).unwrap());
+    safe.force_tls = true;
+    // on this machine anything goes
+    for local in ["127.0.0.1", "localhost", "::1"] {
+        assert!(IpcConfig::default().check_exposure(local).is_ok(), "{local}");
+    }
+    for reachable in ["0.0.0.0", "::", "203.0.113.1", "no.such.host.invalid"] {
+        assert!(safe.check_exposure(reachable).is_ok(), "{reachable}");
+        assert!(IpcConfig::default().check_exposure(reachable).is_err(), "{reachable}");
+    }
+    // each of the three is needed
+    let without = |change: &dyn Fn(&mut IpcConfig)| {
+        let mut config = safe.clone();
+        change(&mut config);
+        config.check_exposure("0.0.0.0").is_err()
+    };
+    assert!(without(&|c| c.users = None));
+    assert!(without(&|c| c.users = IpcConfig::with_single_user("alice", "").users));
+    assert!(without(&|c| c.force_tls = false));
+    assert!(without(&|c| c.tls = None));
+}
+
+#[test]
+fn kix_serve_refuses_to_listen_unprotected_beyond_this_machine() {
+    // (an address no machine here has, so that nothing is ever reachable)
+    let run = |more: &[&str]| {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_kix-serve"));
+        let out = cmd.args(["--bind", "203.0.113.1", "-p", "0"]).args(more).env_remove("KIX_AUTH").output().unwrap();
+        assert!(!out.status.success());
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    let refused = run(&[]);
+    assert!(refused.contains("--force-tls") && !refused.contains("cannot listen"), "{refused}");
+    assert!(run(&["-u", "alice:s3cr3t"]).contains("--insecure-clients"));
+    // allowed to go on, it gets as far as the address
+    let allowed = run(&["--insecure-clients"]);
+    assert!(allowed.contains("WARNING") && allowed.contains("cannot listen"), "{allowed}");
+}

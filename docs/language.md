@@ -16,7 +16,8 @@ Integer arithmetic and aggregates wrap on overflow.
 * adverbs `'` `/` `\` `':` `/:` `\:`, and the words `each`, `over`, `scan`, `prior`
 * `$[c;t;f]`, `if[...]`, `do[...]`, `while[...]`
 * signal `'err`, protected evaluation `@[f;x;handler]` and `.[f;args;handler]`
-* views `v::expression`, namespaces (`\d .name`)
+* views `v::expression`, which read global names only (those of the view's namespace first), never a query's columns or
+  a function's variables; namespaces (`\d .name`)
 
 ## Verbs
 

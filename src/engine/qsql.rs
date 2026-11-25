@@ -46,8 +46,8 @@ fn row_by_row(flip: &Flip, e: &Expr) -> bool {
 }
 
 impl<'a> Engine<'a> {
-    /// The names that `exprs` can read, or `None` when they reach names at run time (through a `DYNAMIC` verb, a view
-    /// or a function variable) and so may read any column.
+    /// The names that `exprs` can read, or `None` when they reach names at run time (through a `DYNAMIC` verb or a
+    /// function variable) and so may read any column.
     fn names_read<'e>(&self,exprs: impl IntoIterator<Item = &'e Expr>) -> Option<Vec<SymId>> {
         let mut names = Vec::new();
         for e in exprs {

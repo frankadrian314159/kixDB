@@ -6,6 +6,7 @@
 //!
 //! Connections to the shards use mutual TLS: give `--node-ca FILE --node-cert FILE --node-key FILE`, or `--insecure` to
 //! leave them unprotected. `--make-certs` writes a certificate authority and a certificate for every node into DIR.
+//! Listening for clients on an address other machines can reach needs `-u` and `--force-tls`, or `--insecure-clients`.
 //!
 //! With `--listen` it serves kdb+ IPC clients (`kix --connect`, `kix-gui --connect`, `hopen`) as one database. Without
 //! it, it runs `q` from standard input against the cluster; `--plan` shows on standard error how each statement ran.
@@ -27,7 +28,8 @@ use std::time::Duration;
 fn usage() -> ! {
     eprintln!(
         "usage: kix-cluster --config cluster.json [--state FILE] --listen PORT [--bind ADDR] [-u USER:PASSWORD]\n                   \
-         [--tls-cert FILE --tls-key FILE | --tls] [--force-tls] [--metrics-listen HOST:PORT] [--wait-shards SECS] [--broadcast-limit ROWS]\n       \
+         [--tls-cert FILE --tls-key FILE | --tls] [--force-tls] [--insecure-clients] [--metrics-listen HOST:PORT]\n                   \
+         [--wait-shards SECS] [--broadcast-limit ROWS]\n       \
          kix-cluster --config cluster.json [--state FILE] [--plan] < script.q\n       \
          kix-cluster --make-certs DIR NAME...\n\
          connections to the shards need --node-ca FILE --node-cert FILE --node-key FILE, or --insecure"
@@ -48,7 +50,7 @@ fn main() -> ExitCode {
     let (mut config, mut state, mut listen) = (None::<String>, None::<String>, None::<u16>);
     let (mut bind, mut auth) = ("127.0.0.1".to_string(), std::env::var("KIX_AUTH").ok());
     let (mut metrics_listen, mut broadcast_limit) = (None::<String>, None::<usize>);
-    let (mut show_plan, mut wait_shards) = (false, 30u64);
+    let (mut show_plan, mut wait_shards, mut insecure_clients) = (false, 30u64, false);
     let (mut cert, mut key, mut self_signed, mut force_tls) = (None::<String>, None::<String>, false, false);
     let mut tls = TlsFlags::default();
     let mut args = std::env::args().skip(1);
@@ -73,6 +75,7 @@ fn main() -> ExitCode {
             "--tls-key" => key = args.next(),
             "--tls" => self_signed = true,
             "--force-tls" => force_tls = true,
+            "--insecure-clients" => insecure_clients = true,
             "--metrics-listen" => metrics_listen = args.next(),
             "--broadcast-limit" => broadcast_limit = Some(parsed(args.next())),
             "--wait-shards" => wait_shards = parsed(args.next()),
@@ -139,6 +142,11 @@ fn main() -> ExitCode {
         ipc.force_tls = force_tls;
     } else if force_tls {
         fail("--force-tls requires --tls or --tls-cert/--tls-key".into());
+    }
+    match ipc.check_exposure(&bind) {
+        Err(why) if insecure_clients => eprintln!("kix-cluster: WARNING: {why}; continuing (--insecure-clients)"),
+        Err(why) => fail(format!("{why}, or --insecure-clients to listen unprotected")),
+        Ok(()) => {}
     }
     let listener = Listener::bind(cluster.gateway(), (bind.as_str(), port), ipc)
         .unwrap_or_else(|e| fail(format!("cannot listen on {bind}:{port}: {e}")));

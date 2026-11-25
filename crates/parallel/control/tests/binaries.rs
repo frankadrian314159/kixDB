@@ -39,7 +39,7 @@ fn kix_cluster_makes_certificates_and_insists_on_them() {
     let dir = tempfile::tempdir().unwrap();
     let run = |args: &[&str], script: &str| {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_kix-cluster"));
-        cmd.current_dir(dir.path()).args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.current_dir(dir.path()).args(args).env_remove("KIX_AUTH").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = cmd.spawn().unwrap();
         // a program that refuses to start may have closed its input already
         let _ = child.stdin.take().unwrap().write_all(script.as_bytes());
@@ -63,6 +63,14 @@ exec sum a from t
     assert!(ok, "{why}");
     assert_eq!(out.trim().lines().last(), Some("6"));
     assert!(!why.contains("WARNING"), "{why}");
+
+    // clients from other machines need a password over TLS
+    let open: Vec<&str> = secured.iter().copied().chain(["--listen", "0", "--bind", "203.0.113.1"]).collect();
+    let (ok, _, why) = run(&open, "");
+    assert!(!ok && why.contains("--insecure-clients") && !why.contains("cannot listen"), "{why}");
+    let allowed: Vec<&str> = open.iter().copied().chain(["--insecure-clients"]).collect();
+    let (ok, _, why) = run(&allowed, "");
+    assert!(!ok && why.contains("WARNING") && why.contains("cannot listen"), "{why}");
 
     let (ok, _, why) = run(&["--config", "cluster.json"], "");
     assert!(!ok && why.contains("--insecure"), "{why}");

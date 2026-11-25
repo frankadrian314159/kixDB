@@ -41,7 +41,7 @@ splayed. The partition appears as the virtual column `date`, `month`, `year` or 
 * Any `where` clause on the partition column prunes partitions (`=`, `<`, `<=`, `>`, `>=`, `in`, `within`), whether it is
   the first clause or appears after other row-wise filters.
 * A `select` or `exec` that lists its columns reads only the columns it mentions, unless it can name one at run time
-  (through `value`, `get`, `eval`, `reval`, `system`, a view or a variable holding a verb). In memory too, only the
+  (through `value`, `get`, `eval`, `reval`, `system` or a variable holding a verb). In memory too, only the
   columns that are read are copied.
 * Column attributes accelerate lookups and joins: `` `s# `` uses `O(log N)` binary search (`=`, `<`, `<=`, `>`, `>=`, `in`,
   `within`, `?`, keyed joins), while `` `u# ``, `` `p# `` (such as HDB `sym` written by `.Q.dpft`) and `` `g# `` maintain

@@ -7,11 +7,15 @@ Compatibility is by the published format; it has not been tested against kdb+ it
 ## Server
 
 ```
-kix-serve [DATA_DIR] [-p PORT] [--bind ADDR] [-u USER:PASSWORD] [--tls-cert FILE --tls-key FILE | --tls] [--no-sync]
+kix-serve [DATA_DIR] [-p PORT] [--bind ADDR] [-u USER:PASSWORD] [--tls-cert FILE --tls-key FILE | --tls] [--force-tls]
+          [--insecure-clients] [--no-sync]
 ```
 
 It listens on `127.0.0.1:5000` by default. **Without `-u` (or `KIX_AUTH=user:password`) any client is accepted**, and a
-client can run any q, including reading and writing files. Set a password before binding to another address.
+client can run any q, including reading and writing files. So `kix-serve` and `kix-cluster` listen on an address other
+machines can reach only with a password **and** `--force-tls` (with `--tls` or `--tls-cert` and `--tls-key`).
+`--insecure-clients` lifts this, with a warning; use it only where something else keeps strangers away from the port.
+The shell (`kix -p`) and `kix-gui` listen on this machine only.
 
 Compressed messages are always accepted. Replies over 2,000 bytes are compressed for clients on other machines.
 

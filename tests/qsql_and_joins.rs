@@ -195,3 +195,29 @@ fn i_is_the_row_number_in_the_whole_table() {
         assert_eq!(c.eval(code).unwrap().to_string(), expected, "{code}");
     }
 }
+
+#[test]
+fn a_view_is_computed_from_global_names_whoever_reads_it_first() {
+    let mut c = Server::new().connect();
+    c.eval("t: ([] a: 1 2 3 4 5; b: 10 20 30 40 50); a: 100").unwrap();
+    // read first inside a query, which has a column `a`, and inside a function, which has a local `a`
+    c.eval("v:: a + 1; w:: sum a; f: {[] a: 1; v}").unwrap();
+    for (code, expected) in [
+        ("exec w from t where b > 30", "100"),
+        ("w", "100"),
+        ("f[]", "101"),
+        ("v", "101"),
+        // a changed global still reaches it
+        ("a: 7; (v; w; exec v from t)", "8 7 8"),
+    ] {
+        assert_eq!(c.eval(code).unwrap().to_string(), expected, "{code}");
+    }
+    // a view reads the names of its own namespace first, wherever it is read from
+    for statement in ["\\d .ns", "k: 5", "u:: k * 2", "\\d .", "k: 1000"] {
+        c.execute(statement);
+    }
+    assert_eq!(c.eval(".ns.u").unwrap().to_string(), "10");
+    // a column is not a name a view can read
+    c.eval("x:: nowhere + 1").unwrap();
+    assert!(c.eval("select x from ([] nowhere: 1 2)").is_err());
+}

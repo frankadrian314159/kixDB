@@ -18,15 +18,19 @@ Make the certificates first (see [Security](#security)), and copy to each node `
 kix-cluster --make-certs certs control s0r1 s0r2 s0r3 s1
 ```
 
-Each command below also takes `--node-ca ca.pem --node-cert NAME.pem --node-key NAME.key`, written `TLS` here:
+Then start each shard on its machine:
 
 ```
 # shard 0 with three replicas: --id is the shard, --replica the member of its group
-kix-shard --id 0 --listen 10.0.0.1:50051 --data s0r1 --replica 1 --peers 2=10.0.0.2:50051,3=10.0.0.3:50051 TLS
-kix-shard --id 0 --listen 10.0.0.2:50051 --data s0r2 --replica 2 --peers 1=10.0.0.1:50051,3=10.0.0.3:50051 TLS
-kix-shard --id 0 --listen 10.0.0.3:50051 --data s0r3 --replica 3 --peers 1=10.0.0.1:50051,2=10.0.0.2:50051 TLS
+kix-shard --id 0 --listen 10.0.0.1:50051 --data s0r1 --replica 1 --peers 2=10.0.0.2:50051,3=10.0.0.3:50051 \
+    --node-ca ca.pem --node-cert s0r1.pem --node-key s0r1.key
+kix-shard --id 0 --listen 10.0.0.2:50051 --data s0r2 --replica 2 --peers 1=10.0.0.1:50051,3=10.0.0.3:50051 \
+    --node-ca ca.pem --node-cert s0r2.pem --node-key s0r2.key
+kix-shard --id 0 --listen 10.0.0.3:50051 --data s0r3 --replica 3 --peers 1=10.0.0.1:50051,2=10.0.0.2:50051 \
+    --node-ca ca.pem --node-cert s0r3.pem --node-key s0r3.key
 # shard 1, not replicated (in memory without --data)
-kix-shard --id 1 --listen 10.0.0.4:50051 --data s1 TLS
+kix-shard --id 1 --listen 10.0.0.4:50051 --data s1 \
+    --node-ca ca.pem --node-cert s1.pem --node-key s1.key
 ```
 
 `cluster.json` lists the shards in order; the replicas of a shard share one address string:
@@ -39,8 +43,11 @@ kix-shard --id 1 --listen 10.0.0.4:50051 --data s1 TLS
 ```
 
 ```
-kix-cluster --config cluster.json --state cluster.state --listen 5000 -u ann:secret [--tls] [--force-tls] TLS
-kix-cluster --config cluster.json --state cluster.state --plan TLS < script.q         # or run a script
+kix-cluster --config cluster.json --state cluster.state --listen 5000 -u ann:secret [--tls] [--force-tls] \
+    --node-ca ca.pem --node-cert control.pem --node-key control.key
+# or run a script
+kix-cluster --config cluster.json --state cluster.state --plan \
+    --node-ca ca.pem --node-cert control.pem --node-key control.key < script.q
 ```
 
 `--tls` and `--force-tls` concern the clients' connections to the control node; the `--node-` flags concern the
@@ -78,7 +85,9 @@ kix-cluster --make-certs certs shard2                    # later: another node, 
   certificate needs the DNS name `kix-node` (callers check for that name, not for the host, so a node can move) and,
   if it restricts key usage, both server and client authentication.
 
-Clients reach the control node over kdb+ IPC, whose TLS and passwords are set separately ([ipc.md](ipc.md)). The
+Clients reach the control node over kdb+ IPC, whose TLS and passwords are set separately ([ipc.md](ipc.md)). To listen
+for them on an address other machines can reach (`--bind`), `kix-cluster` needs `-u` and `--force-tls`, or
+`--insecure-clients`. The
 `--metrics-listen` pages are plain HTTP without authentication.
 
 ## Distribution
@@ -193,10 +202,22 @@ A replicated shard elects a leader. A change takes effect only after a majority 
 majority writes fail with `'cluster`. When the leader dies the control node finds the new one. Replicas cut their Raft
 log with snapshots (`--snapshot-every`, 5,000 entries), and one that fell behind is sent a snapshot.
 
+To add a replica, first make its certificate and start it, with `--join` and the addresses of the others (without
+`--peers` it cannot answer the leader, and adding it fails):
+
+```
+kix-cluster --make-certs certs s0r4
+kix-shard --id 0 --listen 10.0.0.5:50051 --data s0r4 --replica 4 --join --addr 10.0.0.5:50051 \
+    --peers 1=10.0.0.1:50051,2=10.0.0.2:50051,3=10.0.0.3:50051 \
+    --node-ca ca.pem --node-cert s0r4.pem --node-key s0r4.key
+```
+
+Then tell the control node:
+
 ```
 SHARDS                                  / shard, address, role, term, applied, memory
 REPLICAS 0                              / members of shard 0
-ADD REPLICA 0 4 10.0.0.5:50051          / first start: kix-shard ... --replica 4 --join --addr 10.0.0.5:50051 TLS
+ADD REPLICA 0 4 10.0.0.5:50051
 REMOVE REPLICA 0 1
 ```
 
