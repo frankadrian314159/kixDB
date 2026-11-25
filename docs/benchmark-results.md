@@ -1,5 +1,80 @@
 # Benchmark results: scale factor 0.3
 
+## Evaluation of commit `5e031c1`, with writes and concurrency
+
+Measured 2026-11-25 on the machine described under [Setup](#setup), one run each. The sections after this one are older
+and cover read queries only.
+
+### Queries and loading
+
+TPC-H / TPC-DS query totals in seconds, and the time to load TPC-H through the control node. **Previous** is commit
+`2be8fc5`, before changes across shards became atomic. **mimalloc** is `5e031c1` with that memory allocator added to the
+benchmark programs and the shard in a scratch copy.
+
+| Configuration | Queries: previous | `5e031c1` | mimalloc | Load: previous | `5e031c1` | mimalloc |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Single node | | 0.85 / 0.26 | 0.60 / 0.17 | | 3.08 | 2.20 |
+| 3 shard processes | 0.72 / 0.41 | 0.76 / 0.43 | 0.62 / 0.36 | 4.84 | 10.09 | 5.66 |
+| 6 shard processes | 0.73 / 0.41 | 0.82 / 0.46 | 0.65 / 0.42 | 3.96 | 7.45 | 4.62 |
+| 6 shards, in-process | 1.06 / 0.39 | 1.13 / 0.44 | 0.65 / 0.43 | 4.23 | 7.76 | 4.83 |
+
+* The single node is unchanged from the last measurements below.
+* **Loading a cluster is about twice as slow** since two-phase commit: a table is sent to every shard, stored there, and
+  decoded again to commit it. The same applies to tables a multi-statement query assigns: TPC-DS Q22 went from 65 to
+  82 ms and Q36 from 29 to 38 ms on six shard processes. Other query differences are small enough to be run-to-run noise.
+* Link-time optimisation with one code generation unit gave 0.81 / 0.25 and a 2.65 s load on the single node (about 4%
+  on queries).
+
+### Writes
+
+Median milliseconds a statement, from one client (60 runs each). The tables hold the given number of rows in three
+columns; the cluster's are spread over the shards. Durable engines force their log to disk.
+
+| Statement | Rows | Node, memory | Node, durable | 3 shards, memory | 3 shards, durable | 3 replicas |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| insert 1 row | 10,000 | 0.09 | 0.48 | 0.45 | 0.92 | 1.93 |
+| | 1,000,000 | 5.8 | 8.7 | 5.1 | 7.0 | 14.3 |
+| insert 1,000 rows | 10,000 | 0.26 | 0.84 | 1.37 | 3.9 | 2.9 |
+| | 1,000,000 | 6.5 | 9.2 | 16.2 | 20.3 | 15.7 |
+| upsert 1 keyed row | 10,000 | 2.4 | 3.0 | 1.6 | 1.9 | 6.0 |
+| | 1,000,000 | **287** | **284** | **191** | **193** | **648** |
+| update 1 column | 10,000 | 0.30 | 1.47 | 0.74 | 3.6 | 4.4 |
+| | 1,000,000 | 4.0 | 16.1 | 9.1 | 20.0 | 72 |
+
+Of 1,100 durable one-row inserts into 1,000,000 rows the median took 8.5 ms and the worst 47 ms (the log is folded into
+a snapshot every 1,000 records).
+
+### Concurrent clients
+
+Queries a second against tables of 1,000,000 rows, with 1, 4 and 12 clients asking at once.
+
+| Query | Single node | 3 shards, in-process |
+| --- | --- | --- |
+| `select sum v by sym from t` | 97, 96, 96 | 157, 170, 165 |
+| `exec sum v from t where sym = `a` (one shard) | 955, 964, 970 | 1135, 1616, 1626 |
+| `select from k where id = 5` (one shard) | 716, 724, 724 | 1335, 2026, 2021 |
+| `count t` | 962,000, 514,000, 503,000 | 4149, 9613, 15,387 |
+
+A short request to the cluster takes about 0.2 to 0.3 ms (`count t` 0.28 ms), a query routed to one shard 0.7 to 0.9 ms,
+and a grouped join with a small table 16 ms.
+
+### Recommendations
+
+In the order suggested. "Code" means found by reading it, not measured on its own.
+
+| # | Where | Change | Evidence |
+| --- | --- | --- | --- |
+| 1 | both | Use mimalloc in `kix-shard` and `kix-cluster`, and build `kix-serve` with it by default | Measured: query time down 29-35% on one node and 2-42% on the cluster; load time down 29-44% |
+| 2 | both | Make changes across shards cheaper: send row bytes without encoding them one by one, keep what prepare worked out for commit, and create tables that do not exist yet without two phases (a design change) | Measured: loading takes 1.8-2.1 times as long as before; code |
+| 3 | shard, node | Keyed `upsert` and `uj`: look keys up with the typed grouping code and change columns in place, instead of rebuilding every row as separate values ([joins.rs](../src/engine/joins.rs)); the shard's own key set likewise | Measured: 190-650 ms a row at 1,000,000 rows; code |
+| 4 | control | Save round trips: `insert` counts the table on every shard first (return the count with the load), the planner counts tables for each join (cache the counts), and a replicated shard is probed before each change | Measured: a one-row insert (0.45 ms) takes nearly twice a `count` (0.24 ms); code |
+| 5 | shard, node | Append to columns in place when no one else holds them, instead of copying the table | Measured: a one-row insert grows from 0.09 to 5.8 ms between 10,000 and 1,000,000 rows |
+| 6 | shard, node | Let reads run side by side (they take the workspace's write lock), then run `where`, grouping and aggregation on several threads. Both change the engine's design | Measured: no gain from more clients on one node; code |
+| 7 | shard | Replicate single changed values, not whole columns, for sparse updates (a new log record) | Measured: updating a column of 1,000,000 rows takes 72 ms with replicas, 16 ms durable without |
+
+Not measured: `--state` files (written after every change; code), more than one machine, TLS under load, memory use
+under concurrency.
+
 Measured 2026-11-25 with the programs described in [benchmarks.md](benchmarks.md). Six changes were measured, each
 against the build before it. **Before** below is the build with the [filtering
 change](#pattern-matching-and-filter-results); **after** adds the [row number and constant column
