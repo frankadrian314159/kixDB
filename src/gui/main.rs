@@ -27,20 +27,36 @@ fn main() -> Result<(), eframe::Error> {
     while let Some(a) = args.next() {
         match a.as_str() {
             "--connect" | "-S" => {
-                let spec = args.next().unwrap_or_default();
+                let raw = args.next().unwrap_or_default();
                 let mut t = target.take().unwrap_or_default();
+                let spec = match raw.strip_prefix("tcps://") {
+                    Some(rest) => {
+                        t.tls = true;
+                        rest
+                    }
+                    None => raw.strip_prefix("tcp://").unwrap_or(&raw),
+                };
                 match spec.rsplit_once(':') {
                     Some((h, p)) if p.parse::<u16>().is_ok() => {
                         t.host = h.to_string();
                         t.port = p.parse().unwrap_or(5000);
                     }
-                    _ if !spec.is_empty() => t.host = spec,
+                    _ if !spec.is_empty() => t.host = spec.to_string(),
                     _ => {
-                        eprintln!("--connect needs HOST or HOST:PORT");
+                        eprintln!("--connect needs [tcps://]HOST or HOST:PORT");
                         std::process::exit(2);
                     }
                 }
                 target = Some(t);
+            }
+            "--tls" => {
+                target.get_or_insert_with(Default::default).tls = true;
+            }
+            "--tls-ca" => {
+                let ca = args.next().unwrap_or_default();
+                let t = target.get_or_insert_with(Default::default);
+                t.tls = true;
+                t.ca_cert = ca;
             }
             "-U" | "-P" => {
                 let v = args.next().unwrap_or_default();
@@ -190,5 +206,14 @@ mod tests {
                 design_view.ui(ui, &mut **app.conn_for_test(), &mut ev);
             });
         });
+
+        // Verify RemoteBackend explain, non-evaluating view definition, and user namespaces!
+        app.conn_for_test().eval("hits: 0; lazy_v:: (hits:: hits + 1; 99); .ops.limit: 5").unwrap();
+        let def = app.conn_for_test().definition("lazy_v").unwrap();
+        assert!(def.starts_with("lazy_v::"), "got {def}");
+        assert_eq!(app.conn_for_test().eval("hits").unwrap().to_string(), "0");
+        assert!(app.conn_for_test().namespaces().contains(&".ops".to_string()));
+        let plan = app.conn_for_test().explain("select from trade where sym = `AAPL").unwrap();
+        assert!(plan[0].contains("qSQL SELECT"), "{plan:?}");
     }
 }

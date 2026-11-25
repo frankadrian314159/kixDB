@@ -294,7 +294,10 @@ impl ClusterSession {
             }
             return self.inner.run_push(&mut self.conn, &push).map(Some);
         }
-        self.read_parts(e)
+        if let Some(v) = self.read_parts(e)? {
+            return Ok(Some(v));
+        }
+        self.slice(e)
     }
 
     /// Replace the subqueries of a pushed-down expression by their values.
@@ -426,9 +429,6 @@ impl ClusterSession {
 
     /// Run `e` on the mirror engine over the tables it refers to.
     fn on_mirror(&mut self, e: &Expr) -> KResult<K> {
-        if let Some(v) = self.slice(e)? {
-            return Ok(v);
-        }
         let refs = self.names().refs(e);
         let before: BTreeSet<SymId> = self.names().all_tables().into_iter().collect();
         let wanted = if refs.dynamic { before.clone() } else { refs.tables };

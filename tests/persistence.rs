@@ -124,3 +124,25 @@ fn partitioned_queries_load_only_the_columns_they_name() {
     assert!(c.eval("exec px from t").is_err());
     assert!(c.eval("select from t").is_err());
 }
+
+#[test]
+fn year_partitions_and_non_leading_where_pruning() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hdb = tmp.path().display().to_string().replace('\\', "/");
+    {
+        let srv = Server::new();
+        let mut c = srv.connect();
+        c.eval("yt: ([] sym: `a`b; v: 10 20)").unwrap();
+        c.eval(&format!(".Q.dpft[`:{hdb}; 2025i; `sym; `yt]")).unwrap();
+        c.eval("yt: ([] sym: `a`c; v: 30 40)").unwrap();
+        c.eval(&format!(".Q.dpft[`:{hdb}; 2026i; `sym; `yt]")).unwrap();
+    }
+    // Corrupt 2025 partition's `v` column: a query whose SECOND `where` clause prunes to `year = 2026` must not touch 2025!
+    std::fs::write(tmp.path().join("2025/yt/v"), b"corrupt").unwrap();
+    let srv = Server::new();
+    let mut c = srv.connect();
+    c.eval(&format!("\\l {hdb}")).unwrap();
+    assert_eq!(c.eval("exec sum v from yt where sym = `a, year = 2026").unwrap().to_string(), "30");
+    assert_eq!(c.eval("exec sum v from yt where year > 2025, year <= 2026").unwrap().to_string(), "70");
+    assert!(c.eval("exec sum v from yt where year = 2025").is_err());
+}

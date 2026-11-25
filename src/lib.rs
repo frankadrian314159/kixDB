@@ -10,6 +10,7 @@
 pub mod ast;
 pub mod engine;
 pub mod error;
+pub mod index;
 pub mod inspect;
 pub mod ipc;
 pub mod lexer;
@@ -374,7 +375,7 @@ impl Connection {
     }
 }
 
-fn describe_expr_plan(e: &ast::Expr, ws: &Workspace) -> String {
+pub(crate) fn describe_expr_plan(e: &ast::Expr, ws: &Workspace) -> String {
     match e {
         ast::Expr::Query(q) => {
             let kind = match q.kind {
@@ -425,5 +426,14 @@ impl tools::QSession for Connection {
     }
     fn describe_table(&mut self, name: &str) -> Option<inspect::TableInfo> {
         self.table_info(name)
+    }
+}
+
+impl tools::QSession for ipc::IpcClient {
+    fn run_q(&mut self, code: &str) -> KResult<()> {
+        self.query_str(code).map(|_| ())
+    }
+    fn describe_table(&mut self, name: &str) -> Option<inspect::TableInfo> {
+        inspect::remote_table_info(self, name)
     }
 }

@@ -32,7 +32,6 @@ required-features = ["gui"]
 
 [features]
 default = []
-prof = []
 fast-alloc = ["dep:mimalloc"]
 gui = ["dep:eframe", "dep:egui", "dep:egui_extras", "dep:rfd"]
 

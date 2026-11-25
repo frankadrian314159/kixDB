@@ -17,21 +17,34 @@ fn row_hash(cols: &[&ColVec], row: usize) -> Vec<u8> {
     out
 }
 
+/// Probe row index in `kt` for each row of `left_key_cols` (`None` on miss), using attribute indexes on 1-key tables when present.
+fn probe_keyed_table(kt: &KeyedTable, left_key_cols: &[&ColVec], nrows: usize) -> Vec<Option<usize>> {
+    if kt.keys.ncols() == 1 && kt.keys.vals[0].attr() != Attr::None && -kt.keys.vals[0].type_num() == -left_key_cols[0].type_num() {
+        let kcol = &kt.keys.vals[0];
+        let lcol = left_key_cols[0];
+        let klen = kcol.len();
+        return (0..nrows)
+            .map(|r| crate::index::find_first(kcol, &lcol.get_atom(r)).filter(|&idx| idx < klen))
+            .collect();
+    }
+    let right_key_cols: Vec<&ColVec> = kt.keys.vals.iter().collect();
+    let mut right_map: HashMap<Vec<u8>, usize> = HashMap::with_capacity(kt.nrows());
+    for r in 0..kt.nrows() {
+        right_map.entry(row_hash(&right_key_cols, r)).or_insert(r);
+    }
+    (0..nrows).map(|r| right_map.get(&row_hash(left_key_cols, r)).copied()).collect()
+}
+
 /// Look up value rows in `kt` for each row of `probe_keys` (returns `kt.vals`-shaped `Flip` with nulls for misses).
 pub fn lookup_keyed_rows(kt: &KeyedTable, probe_keys: &Flip) -> KResult<Flip> {
     if kt.keys.ncols() != probe_keys.ncols() {
         return Err(KError::length("keyed table lookup column count mismatch"));
     }
-    let kcols: Vec<&ColVec> = kt.keys.vals.iter().collect();
-    let mut index: HashMap<Vec<u8>, usize> = HashMap::with_capacity(kt.nrows());
-    for r in 0..kt.nrows() {
-        index.entry(row_hash(&kcols, r)).or_insert(r);
-    }
     let pcols: Vec<&ColVec> = probe_keys.vals.iter().collect();
-    let mut gather_idx = Vec::with_capacity(probe_keys.nrows());
-    for r in 0..probe_keys.nrows() {
-        gather_idx.push(*index.get(&row_hash(&pcols, r)).unwrap_or(&usize::MAX));
-    }
+    let gather_idx: Vec<usize> = probe_keyed_table(kt, &pcols, probe_keys.nrows())
+        .into_iter()
+        .map(|m| m.unwrap_or(usize::MAX))
+        .collect();
     Ok(kt.vals.gather(&gather_idx))
 }
 
@@ -53,17 +66,8 @@ pub fn left_join(lhs: &K, rhs: &K) -> KResult<K> {
             .ok_or_else(|| KError::new("mismatch", format!("lj key column `{}` missing on LHS", resolve(kc))))?;
         left_key_cols.push(&left_flip.vals[idx]);
     }
-    let right_key_cols: Vec<&ColVec> = kt.keys.vals.iter().collect();
-    let mut right_map: HashMap<Vec<u8>, usize> = HashMap::with_capacity(kt.nrows());
-    for r in 0..kt.nrows() {
-        right_map.entry(row_hash(&right_key_cols, r)).or_insert(r);
-    }
-
     let nrows = left_flip.nrows();
-    let mut matched: Vec<Option<usize>> = Vec::with_capacity(nrows);
-    for r in 0..nrows {
-        matched.push(right_map.get(&row_hash(&left_key_cols, r)).copied());
-    }
+    let matched = probe_keyed_table(kt, &left_key_cols, nrows);
 
     let mut out_cols = left_flip.cols.clone();
     let mut out_vals = left_flip.vals.clone();
@@ -118,16 +122,10 @@ pub fn inner_join(lhs: &K, rhs: &K) -> KResult<K> {
             .ok_or_else(|| KError::new("mismatch", format!("ij key column `{}` missing on LHS", resolve(kc))))?;
         left_key_cols.push(&left_flip.vals[idx]);
     }
-    let right_key_cols: Vec<&ColVec> = kt.keys.vals.iter().collect();
-    let mut right_map: HashMap<Vec<u8>, usize> = HashMap::with_capacity(kt.nrows());
-    for r in 0..kt.nrows() {
-        right_map.entry(row_hash(&right_key_cols, r)).or_insert(r);
-    }
-
     let mut l_keep = Vec::new();
     let mut r_keep = Vec::new();
-    for r in 0..left_flip.nrows() {
-        if let Some(&rr) = right_map.get(&row_hash(&left_key_cols, r)) {
+    for (r, m) in probe_keyed_table(kt, &left_key_cols, left_flip.nrows()).into_iter().enumerate() {
+        if let Some(rr) = m {
             l_keep.push(r);
             r_keep.push(rr);
         }
@@ -227,17 +225,8 @@ pub fn plus_join(lhs: &K, rhs: &K) -> KResult<K> {
         let idx = left_flip.col_idx(kc).ok_or_else(|| KError::value(resolve(kc)))?;
         left_key_cols.push(&left_flip.vals[idx]);
     }
-    let right_key_cols: Vec<&ColVec> = kt.keys.vals.iter().collect();
-    let mut right_map: HashMap<Vec<u8>, usize> = HashMap::with_capacity(kt.nrows());
-    for r in 0..kt.nrows() {
-        right_map.entry(row_hash(&right_key_cols, r)).or_insert(r);
-    }
-
     let nrows = left_flip.nrows();
-    let mut matched: Vec<Option<usize>> = Vec::with_capacity(nrows);
-    for r in 0..nrows {
-        matched.push(right_map.get(&row_hash(&left_key_cols, r)).copied());
-    }
+    let matched = probe_keyed_table(kt, &left_key_cols, nrows);
 
     let mut out_cols = left_flip.cols;
     let mut out_vals = left_flip.vals;

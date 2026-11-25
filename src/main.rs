@@ -223,11 +223,29 @@ impl Shell {
                 if trimmed.is_empty() {
                     continue;
                 }
-                if trimmed.starts_with("\\p") {
-                    self.handle_port_cmd(trimmed[2..].trim());
+                if let Some(rest) = trimmed.strip_prefix("\\p") {
+                    self.handle_port_cmd(rest.trim());
                     continue;
                 }
-                if trimmed.starts_with('.') && !trimmed.starts_with(".z.") && !trimmed.starts_with(".Q.") && !trimmed.starts_with(".kix.") && !trimmed.contains(':') {
+                let head = trimmed.split_whitespace().next().unwrap_or("");
+                if matches!(
+                    head,
+                    ".help"
+                        | ".quit"
+                        | ".tables"
+                        | ".views"
+                        | ".functions"
+                        | ".vars"
+                        | ".meta"
+                        | ".schema"
+                        | ".import"
+                        | ".export"
+                        | ".read"
+                        | ".plan"
+                        | ".timer"
+                        | ".storage"
+                        | ".checkpoint"
+                ) {
                     if !self.dot_command(trimmed) {
                         break;
                     }
@@ -378,19 +396,19 @@ impl Shell {
                     eprintln!("cannot read '{}'", parts[0]);
                     return true;
                 };
-                if let Target::Local { conn, .. } = &mut self.target {
-                    match tools::import_csv(conn, &csv_text, parts[1], create) {
-                        Ok(n) => println!("imported {n} row(s) into {}", parts[1]),
-                        Err(e) => eprintln!("{e}"),
-                    }
-                } else {
-                    eprintln!(".import requires a local workspace (use 0: on remote)");
+                let res = match &mut self.target {
+                    Target::Local { conn, .. } => tools::import_csv(conn, &csv_text, parts[1], create),
+                    Target::Remote { client, .. } => tools::import_csv(client, &csv_text, parts[1], create),
+                };
+                match res {
+                    Ok(n) => println!("imported {n} row(s) into {}", parts[1]),
+                    Err(e) => eprintln!("{e}"),
                 }
             }
-            ".schema" => {
-                if let Target::Local { conn, .. } = &mut self.target {
+            ".schema" => match &mut self.target {
+                Target::Local { conn, .. } => {
                     if rest.is_empty() {
-                        for o in conn.objects().into_iter().filter(|o| matches!(o.kind, ObjectKind::Table | ObjectKind::KeyedTable | ObjectKind::View | ObjectKind::Function)) {
+                        for o in conn.objects().into_iter().filter(|o| matches!(o.kind, ObjectKind::Table | ObjectKind::KeyedTable | ObjectKind::PartitionedTable | ObjectKind::View | ObjectKind::Function)) {
                             if let Some(d) = conn.definition(&o.full_name()) {
                                 println!("{d}");
                             }
@@ -401,17 +419,32 @@ impl Shell {
                         eprintln!("'{rest} not found");
                     }
                 }
-            }
-            ".plan" => {
-                if let Target::Local { conn, .. } = &mut self.target {
-                    match conn.explain(rest) {
-                        Ok(lines) => {
-                            for l in lines {
-                                println!("{l}");
+                Target::Remote { client, .. } => {
+                    if rest.is_empty() {
+                        for o in kixdb::inspect::remote_objects(client).into_iter().filter(|o| matches!(o.kind, ObjectKind::Table | ObjectKind::KeyedTable | ObjectKind::PartitionedTable | ObjectKind::View | ObjectKind::Function)) {
+                            if let Some(d) = kixdb::inspect::remote_definition(client, &o.full_name()) {
+                                println!("{d}");
                             }
                         }
-                        Err(e) => eprintln!("{e}"),
+                    } else if let Some(d) = kixdb::inspect::remote_definition(client, rest) {
+                        println!("{d}");
+                    } else {
+                        eprintln!("'{rest} not found");
                     }
+                }
+            },
+            ".plan" => {
+                let res = match &mut self.target {
+                    Target::Local { conn, .. } => conn.explain(rest),
+                    Target::Remote { client, .. } => kixdb::inspect::remote_explain(client, rest),
+                };
+                match res {
+                    Ok(lines) => {
+                        for l in lines {
+                            println!("{l}");
+                        }
+                    }
+                    Err(e) => eprintln!("{e}"),
                 }
             }
             ".storage" => {

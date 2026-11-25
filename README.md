@@ -66,11 +66,15 @@ that spans shards is not atomic, and traffic between nodes is neither authentica
 * [IPC and TLS](docs/ipc.md)
 * [Shell and desktop app](docs/shell-and-gui.md)
 * [Distributed edition](docs/distributed.md)
+* [Benchmarks (TPC-H and TPC-DS)](docs/benchmarks.md)
 
-## Testing
+## Testing and Benchmarks
 
 ```
 cargo test --workspace --features gui
+cargo run --release --example tpc                          # TPC-H + TPC-DS (default --sf 0.05)
+cargo run --release -p kix-control --example tpch_cluster  # TPC-H on cluster vs single node (--sf 0.05)
+cargo run --release -p kix-control --example tpcds_cluster # TPC-DS on cluster vs single node (--sf 0.05)
 ```
 
 The cluster tests start shard nodes in the test process and compare every answer with a single server, including a few

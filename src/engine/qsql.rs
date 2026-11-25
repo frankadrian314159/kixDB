@@ -82,27 +82,45 @@ impl<'a> Engine<'a> {
         }
 
         // Sequential `where` filtering: each sub-clause sees only rows surviving prior sub-clauses!
+        // `active_rows == None` represents all `0..total_nrows` rows without cloning `base_flip` up front.
         let total_nrows = base_flip.nrows();
-        let mut active_rows: Vec<usize> = (0..total_nrows).collect();
+        let mut active_rows: Option<Vec<usize>> = None;
 
         for wc in &q.where_clauses {
-            if active_rows.is_empty() {
+            if total_nrows == 0 || active_rows.as_ref().is_some_and(|r| r.is_empty()) {
                 break;
             }
-            let sub_flip = base_flip.gather(&active_rows);
-            let pred_k = self.eval_in_table_scope(&sub_flip, wc)?;
-            let keep_local = extract_where_indices(&pred_k, sub_flip.nrows())?;
-            active_rows = keep_local.into_iter().map(|li| active_rows[li]).collect();
+            if let Some(indexed) = crate::index::try_filter_where(&base_flip, active_rows.as_deref(), wc, &mut |e| self.eval_expr(e))? {
+                active_rows = Some(indexed);
+                continue;
+            }
+            match &active_rows {
+                None => {
+                    let pred_k = self.eval_in_table_scope(&base_flip, wc)?;
+                    active_rows = Some(extract_where_indices(&pred_k, total_nrows)?);
+                }
+                Some(cur) => {
+                    let sub_flip = base_flip.gather(cur);
+                    let pred_k = self.eval_in_table_scope(&sub_flip, wc)?;
+                    let keep_local = extract_where_indices(&pred_k, sub_flip.nrows())?;
+                    active_rows = Some(keep_local.into_iter().map(|li| cur[li]).collect());
+                }
+            }
         }
 
         match q.kind {
             QSqlKind::DeleteRows => {
-                let mut drop_mask = vec![false; total_nrows];
-                for &r in &active_rows {
-                    drop_mask[r] = true;
-                }
-                let keep_idx: Vec<usize> = (0..total_nrows).filter(|&r| !drop_mask[r]).collect();
-                let res_flip = base_flip.gather(&keep_idx);
+                let res_flip = match &active_rows {
+                    None => base_flip.take(0),
+                    Some(rows) => {
+                        let mut drop_mask = vec![false; total_nrows];
+                        for &r in rows {
+                            drop_mask[r] = true;
+                        }
+                        let keep_idx: Vec<usize> = (0..total_nrows).filter(|&r| !drop_mask[r]).collect();
+                        base_flip.gather(&keep_idx)
+                    }
+                };
                 let out_k = restore_keys(res_flip, orig_key_cols)?;
                 if let Some(sym) = inplace_target {
                     self.set_global(sym, out_k)?;
@@ -112,7 +130,15 @@ impl<'a> Engine<'a> {
             }
 
             QSqlKind::Update => {
-                let out_flip = self.exec_update(&base_flip, &active_rows, &q.cols, q.by.as_deref())?;
+                let all_idx: Vec<usize>;
+                let rows_slice: &[usize] = match &active_rows {
+                    Some(r) => r.as_slice(),
+                    None => {
+                        all_idx = (0..total_nrows).collect();
+                        &all_idx
+                    }
+                };
+                let out_flip = self.exec_update(&base_flip, rows_slice, &q.cols, q.by.as_deref())?;
                 let out_k = restore_keys(out_flip, orig_key_cols)?;
                 if let Some(sym) = inplace_target {
                     self.set_global(sym, out_k)?;
@@ -122,13 +148,27 @@ impl<'a> Engine<'a> {
             }
 
             QSqlKind::Exec => {
-                let filtered = base_flip.gather(&active_rows);
-                self.exec_query_exec(&filtered, &q.cols, q.by.as_deref())
+                let sub_buf;
+                let filtered = match &active_rows {
+                    None => &base_flip,
+                    Some(r) => {
+                        sub_buf = base_flip.gather(r);
+                        &sub_buf
+                    }
+                };
+                self.exec_query_exec(filtered, &q.cols, q.by.as_deref())
             }
 
             QSqlKind::Select => {
-                let filtered = base_flip.gather(&active_rows);
-                let mut res = self.exec_select(&filtered, &q.cols, q.by.as_deref(), orig_key_cols)?;
+                let sub_buf;
+                let filtered = match &active_rows {
+                    None => &base_flip,
+                    Some(r) => {
+                        sub_buf = base_flip.gather(r);
+                        &sub_buf
+                    }
+                };
+                let mut res = self.exec_select(filtered, &q.cols, q.by.as_deref(), orig_key_cols)?;
                 if q.distinct {
                     if let K::Table(_) = &res {
                         res = crate::engine::ops::distinct_op(&res)?;

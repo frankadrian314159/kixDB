@@ -746,15 +746,17 @@ impl IpcClient {
 pub struct IpcConfig {
     /// Optional `username -> password` map (`None` allows any user, matching kdb+ without `-u`).
     pub users: Option<HashMap<String, String>>,
-    /// Accept TLS connections too (on the same port; plain connections are still accepted).
+    /// Accept TLS connections too (on the same port; plain connections are still accepted unless `force_tls` is true).
     pub tls: Option<Arc<rustls::ServerConfig>>,
+    /// Require TLS (`tcps://`) and reject unencrypted connections.
+    pub force_tls: bool,
 }
 
 impl IpcConfig {
     pub fn with_single_user(user: impl Into<String>, password: impl Into<String>) -> Self {
         let mut m = HashMap::new();
         m.insert(user.into(), password.into());
-        Self { users: Some(m), tls: None }
+        Self { users: Some(m), tls: None, force_tls: false }
     }
 }
 
@@ -820,11 +822,18 @@ fn handle_client(
 ) -> KResult<()> {
     let _ = tcp.set_nodelay(true);
     let compress = tcp.peer_addr().is_ok_and(|a| !a.ip().is_loopback());
-    let tls = cfg.read().unwrap_or_else(|e| e.into_inner()).tls.clone();
+    let (tls, force_tls) = {
+        let g = cfg.read().unwrap_or_else(|e| e.into_inner());
+        (g.tls.clone(), g.force_tls)
+    };
     // a TLS connection starts with a handshake record (0x16), which no IPC handshake does
     let mut first = [0u8; 1];
+    let is_tls = tcp.peek(&mut first)? == 1 && first[0] == 0x16;
+    if force_tls && !is_tls {
+        return Err(KError::ipc("plaintext connection rejected (--force-tls)"));
+    }
     let mut stream: Box<dyn Wire> = match tls {
-        Some(t) if tcp.peek(&mut first)? == 1 && first[0] == 0x16 => {
+        Some(t) if is_tls => {
             Box::new(rustls::StreamOwned::new(rustls::ServerConnection::new(t).map_err(tls_error)?, tcp))
         }
         _ => Box::new(tcp),

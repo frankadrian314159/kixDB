@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 
 /// A table with at most this many rows is copied to every shard for a join, rather than shuffled.
 const BROADCAST_LIMIT: usize = 100_000;
+const STATE_MAGIC: [u8; 4] = *b"KXCS";
 
 /// What `cluster.state` holds.
 #[derive(Serialize, Deserialize)]
@@ -58,6 +59,7 @@ struct Inner {
     next_temp: AtomicU64,
     broadcast_limit: AtomicUsize,
     state_path: Option<PathBuf>,
+    _state_lock: Option<std::fs::File>,
 }
 
 impl Inner {
@@ -78,9 +80,14 @@ impl Inner {
         let Some(path) = &self.state_path else { return Ok(()) };
         let shards = self.shards.iter().map(|s| ShardInfo { id: s.id, addr: s.addresses() }).collect();
         let state = State { shards, slots: self.slots.clone(), mirror: self.mirror.export_state()? };
-        let bytes = postcard::to_allocvec(&state).map_err(|e| KError::io(e.to_string()))?;
+        let payload = postcard::to_allocvec(&state).map_err(|e| KError::io(e.to_string()))?;
+        let crc = crc32fast::hash(&payload);
+        let mut out = Vec::with_capacity(8 + payload.len());
+        out.extend_from_slice(&STATE_MAGIC);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&payload);
         let tmp = path.with_extension("state.tmp");
-        std::fs::write(&tmp, bytes)?;
+        std::fs::write(&tmp, out)?;
         std::fs::rename(&tmp, path)?;
         Ok(())
     }
@@ -95,7 +102,7 @@ pub struct Cluster {
 impl Cluster {
     /// Start a control node for the shards of `config`, with no state file.
     pub fn connect(config: &ClusterConfig) -> KResult<Cluster> {
-        Self::build(config.shards.clone(), even_slots(config.shards.len()), None, None)
+        Self::build(config.shards.clone(), even_slots(config.shards.len()), None, None, None)
     }
 
     /// Start a control node that keeps its state in `path`. An existing file picks the cluster up where it was: it
@@ -103,12 +110,33 @@ impl Cluster {
     /// many shards adds any other replica addresses.
     pub fn open(path: impl AsRef<Path>, config: &ClusterConfig) -> KResult<Cluster> {
         let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let lock_path = path.with_extension("state.lock");
+        let lock_file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&lock_path)?;
+        if lock_file.try_lock().is_err() {
+            return Err(KError::io(format!("cluster state '{}' is in use by another process", path.display())));
+        }
         if !path.exists() {
-            let c = Self::build(config.shards.clone(), even_slots(config.shards.len()), None, Some(path))?;
+            let c = Self::build(config.shards.clone(), even_slots(config.shards.len()), None, Some(path), Some(lock_file))?;
             c.inner.save_state()?;
             return Ok(c);
         }
-        let state: State = postcard::from_bytes(&std::fs::read(&path)?).map_err(|e| KError::io(format!("{}: {e}", path.display())))?;
+        let raw = std::fs::read(&path)?;
+        let payload: &[u8] = if raw.len() >= 8 && raw[..4] == STATE_MAGIC {
+            let expected = u32::from_le_bytes(raw[4..8].try_into().unwrap());
+            let actual = crc32fast::hash(&raw[8..]);
+            if expected != actual {
+                return Err(KError::io(format!("{}: state checksum mismatch", path.display())));
+            }
+            &raw[8..]
+        } else {
+            return Err(KError::io(format!("{}: invalid or corrupt cluster state header", path.display())));
+        };
+        let state: State = postcard::from_bytes(payload).map_err(|e| KError::io(format!("{}: {e}", path.display())))?;
         let mut shards = state.shards;
         if !config.shards.is_empty() {
             if config.shards.len() != shards.len() {
@@ -123,10 +151,16 @@ impl Cluster {
                 }
             }
         }
-        Self::build(shards, state.slots, Some(state.mirror), Some(path))
+        Self::build(shards, state.slots, Some(state.mirror), Some(path), Some(lock_file))
     }
 
-    fn build(info: Vec<ShardInfo>, slots: Vec<u32>, mirror_state: Option<Vec<u8>>, state_path: Option<PathBuf>) -> KResult<Cluster> {
+    fn build(
+        info: Vec<ShardInfo>,
+        slots: Vec<u32>,
+        mirror_state: Option<Vec<u8>>,
+        state_path: Option<PathBuf>,
+        state_lock: Option<std::fs::File>,
+    ) -> KResult<Cluster> {
         if info.is_empty() {
             return Err(KError::new("cluster", "the cluster has no shards"));
         }
@@ -149,6 +183,7 @@ impl Cluster {
             next_temp: AtomicU64::new(0),
             broadcast_limit: AtomicUsize::new(BROADCAST_LIMIT),
             state_path,
+            _state_lock: state_lock,
         };
         let cluster = Cluster { inner: Arc::new(inner) };
         if mirror_state.is_some() {

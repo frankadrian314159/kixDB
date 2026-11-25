@@ -13,7 +13,7 @@
 use kix_control::Cluster;
 use kix_shared_ces::metrics::serve_http;
 use kix_shared_ces::ClusterConfig;
-use kixdb::ipc::{IpcConfig, Listener};
+use kixdb::ipc::{self_signed_cert, tls_server_config, IpcConfig, Listener};
 use kixdb::{tools, Event};
 use std::io::BufRead;
 use std::process::ExitCode;
@@ -22,7 +22,7 @@ use std::time::Duration;
 fn usage() -> ! {
     eprintln!(
         "usage: kix-cluster --config cluster.json [--state FILE] --listen PORT [--bind ADDR] [-u USER:PASSWORD]\n                   \
-         [--metrics-listen HOST:PORT] [--wait-shards SECS] [--broadcast-limit ROWS]\n       \
+         [--tls-cert FILE --tls-key FILE | --tls] [--force-tls] [--metrics-listen HOST:PORT] [--wait-shards SECS] [--broadcast-limit ROWS]\n       \
          kix-cluster --config cluster.json [--state FILE] [--plan] < script.q"
     );
     std::process::exit(2);
@@ -42,6 +42,7 @@ fn main() -> ExitCode {
     let (mut bind, mut auth) = ("127.0.0.1".to_string(), std::env::var("KIX_AUTH").ok());
     let (mut metrics_listen, mut broadcast_limit) = (None::<String>, None::<usize>);
     let (mut show_plan, mut wait_shards) = (false, 30u64);
+    let (mut cert, mut key, mut self_signed, mut force_tls) = (None::<String>, None::<String>, false, false);
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -50,6 +51,10 @@ fn main() -> ExitCode {
             "--listen" | "-p" => listen = Some(parsed(args.next())),
             "--bind" => bind = parsed(args.next()),
             "-u" | "--auth" => auth = args.next(),
+            "--tls-cert" => cert = args.next(),
+            "--tls-key" => key = args.next(),
+            "--tls" => self_signed = true,
+            "--force-tls" => force_tls = true,
             "--metrics-listen" => metrics_listen = args.next(),
             "--broadcast-limit" => broadcast_limit = Some(parsed(args.next())),
             "--wait-shards" => wait_shards = parsed(args.next()),
@@ -85,13 +90,32 @@ fn main() -> ExitCode {
         }
     }
     let Some(port) = listen else { return run_input(&cluster, show_plan) };
-    let ipc = match auth {
+    let mut ipc = match auth {
         Some(spec) => {
             let (user, password) = spec.split_once(':').unwrap_or((&spec, ""));
             IpcConfig::with_single_user(user, password)
         }
         None => IpcConfig::default(),
     };
+    let read_pem = |p: &str| std::fs::read(p).unwrap_or_else(|e| fail(format!("cannot read {p}: {e}")));
+    let pem = match (cert, key) {
+        (Some(c), Some(k)) => Some((read_pem(&c), read_pem(&k))),
+        (None, None) if self_signed => {
+            let (c, k) = self_signed_cert(&bind).unwrap_or_else(|e| fail(e.to_string()));
+            if let Err(e) = std::fs::write("kix-cluster-cert.pem", &c) {
+                fail(format!("cannot write kix-cluster-cert.pem: {e}"));
+            }
+            Some((c.into_bytes(), k.into_bytes()))
+        }
+        (None, None) => None,
+        _ => usage(),
+    };
+    if let Some((c, k)) = pem {
+        ipc.tls = Some(tls_server_config(&c, &k).unwrap_or_else(|e| fail(e.to_string())));
+        ipc.force_tls = force_tls;
+    } else if force_tls {
+        fail("--force-tls requires --tls or --tls-cert/--tls-key".into());
+    }
     let listener = Listener::bind(cluster.gateway(), (bind.as_str(), port), ipc)
         .unwrap_or_else(|e| fail(format!("cannot listen on {bind}:{port}: {e}")));
     eprintln!("kix-cluster: control node listening on {} (kdb+ IPC), {} shard(s)", listener.local_addr(), cluster.shard_count());

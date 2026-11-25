@@ -94,3 +94,48 @@ fn relational_and_timeseries_joins_aj_wj() {
         .unwrap();
     assert_eq!(wj_res.to_string(), "179.8 181.8 181.8");
 }
+
+#[test]
+fn attribute_accelerated_filters_find_and_joins() {
+    let srv = Server::new();
+    let mut c = srv.connect();
+
+    // Build identical unattributed and attributed tables (`s#, `u#, `p#, `g#)
+    c.eval(
+        "plain: ([] ts: 10 20 30 40 50 60 70 80; id: 100 101 102 103 104 105 106 107; sym: `A`A`A`B`B`C`C`C; grp: `x`y`x`z`y`x`z`y; v: 1 2 3 4 5 6 7 8);\
+         idxed: ([] ts: `s#10 20 30 40 50 60 70 80; id: `u#100 101 102 103 104 105 106 107; sym: `p#`A`A`A`B`B`C`C`C; grp: `g#`x`y`x`z`y`x`z`y; v: 1 2 3 4 5 6 7 8)",
+    )
+    .unwrap();
+
+    for q in [
+        "exec v from T where ts = 40",
+        "exec v from T where 40 = ts",
+        "exec v from T where ts < 35",
+        "exec v from T where ts <= 30",
+        "exec v from T where ts > 60",
+        "exec v from T where ts >= 60",
+        "exec v from T where ts within 25 65",
+        "exec v from T where id = 105",
+        "exec v from T where id in 101 106 999",
+        "exec v from T where sym = `B",
+        "exec v from T where sym in `A`C",
+        "exec v from T where grp = `y",
+        "exec v from T where grp in `x`z, ts >= 30, sym = `C",
+    ] {
+        let a = c.eval(&q.replace('T', "plain")).unwrap();
+        let b = c.eval(&q.replace('T', "idxed")).unwrap();
+        assert_eq!(a, b, "mismatch on {q}");
+    }
+
+    // `?` (find) on `s#, `u#, `p#, `g#
+    assert_eq!(c.eval("(`s#10 20 30 40) ? 30 99 10").unwrap().to_string(), "2 4 0");
+    assert_eq!(c.eval("(`u#`a`b`c) ? `c`x`a").unwrap().to_string(), "2 3 0");
+    assert_eq!(c.eval("(`p#`a`a`b`b`c) ? `b`z`a").unwrap().to_string(), "2 5 0");
+    assert_eq!(c.eval("(`g#`x`y`x`z) ? `z`x`w").unwrap().to_string(), "3 0 4");
+
+    // `lj`, `ij`, `pj` against `u# and `s# keyed tables
+    c.eval("ku: ([id: `u#101 104 107] w: 10 20 30); ks: ([ts: `s#20 50 80] bonus: 5 6 7)").unwrap();
+    assert_eq!(c.eval("exec w from (idxed lj ku)").unwrap().to_string(), "0N 10 0N 0N 20 0N 0N 30");
+    assert_eq!(c.eval("exec v from (idxed ij ks)").unwrap().to_string(), "2 5 8");
+    assert_eq!(c.eval("exec v from (idxed pj ([id: `u#100 107] v: 100 200))").unwrap().to_string(), "101 2 3 4 5 6 7 208");
+}

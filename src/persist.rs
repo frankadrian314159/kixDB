@@ -235,7 +235,12 @@ pub fn apply_record(ws: &mut Workspace, rec: &WalRecord) {
 pub fn export_snapshot(ws: &Workspace, ts: u64) -> SnapshotData {
     SnapshotData {
         ts,
-        vars: ws.vars.iter().map(|(&k, v)| (k, v.clone())).collect(),
+        vars: ws
+            .vars
+            .iter()
+            .filter(|(&k, _)| !crate::engine::is_ephemeral_var(k))
+            .map(|(&k, v)| (k, v.clone()))
+            .collect(),
         views: ws.views.values().cloned().collect(),
         dist: ws.dist.iter().map(|(&k, m)| (k, m.clone())).collect(),
     }

@@ -16,6 +16,7 @@ fn usage() -> ! {
          --tls-cert FILE  PEM certificate chain: also accept TLS connections (`tcps://`)\n\
          --tls-key FILE   PEM private key of that certificate\n\
          --tls           accept TLS with a new self-signed certificate, written to kix-cert.pem\n\
+         --force-tls     reject plaintext connections (requires --tls or --tls-cert/--tls-key)\n\
          --no-sync       disable per-write fsync on WAL appends"
     );
     std::process::exit(2)
@@ -36,7 +37,7 @@ fn main() {
     let mut bind = "127.0.0.1".to_string();
     let mut auth = std::env::var("KIX_AUTH").ok();
     let mut opts = StorageOptions::default();
-    let (mut cert, mut key, mut self_signed) = (None::<String>, None::<String>, false);
+    let (mut cert, mut key, mut self_signed, mut force_tls) = (None::<String>, None::<String>, false, false);
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -48,6 +49,7 @@ fn main() {
             "--tls-cert" => cert = Some(args.next().unwrap_or_else(|| usage())),
             "--tls-key" => key = Some(args.next().unwrap_or_else(|| usage())),
             "--tls" => self_signed = true,
+            "--force-tls" => force_tls = true,
             "-h" | "--help" => usage(),
             other if !other.starts_with('-') && dir.is_none() => dir = Some(other.to_string()),
             _ => usage(),
@@ -89,6 +91,9 @@ fn main() {
     };
     if let Some((c, k)) = pem {
         ipc_cfg.tls = Some(tls_server_config(&c, &k).unwrap_or_else(|e| fail(&e.to_string())));
+        ipc_cfg.force_tls = force_tls;
+    } else if force_tls {
+        fail("--force-tls requires --tls or --tls-cert/--tls-key");
     }
 
     let listener = match Listener::bind(server, (bind.as_str(), port), ipc_cfg) {

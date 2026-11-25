@@ -77,4 +77,63 @@ fn tls_and_plain_clients_share_a_port() {
     std::fs::write(dir.path().join("other.pem"), other).unwrap();
     let other = dir.path().join("other.pem").display().to_string();
     assert!(IpcClient::connect_tls(&addr, "alice", "s3cr3t", &other).is_err());
+
+    // `--force-tls` (`IpcConfig::force_tls = true`) rejects plaintext clients while allowing TLS clients
+    let mut forced = IpcConfig::with_single_user("alice", "s3cr3t");
+    forced.tls = Some(kixdb::ipc::tls_server_config(cert.as_bytes(), key.as_bytes()).unwrap());
+    forced.force_tls = true;
+    let forced_listener = Listener::bind(Server::new(), ("127.0.0.1", 0), forced).unwrap();
+    let forced_addr = forced_listener.local_addr().to_string();
+    assert!(IpcClient::connect_addr(&forced_addr, "alice", "s3cr3t").is_err());
+    let mut forced_tls = IpcClient::connect_tls(&forced_addr, "alice", "s3cr3t", &ca).unwrap();
+    assert_eq!(forced_tls.query_str("2 + 3").unwrap().to_string(), "5");
+}
+
+#[test]
+fn remote_introspection_does_not_eval_views_and_cli_connect_supports_dot_commands() {
+    let srv = Server::new();
+    {
+        let mut c = srv.connect();
+        c.eval("counter: 0; boom:: (counter:: counter + 1; 42); .analytics.factor: 7; f: {[x] x + 1}").unwrap();
+    }
+    let listener = Listener::bind(srv.clone(), ("127.0.0.1", 0), IpcConfig::default()).unwrap();
+    let addr = listener.local_addr().to_string();
+
+    let mut cli = IpcClient::connect_addr(&addr, "admin", "").unwrap();
+    let ns = kixdb::inspect::remote_namespaces(&mut cli);
+    assert!(ns.contains(&".".to_string()) && ns.contains(&".analytics".to_string()), "{ns:?}");
+
+    // `remote_definition` must inspect `boom` WITHOUT evaluating it (`counter` stays 0!)
+    let def = kixdb::inspect::remote_definition(&mut cli, "boom").unwrap();
+    assert!(def.starts_with("boom::"), "got: {def}");
+    assert_eq!(cli.query_str("counter").unwrap().to_string(), "0");
+
+    let plan = kixdb::inspect::remote_explain(&mut cli, "select from ([] a: 1 2) where a = 1").unwrap();
+    assert!(plan[0].contains("qSQL SELECT"), "{plan:?}");
+
+    // Test `kix --connect` `.import`, `.schema`, `.plan`
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = tmp.path().join("items.csv");
+    std::fs::write(&csv, "sym,qty\nAAPL,10\nMSFT,25\n").unwrap();
+    let bin = env!("CARGO_BIN_EXE_kix");
+    let script = format!(
+        ".import --new {} items\n.schema items\n.plan select from items where sym = `AAPL\nexec sum qty from items\n\\\\\n",
+        csv.display()
+    );
+    let mut child = Command::new(bin)
+        .args(["--connect", &addr])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    child.stdin.as_mut().unwrap().write_all(script.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("imported 2 row(s) into items"), "stdout: {stdout}");
+    assert!(stdout.contains("items:"), "stdout: {stdout}");
+    assert!(stdout.contains("qSQL SELECT"), "stdout: {stdout}");
+    assert!(stdout.contains("35"), "stdout: {stdout}");
 }

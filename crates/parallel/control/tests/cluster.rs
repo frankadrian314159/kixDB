@@ -344,12 +344,52 @@ fn state_file_picks_the_cluster_up_again() {
         s.eval("v:: exec sum v from t").unwrap();
     }
     let cluster = Cluster::open(&state, &kix_shared_ces::ClusterConfig::default()).unwrap();
+    // a second control node cannot open the same locked state file simultaneously
+    assert!(Cluster::open(&state, &kix_shared_ces::ClusterConfig::default()).is_err());
     let mut s = cluster.session();
     assert_eq!(s.eval("f 3").unwrap(), K::Long(30));
     // new rows are numbered after the old ones
     s.eval("`t insert (`f`a; 6 7)").unwrap();
     assert_eq!(s.eval("exec v from t").unwrap().to_string(), "1 2 3 4 5 6 7");
     assert_eq!(s.eval("v").unwrap(), K::Long(28));
+    drop(s);
+    drop(cluster);
+
+    // corrupting `cluster.state` is caught by its CRC32 checksum
+    let mut bytes = std::fs::read(&state).unwrap();
+    *bytes.last_mut().unwrap() ^= 0xff;
+    std::fs::write(&state, bytes).unwrap();
+    assert!(Cluster::open(&state, &kix_shared_ces::ClusterConfig::default()).is_err());
+}
+
+#[test]
+fn broadcast_and_shuffle_joins_do_not_write_to_shard_wal() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let d0 = tempfile::tempdir().unwrap();
+    let d1 = tempfile::tempdir().unwrap();
+    let s0_srv = kixdb::Server::open(d0.path()).unwrap();
+    let s1_srv = kixdb::Server::open(d1.path()).unwrap();
+    let sh0 = rt.block_on(kix_storage::spawn(kix_storage::ShardNode::new(0, s0_srv.clone()), "127.0.0.1:0".parse().unwrap())).unwrap();
+    let sh1 = rt.block_on(kix_storage::spawn(kix_storage::ShardNode::new(1, s1_srv.clone()), "127.0.0.1:0".parse().unwrap())).unwrap();
+    let cfg = kix_shared_ces::ClusterConfig {
+        shards: vec![
+            kix_shared_ces::ShardInfo { id: 0, addr: sh0.addr.to_string() },
+            kix_shared_ces::ShardInfo { id: 1, addr: sh1.addr.to_string() },
+        ],
+    };
+    let cluster = Cluster::connect(&cfg).unwrap();
+    let mut s = cluster.session();
+    s.eval("orders: ([] oid: 1 2 3 4; cid: 10 20 10 30; amt: 50 60 70 80)").unwrap();
+    s.eval("cust: ([cid: 10 20 30] tier: `gold`silver`gold)").unwrap();
+
+    let wal_before = (s0_srv.storage_stats().wal_records, s1_srv.storage_stats().wal_records);
+    // Broadcast join (`orders` sharded by `oid`, `cust` sharded by `cid` -> `cust` moved to `.kix.tmp.*`)
+    assert_eq!(s.eval("exec sum amt from (orders lj cust) where tier = `gold").unwrap(), K::Long(200));
+    // Force shuffle by setting broadcast limit to 1 row
+    cluster.set_broadcast_limit(1);
+    assert_eq!(s.eval("exec sum amt from (orders lj cust) where tier = `silver").unwrap(), K::Long(60));
+    let wal_after = (s0_srv.storage_stats().wal_records, s1_srv.storage_stats().wal_records);
+    assert_eq!(wal_before, wal_after, "read-only broadcast/shuffle joins must not append to shard WAL");
 }
 
 #[test]

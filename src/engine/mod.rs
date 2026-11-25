@@ -205,6 +205,15 @@ impl<'a> Engine<'a> {
     }
 
     pub fn eval_str(&mut self, src: &str) -> KResult<K> {
+        if let Some(q) = src.trim().strip_prefix("EXPLAIN ") {
+            let stmts = parse_script(q)?;
+            let lines: Vec<K> = stmts
+                .iter()
+                .enumerate()
+                .map(|(idx, s)| K::string(&format!("Statement {}: {}", idx + 1, crate::describe_expr_plan(s, self.ws))))
+                .collect();
+            return Ok(K::Vector(ColVec::General(Attr::None, Arc::new(lines))));
+        }
         let stmts = parse_script(src)?;
         if stmts.is_empty() {
             return Ok(K::Null);
@@ -293,17 +302,20 @@ impl<'a> Engine<'a> {
     }
 
     /// Set (`Some`) or drop (`None`) several fully qualified globals as one log record, so that a crash or a replica sees
-    /// all of the changes or none.
+    /// all of the changes or none. Ephemeral `.kix.tmp.*` shuffle/broadcast tables stay in memory only.
     pub fn set_globals(&mut self, changes: Vec<(SymId, Option<K>)>) -> KResult<()> {
-        let ops = changes
+        let ops: Vec<LogOp> = changes
             .iter()
+            .filter(|(name, _)| !is_ephemeral_var(*name))
             .map(|(name, val)| match val {
                 Some(val) => LogOp::SetVar { name: *name, val: val.clone() },
                 None => LogOp::DropVar { name: *name },
             })
             .collect();
-        self.record_ops(ops)?;
-        self.ws.invalidate_views();
+        if !ops.is_empty() {
+            self.record_ops(ops)?;
+            self.ws.invalidate_views();
+        }
         for (name, val) in changes {
             self.ws.views.remove(&name);
             match val {
@@ -439,7 +451,7 @@ impl<'a> Engine<'a> {
             ".z.i" => Ok(Some(K::Int(std::process::id() as i32))),
             ".z.u" => Ok(Some(K::Sym(intern(&self.session.login)))),
             ".z.o" => Ok(Some(K::Sym(intern(if cfg!(windows) { "w64" } else if cfg!(target_os = "macos") { "m64" } else { "l64" })))),
-            ".Q.en" | ".Q.dpft" | ".Q.s" | ".kix.dist" => Ok(Some(K::Func(Func::Prim(intern(s))))),
+            ".Q.en" | ".Q.dpft" | ".Q.s" | ".kix.dist" | ".kix.objects" | ".kix.def" => Ok(Some(K::Func(Func::Prim(intern(s))))),
             _ => Ok(None),
         }
     }
@@ -684,7 +696,7 @@ impl<'a> Engine<'a> {
         let mut any_vec = false;
         for v in &raw_vals {
             if let K::Vector(cv) = v {
-                if !matches!(cv, ColVec::Char(_, _)) || raw_vals.len() == 1 {
+                if !matches!(cv, ColVec::Char(_, _)) || cv.is_empty() || raw_vals.len() == 1 {
                     any_vec = true;
                     max_len = max_len.max(cv.len());
                 }
@@ -759,6 +771,11 @@ impl<'a> Engine<'a> {
                 }
             }
             ".Q.s" => Ok(K::string(&x.q_repr())),
+            ".kix.objects" => crate::inspect::workspace_objects_table(self.ws),
+            ".kix.def" => {
+                let target = x.as_str().unwrap_or_else(|| x.cell_text());
+                crate::inspect::workspace_definition(self.ws, &target)
+            }
             _ => ops::eval_unary_prim(&name, x),
         }
     }
@@ -919,7 +936,7 @@ impl<'a> Engine<'a> {
                 match n.as_str() {
                     "aj" | "aj0" | "ej" | "ssr" => 3,
                     "wj" | "wj1" | ".Q.dpft" => 4,
-                    ".Q.s" => 1,
+                    ".Q.s" | ".kix.objects" | ".kix.def" => 1,
                     ".kix.dist" => 2,
                     _ if is_unary_keyword(&n) => 1,
                     _ => 2,
@@ -1690,6 +1707,11 @@ impl<'a> Engine<'a> {
             _ => Err(KError::nyi(format!("unknown system command \\{cmd}"))),
         }
     }
+}
+
+pub(crate) fn is_ephemeral_var(name: SymId) -> bool {
+    let s = resolve(name);
+    s.starts_with(".kix.tmp.") || s.starts_with(".kix.ord..kix.tmp.")
 }
 
 fn is_ambivalent_prim(func: &Func) -> bool {

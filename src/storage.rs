@@ -20,6 +20,7 @@ const FLAT_MAGIC: [u8; 4] = [0xfe, 0x20, b'K', b'X'];
 pub enum PartKind {
     Date,
     Month,
+    Year,
     Int,
 }
 
@@ -292,6 +293,12 @@ fn parse_partition_dir_name(name: &str) -> Option<(PartKind, SymId, K)> {
             return Some((PartKind::Month, intern("month"), K::Month((y - 2000) * 12 + (m - 1))));
         }
     }
+    if name.len() == 4 && name.bytes().all(|b| b.is_ascii_digit()) {
+        let y: i32 = name.parse().ok()?;
+        if (1800..=2999).contains(&y) {
+            return Some((PartKind::Year, intern("year"), K::Int(y)));
+        }
+    }
     if !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()) {
         let n: i64 = name.parse().ok()?;
         return Some((PartKind::Int, intern("int"), K::Long(n)));
@@ -299,7 +306,7 @@ fn parse_partition_dir_name(name: &str) -> Option<(PartKind, SymId, K)> {
     None
 }
 
-/// Load a partitioned HDB table, pruning partitions when the first `where` clause constrains the partition column!
+/// Load a partitioned HDB table, pruning partitions across all `where` clauses that constrain the partition column!
 pub fn load_partitioned_filtered(
     pt: &PartitionedTable,
     where_clauses: &[Expr],
@@ -315,15 +322,16 @@ pub fn load_partitioned_filtered(
         on_disk
     });
     let needed = needed.as_deref();
-    let selected_slices: Vec<&PartitionSlice> = if let Some(first_wc) = where_clauses.first() {
-        if let Some(pred) = match_partition_predicate(pt.part_col, first_wc, &mut eval_rhs)? {
-            pt.slices.iter().filter(|s| pred(&s.part_val)).collect()
-        } else {
-            pt.slices.iter().collect()
+    let mut selected_slices: Vec<&PartitionSlice> = pt.slices.iter().collect();
+    for wc in where_clauses {
+        // Stop pruning if an earlier clause references virtual row index `i` (whose numbering depends on prior clauses).
+        if wc.any(&mut |x| matches!(x, Expr::Var(s) if resolve(*s) == "i")) {
+            break;
         }
-    } else {
-        pt.slices.iter().collect()
-    };
+        if let Some(pred) = match_partition_predicate(pt.part_col, &pt.cols, wc, &mut eval_rhs)? {
+            selected_slices.retain(|s| pred(&s.part_val));
+        }
+    }
 
     if selected_slices.is_empty() {
         // Return an empty schema-preserving Flip!
@@ -331,6 +339,7 @@ pub fn load_partitioned_filtered(
         let p_empty = match pt.kind {
             PartKind::Date => ColVec::Date(Attr::Sorted, Arc::new(vec![])),
             PartKind::Month => ColVec::Month(Attr::Sorted, Arc::new(vec![])),
+            PartKind::Year => ColVec::Int(Attr::Sorted, Arc::new(vec![])),
             PartKind::Int => ColVec::Long(Attr::Sorted, Arc::new(vec![])),
         };
         vals.push(p_empty);
@@ -367,50 +376,51 @@ type PartPred = Box<dyn Fn(&K) -> bool>;
 
 fn match_partition_predicate(
     part_col: SymId,
+    table_cols: &[SymId],
     wc: &Expr,
     eval_rhs: &mut impl FnMut(&Expr) -> KResult<K>,
 ) -> KResult<Option<PartPred>> {
     let Expr::Binary { op, lhs, rhs } = wc else {
         return Ok(None);
     };
-    let Expr::Var(col_var) = &**lhs else {
-        return Ok(None);
-    };
-    if *col_var != part_col {
-        return Ok(None);
-    }
     let op_s = resolve(*op);
+    let no_cols = |e: &Expr| !e.any(&mut |x| matches!(x, Expr::Var(s) | Expr::Field(_, s) if table_cols.contains(s)));
+    let rhs_expr = match (&**lhs, &**rhs, op_s.as_str()) {
+        (Expr::Var(c), r, _) if *c == part_col && no_cols(r) => r,
+        (l, Expr::Var(c), "=") if *c == part_col && no_cols(l) => l,
+        _ => return Ok(None),
+    };
     match op_s.as_str() {
         "=" => {
-            let v = eval_rhs(rhs)?;
-            Ok(Some(Box::new(move |pv| pv == &v)))
+            let v = eval_rhs(rhs_expr)?;
+            Ok(Some(Box::new(move |pv| pv.k_cmp(&v) == std::cmp::Ordering::Equal)))
         }
         "<" => {
-            let v = eval_rhs(rhs)?;
+            let v = eval_rhs(rhs_expr)?;
             Ok(Some(Box::new(move |pv| pv.k_cmp(&v) == std::cmp::Ordering::Less)))
         }
         "<=" => {
-            let v = eval_rhs(rhs)?;
+            let v = eval_rhs(rhs_expr)?;
             Ok(Some(Box::new(move |pv| pv.k_cmp(&v) != std::cmp::Ordering::Greater)))
         }
         ">" => {
-            let v = eval_rhs(rhs)?;
+            let v = eval_rhs(rhs_expr)?;
             Ok(Some(Box::new(move |pv| pv.k_cmp(&v) == std::cmp::Ordering::Greater)))
         }
         ">=" => {
-            let v = eval_rhs(rhs)?;
+            let v = eval_rhs(rhs_expr)?;
             Ok(Some(Box::new(move |pv| pv.k_cmp(&v) != std::cmp::Ordering::Less)))
         }
         "in" => {
-            let v = eval_rhs(rhs)?;
-            let set: HashSet<Vec<u8>> = match v {
-                K::Vector(cv) => (0..cv.len()).map(|i| cv.get_atom(i).hash_key()).collect(),
-                atom => [atom.hash_key()].into_iter().collect(),
+            let v = eval_rhs(rhs_expr)?;
+            let items: Vec<K> = match v {
+                K::Vector(cv) => (0..cv.len()).map(|i| cv.get_atom(i)).collect(),
+                atom => vec![atom],
             };
-            Ok(Some(Box::new(move |pv| set.contains(&pv.hash_key()))))
+            Ok(Some(Box::new(move |pv| items.iter().any(|it| pv.k_cmp(it) == std::cmp::Ordering::Equal))))
         }
         "within" => {
-            let v = eval_rhs(rhs)?;
+            let v = eval_rhs(rhs_expr)?;
             if let K::Vector(cv) = v {
                 if cv.len() == 2 {
                     let lo = cv.get_atom(0);

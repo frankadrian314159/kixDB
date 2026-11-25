@@ -31,15 +31,16 @@ kix-shard --id 1 --listen 10.0.0.4:50051 --data s1
 ```
 
 ```
-kix-cluster --config cluster.json --state cluster.state --listen 5000 -u ann:secret   # serve clients
+kix-cluster --config cluster.json --state cluster.state --listen 5000 -u ann:secret [--tls] [--force-tls]
 kix-cluster --config cluster.json --state cluster.state --plan < script.q             # or run a script
 ```
 
 From Rust: `Cluster::connect(&config)` or `Cluster::open(state_file, &config)`, then `cluster.session()`,
 `session.eval(q)` and `session.last_plan()`. Do not call these from inside a tokio runtime.
 
-**Keep the state file.** It records the shards, table schemas, distribution, and the variables, functions and views of
-the control node. A control node started without it does not know about data already on the shards.
+**Keep the state file.** It is checksummed (`KXCS` + CRC32), locked against concurrent processes (`cluster.state.lock`),
+and records the shards, table schemas, distribution, and the variables, functions and views of the control node. A control
+node started without it does not know about data already on the shards.
 
 ## Distribution
 
@@ -140,8 +141,9 @@ gathered.
 
 ## Concurrency
 
-There is one control node. It lets pushed-down reads run together and gives every other statement, including gathered
-reads, the cluster to itself.
+There is one control node. Pushed-down reads and selective partial gathers (`slice`) share the cluster concurrently
+(and temporary `.kix.tmp.*` broadcast/shuffle join tables stay in shard RAM without writing to the WAL or Raft log);
+writes and full-table mirror gathers take exclusive cluster access.
 
 ## Replication
 

@@ -560,6 +560,14 @@ impl App {
                             ui.label("Password:");
                             ui.add(egui::TextEdit::singleline(&mut d.target.password).password(true));
                             ui.end_row();
+                            ui.label("TLS:");
+                            ui.checkbox(&mut d.target.tls, "Encrypt with TLS (tcps://)");
+                            ui.end_row();
+                            if d.target.tls {
+                                ui.label("CA cert:");
+                                ui.text_edit_singleline(&mut d.target.ca_cert);
+                                ui.end_row();
+                            }
                         });
                         if let Some(err) = &d.error {
                             ui.colored_label(ERROR, err);

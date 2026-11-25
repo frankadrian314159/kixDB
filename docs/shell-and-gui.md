@@ -25,14 +25,14 @@ q's `\` commands work (see [language.md](language.md#system-commands)), plus `\p
 | `.storage` `.checkpoint` | storage statistics, write a snapshot |
 | `.help` `.quit` | help, exit |
 
-With `--connect`, expressions run on the server; `.import`, `.schema` and `.plan` need a local workspace. A cluster
-answers `EXPLAIN query` instead of `.plan`.
+With `--connect` (`tcps://host:port` for TLS), expressions as well as `.import`, `.schema` and `.plan` run against the
+remote server or `kix-cluster` gateway.
 
 ## kix-gui
 
 ```
 cargo run --release --features gui --bin kix-gui -- [DATA_DIR] [--embedded]
-cargo run --release --features gui --bin kix-gui -- --connect HOST[:PORT] [-U USER] [-P PASSWORD]
+cargo run --release --features gui --bin kix-gui -- --connect [tcps://]HOST[:PORT] [-U USER] [-P PASSWORD] [--tls] [--tls-ca FILE]
 ```
 
 Without `--connect` it uses a server already listening on `127.0.0.1:5000` (credentials from `KIX_USER` and

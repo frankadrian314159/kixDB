@@ -2211,12 +2211,15 @@ name = "kix-control"
 version = "0.1.0"
 dependencies = [
  "arrow-flight",
+ "chrono",
+ "crc32fast",
  "futures",
  "kix-raft",
  "kix-shared-ces",
  "kix-storage",
  "kixdb",
  "postcard",
+ "rand",
  "serde",
  "tempfile",
  "tokio",

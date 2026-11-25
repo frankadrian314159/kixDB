@@ -33,12 +33,15 @@ latest changes in a crash.
 Relative paths given to `set`, `get` and `.Q.dpft` are resolved against the workspace directory; `0:` and `.Q.en` use
 the process's current directory. The file format is kixDB's own and is not readable by kdb+.
 
-## Partitioned databases
+## Partitioned databases and column attributes
 
-Directories named `YYYY.MM.DD`, `YYYY.MM` or an integer are partitions; each table inside is splayed. The partition
-appears as the virtual column `date`, `month` or `int`.
+Directories named `YYYY.MM.DD`, `YYYY.MM`, `YYYY` (`1800..=2999`) or an integer are partitions; each table inside is
+splayed. The partition appears as the virtual column `date`, `month`, `year` or `int`.
 
-* A `where` clause on the partition column prunes partitions when it is the **first** clause (`=`, `<`, `<=`, `>`,
-  `>=`, `in`, `within`).
+* Any `where` clause on the partition column prunes partitions (`=`, `<`, `<=`, `>`, `>=`, `in`, `within`), whether it is
+  the first clause or appears after other row-wise filters.
 * A `select` or `exec` that lists its columns reads only the columns it mentions.
+* Column attributes accelerate lookups and joins: `` `s# `` uses `O(log N)` binary search (`=`, `<`, `<=`, `>`, `>=`, `in`,
+  `within`, `?`, keyed joins), while `` `u# ``, `` `p# `` (such as HDB `sym` written by `.Q.dpft`) and `` `g# `` maintain
+  cached `O(1)` hash, run-range, and inverted indexes.
 * Selected partitions are loaded into memory for each query; nothing is memory-mapped.

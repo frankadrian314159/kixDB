@@ -2196,9 +2196,6 @@ pub fn parse_atom_from_str(type_ch: char, s: &str) -> K {
             K::Month(NULL_INT)
         }
         'p' => {
-            if let Ok(toks) = crate::lexer::tokenize(&t.replace(['-', 'T', ' '], &"").to_string()) {
-                let _ = toks;
-            }
             let norm = t.replace('-', ".").replace(['T', ' '], "D");
             if let Ok(mut toks) = crate::lexer::tokenize(&norm) {
                 if let Some(crate::lexer::Tok::Lit(K::Timestamp(ns))) = toks.drain(..1).next() {
@@ -2307,6 +2304,16 @@ fn find_or_roll_op(lhs: &K, rhs: &K) -> KResult<K> {
 
     // 2. Find (`vec ? x`): first index of each item of `rhs` in `lhs` (`count lhs` if not found, as in kdb+!)
     if let K::Vector(hay) = lhs {
+        if hay.attr() != Attr::None {
+            if let K::Vector(needles) = rhs {
+                let out: Vec<i64> = (0..needles.len())
+                    .map(|i| crate::index::find_first(hay, &needles.get_atom(i)).unwrap_or_else(|| hay.len()) as i64)
+                    .collect();
+                return Ok(K::Vector(ColVec::Long(Attr::None, Arc::new(out))));
+            } else if let Some(idx) = crate::index::find_first(hay, rhs) {
+                return Ok(K::Long(idx as i64));
+            }
+        }
         let mut first_idx: HashMap<Vec<u8>, i64> = HashMap::with_capacity(hay.len());
         for i in 0..hay.len() {
             first_idx.entry(hay.get_atom(i).hash_key()).or_insert(i as i64);
