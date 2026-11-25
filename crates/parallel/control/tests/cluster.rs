@@ -152,6 +152,13 @@ fn everything_else_is_gathered_and_still_exact() {
     p.plan("select med price by ex from trade", "gather trade (2 column(s)");
     p.plan("select from trade where price > avg price", "gather trade");
     p.plan("select d: deltas price from trade where size > 10", "gather trade (1 column(s), 1 filter(s)");
+    // `i` numbers the rows of the whole table, also after a filter
+    p.check("exec i from trade where size > 100");
+    p.check("exec i from trade where size > 100, i < 50");
+    p.check("select i, price from trade where size > 100, ex = `N");
+    p.check("select f: first i, s: sum i, n: count i by ex from trade where size > 100");
+    p.check("exec last i by sym from trade where price > 110");
+    p.check("exec i from inst where lot > 20");
     p.plan("select i, price from trade where sym = `IBM", "gather");
     p.plan("update m: 3 mavg price by sym from trade", "gather trade");
     p.check("select first price, last size by ex from trade");

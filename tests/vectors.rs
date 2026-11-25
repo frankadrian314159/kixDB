@@ -131,6 +131,8 @@ fn aggregates_over_all_groups_at_once_match_the_group_by_group_results() {
             "count distinct s", "last distinct j", "sum f * 1 - j", "sum j in some", "sum not s in `a`c", "sum j within 2 5",
             "(sum j * s = `a) % sum j", "100.0 * (sum f) % count i", "0 ^ min j", "neg max f", "(first d) + count i",
             "j wsum f", "j wavg f", "not min d", "null first w", "count first w", "sum 1", "first some", "sum j + some",
+            // the same for every group
+            "1b", "2 + 3", "neg 2.5", "`x", "0n",
         ]
         .map(String::from),
     );
@@ -146,6 +148,7 @@ fn aggregates_over_all_groups_at_once_match_the_group_by_group_results() {
     }
     for (code, expected) in [
         ("value exec sum j by k from t", "4 10 5"),
+        ("(select ok: 1b, n: count i by k from t) ~ ([k: 1 2 3] ok: 111b; n: 2 3 1)", "1b"),
         // keys sort by every column, the first one first
         ("(key select count i by s, k from t) ~ ([] s: ``a`b`b; k: 1 2 1 3)", "1b"),
         ("exec r from select r: (sum j) % count i, q: sums j by k from t", "2 3.3333333 5"),
@@ -193,7 +196,7 @@ fn queries_see_the_columns_they_name_however_they_name_them() {
         ("exec c from t where a > 1, b < 40", "`x`y"),
         ("exec alias \"a + b\" from t where a > 3", ",44"),
         ("count select i from t where a > 1, b < 40", "2"),
-        ("exec count i from t where a > 1, i > 0", "2"),
+        ("exec count i from t where a > 1, i > 0", "3"),
         ("cols select from t where a > 1, b < 40", "`a`b`c`s"),
         ("exec s from t where c in `x`z, a > 2", ",\"ss\""),
         // names reached at run time

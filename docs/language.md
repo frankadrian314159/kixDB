@@ -43,7 +43,8 @@ update cols by groups from t where c                    / from `t changes t in p
 delete from t where c                                    / delete c1, c2 from t
 ```
 
-`where` clauses filter one after another: each sees only the rows the previous ones kept. `i` is the row number.
+`where` clauses filter one after another: each sees only the rows the previous ones kept. `i` is a row's number in the
+whole table, counted from 0, wherever it is used: also in a later `where` clause, after a filter and within a group.
 Grouped results are keyed and sorted by their groups. Functional forms `?[t;c;b;a]` and `![t;c;b;a]` are supported.
 
 ## Joins

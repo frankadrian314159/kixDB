@@ -168,3 +168,30 @@ fn joins_match_keys_by_type_and_value_however_they_are_looked_up() {
         assert_eq!(c.eval(code).unwrap().to_string(), expected, "{code}");
     }
 }
+
+#[test]
+fn i_is_the_row_number_in_the_whole_table() {
+    let mut c = Server::new().connect();
+    c.eval("t: ([] g: 10#`a`b; v: til 10); s: ([] v: `s#til 10)").unwrap();
+    for (code, expected) in [
+        ("exec i from t where v > 5", "6 7 8 9"),
+        // a later clause, and a clause on `i` itself, after a filter
+        ("exec i from t where v > 2, i < 6", "3 4 5"),
+        ("exec v from t where v > 3, i in 5 7", "5 7"),
+        ("exec i from s where v > 5, i < 8", "6 7"),
+        // columns computed from it, with and without a column list of aggregates
+        ("exec i - v from t where v > 7", "0 0"),
+        // within groups: computed for all groups at once, and group by group (the lambda)
+        ("value exec first i by g from t where v > 3", "4 5"),
+        ("value exec sum i by g from t where v > 3", "18 21"),
+        ("raze value exec {x} i by g from t where v > 6", "8 7 9"),
+        ("key exec count v by 3 xbar i from t where v > 4", "`s#3 6 9"),
+        // updates and deletes
+        ("exec j from update j: i from t where v > 7", "0N 0N 0N 0N 0N 0N 0N 0N 8 9"),
+        ("exec j from update j: i by g from t where v > 7", "0N 0N 0N 0N 0N 0N 0N 0N 8 9"),
+        ("exec j from update j: sum i by g from t where v > 5", "0N 0N 0N 0N 0N 0N 14 16 14 16"),
+        ("exec v from delete from t where v > 2, i > 5", "0 1 2 3 4 5"),
+    ] {
+        assert_eq!(c.eval(code).unwrap().to_string(), expected, "{code}");
+    }
+}

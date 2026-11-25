@@ -164,9 +164,13 @@ impl SessionState {
 
 // ----- Execution Engine -----------------------------------------------------
 
+/// For the rows of a table scope, their numbers in the whole table (what `i` gives); `None` when the scope holds every
+/// row, in order.
+pub type RowNumbers = Option<Arc<Vec<usize>>>;
+
 struct TableScope {
     flip: Flip,
-    orig_i: Option<Vec<usize>>,
+    rows: RowNumbers,
 }
 
 struct ReturnSignal(K);
@@ -274,14 +278,12 @@ impl<'a> Engine<'a> {
     }
 
     pub fn eval_in_table_scope(&mut self, flip: &Flip, expr: &Expr) -> KResult<K> {
-        self.table_scopes.push(TableScope { flip: flip.clone(), orig_i: None });
-        let r = self.eval_expr(expr);
-        self.table_scopes.pop();
-        r
+        self.eval_in_rows(flip, None, expr)
     }
 
-    pub fn eval_in_table_scope_with_orig_i(&mut self, flip: &Flip, orig_i: &[usize], expr: &Expr) -> KResult<K> {
-        self.table_scopes.push(TableScope { flip: flip.clone(), orig_i: Some(orig_i.to_vec()) });
+    /// Evaluate `expr` over the columns of `flip`, which holds the rows numbered `rows` of a table.
+    pub fn eval_in_rows(&mut self, flip: &Flip, rows: RowNumbers, expr: &Expr) -> KResult<K> {
+        self.table_scopes.push(TableScope { flip: flip.clone(), rows });
         let r = self.eval_expr(expr);
         self.table_scopes.pop();
         r
@@ -365,8 +367,8 @@ impl<'a> Engine<'a> {
         if let Some(ts) = self.table_scopes.last() {
             let s = resolve(name);
             if s == "i" {
-                let idx: Vec<i64> = match &ts.orig_i {
-                    Some(orig) => orig.iter().map(|&r| r as i64).collect(),
+                let idx: Vec<i64> = match &ts.rows {
+                    Some(rows) => rows.iter().map(|&r| r as i64).collect(),
                     None => (0..ts.flip.nrows() as i64).collect(),
                 };
                 return Ok(K::Vector(ColVec::Long(Attr::None, Arc::new(idx))));

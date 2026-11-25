@@ -3,7 +3,7 @@ use crate::ast::{ColSpec, Expr, QSql, QSqlKind};
 use crate::engine::ops::{
     aggregate_rows, broadcast_atoms, distinct_op, eval_binary_prim, eval_unary_prim, group_rows, sort_order,
 };
-use crate::engine::Engine;
+use crate::engine::{Engine, RowNumbers};
 use crate::error::{KError, KResult};
 use crate::parser::infer_col_name;
 use crate::sym::{intern, resolve, SymId};
@@ -79,12 +79,12 @@ impl<'a> Engine<'a> {
         Flip { cols: keep.iter().map(|&c| flip.cols[c]).collect(), vals: keep.iter().map(|&c| flip.vals[c].clone()).collect() }
     }
 
-    /// The values of `e` on all rows of `flip`, when each depends on its own row only.
-    fn row_values(&mut self, flip: &Flip, e: &Expr) -> Option<ColVec> {
+    /// The values of `e` on all rows of `flip` (numbered `rows`), when each depends on its own row only.
+    fn row_values(&mut self, flip: &Flip, rows: &RowNumbers, e: &Expr) -> Option<ColVec> {
         if !row_by_row(flip, e) {
             return None;
         }
-        match self.eval_in_table_scope(flip, e).ok()? {
+        match self.eval_in_rows(flip, rows.clone(), e).ok()? {
             // a computed general list may not have the type that a group's own values would
             K::Vector(v) if v.len() == flip.nrows() && (matches!(e, Expr::Var(_)) || !matches!(v, ColVec::General(..))) => Some(v),
             _ => None,
@@ -94,7 +94,7 @@ impl<'a> Engine<'a> {
     /// `e` for all `groups` of `flip`'s rows at once: the arguments of its aggregates are computed once over all rows, so
     /// that a group only gathers and aggregates values. The result has an item per group (or is an atom, for a constant);
     /// `None` when `e` is more than aggregates and item-by-item verbs on them, or fails.
-    fn by_groups(&mut self, flip: &Flip, groups: &[Vec<usize>], e: &Expr) -> Option<K> {
+    fn by_groups(&mut self, flip: &Flip, rows: &RowNumbers, groups: &[Vec<usize>], e: &Expr) -> Option<K> {
         let per_group = |f: &dyn Fn(&[usize]) -> KResult<K>| {
             let items = groups.iter().map(|g| f(g)).collect::<KResult<Vec<K>>>().ok()?;
             Some(K::Vector(ColVec::from_atoms(items)))
@@ -109,7 +109,7 @@ impl<'a> Engine<'a> {
                     Expr::Unary { op, arg } if resolve(*op) == "distinct" => (&**arg, true),
                     other => (other, false),
                 };
-                let values = self.row_values(flip, arg)?;
+                let values = self.row_values(flip, rows, arg)?;
                 let verb = resolve(*op);
                 per_group(&|g| match distinct {
                     true => eval_unary_prim(&verb, &distinct_op(&K::Vector(values.gather(g)))?),
@@ -117,16 +117,17 @@ impl<'a> Engine<'a> {
                 })
             }
             Expr::Binary { op, lhs, rhs } if is_one_of(*op, &["wsum", "wavg"]) => {
-                let (r, l) = (self.row_values(flip, rhs)?, self.row_values(flip, lhs)?);
+                let (r, l) = (self.row_values(flip, rows, rhs)?, self.row_values(flip, rows, lhs)?);
                 let verb = resolve(*op);
                 per_group(&|g| eval_binary_prim(&verb, &K::Vector(l.gather(g)), &K::Vector(r.gather(g))))
             }
             Expr::Unary { op, arg } if is_one_of(*op, &ITEMWISE_UNARY) => {
-                let (x, verb) = (atoms(self.by_groups(flip, groups, arg)?)?, resolve(*op));
+                let (x, verb) = (atoms(self.by_groups(flip, rows, groups, arg)?)?, resolve(*op));
                 broadcast_atoms(&x, &K::Null, |a, _| eval_unary_prim(&verb, a)).ok()
             }
             Expr::Binary { op, lhs, rhs } if is_one_of(*op, &ITEMWISE_BINARY) => {
-                let (r, l) = (atoms(self.by_groups(flip, groups, rhs)?)?, atoms(self.by_groups(flip, groups, lhs)?)?);
+                let r = atoms(self.by_groups(flip, rows, groups, rhs)?)?;
+                let l = atoms(self.by_groups(flip, rows, groups, lhs)?)?;
                 let verb = resolve(*op);
                 broadcast_atoms(&l, &r, |a, b| eval_binary_prim(&verb, a, b)).ok()
             }
@@ -199,26 +200,27 @@ impl<'a> Engine<'a> {
         // Sequential `where` filtering: each sub-clause sees only rows surviving prior sub-clauses!
         // `active_rows == None` represents all `0..total_nrows` rows without cloning `base_flip` up front.
         let total_nrows = base_flip.nrows();
-        let mut active_rows: Option<Vec<usize>> = None;
+        let mut active_rows: RowNumbers = None;
 
         for wc in &q.where_clauses {
             if total_nrows == 0 || active_rows.as_ref().is_some_and(|r| r.is_empty()) {
                 break;
             }
-            if let Some(indexed) = crate::index::try_filter_where(&base_flip, active_rows.as_deref(), wc, &mut |e| self.eval_expr(e))? {
-                active_rows = Some(indexed);
+            let active = active_rows.as_ref().map(|r| r.as_slice());
+            if let Some(indexed) = crate::index::try_filter_where(&base_flip, active, wc, &mut |e| self.eval_expr(e))? {
+                active_rows = Some(Arc::new(indexed));
                 continue;
             }
             match &active_rows {
                 None => {
                     let pred_k = self.eval_in_table_scope(&base_flip, wc)?;
-                    active_rows = Some(extract_where_indices(&pred_k, total_nrows)?);
+                    active_rows = Some(Arc::new(extract_where_indices(&pred_k, total_nrows)?));
                 }
                 Some(cur) => {
                     let sub_flip = self.columns_read(&base_flip, [wc]).gather(cur);
-                    let pred_k = self.eval_in_table_scope(&sub_flip, wc)?;
+                    let pred_k = self.eval_in_rows(&sub_flip, active_rows.clone(), wc)?;
                     let keep_local = extract_where_indices(&pred_k, sub_flip.nrows())?;
-                    active_rows = Some(keep_local.into_iter().map(|li| cur[li]).collect());
+                    active_rows = Some(Arc::new(keep_local.into_iter().map(|li| cur[li]).collect()));
                 }
             }
         }
@@ -229,7 +231,7 @@ impl<'a> Engine<'a> {
                     None => base_flip.take(0),
                     Some(rows) => {
                         let mut drop_mask = vec![false; total_nrows];
-                        for &r in rows {
+                        for &r in rows.iter() {
                             drop_mask[r] = true;
                         }
                         let keep_idx: Vec<usize> = (0..total_nrows).filter(|&r| !drop_mask[r]).collect();
@@ -245,15 +247,8 @@ impl<'a> Engine<'a> {
             }
 
             QSqlKind::Update => {
-                let all_idx: Vec<usize>;
-                let rows_slice: &[usize] = match &active_rows {
-                    Some(r) => r.as_slice(),
-                    None => {
-                        all_idx = (0..total_nrows).collect();
-                        &all_idx
-                    }
-                };
-                let out_flip = self.exec_update(&base_flip, rows_slice, &q.cols, q.by.as_deref())?;
+                let selected = active_rows.unwrap_or_else(|| Arc::new((0..total_nrows).collect()));
+                let out_flip = self.exec_update(&base_flip, &selected, &q.cols, q.by.as_deref())?;
                 let out_k = restore_keys(out_flip, orig_key_cols)?;
                 if let Some(sym) = inplace_target {
                     self.set_global(sym, out_k)?;
@@ -270,9 +265,9 @@ impl<'a> Engine<'a> {
                     Some(rows) => read.gather(rows),
                 };
                 if q.kind == QSqlKind::Exec {
-                    return self.exec_query_exec(&filtered, &q.cols, q.by.as_deref());
+                    return self.exec_query_exec(&filtered, &active_rows, &q.cols, q.by.as_deref());
                 }
-                let mut res = self.exec_select(&filtered, &q.cols, q.by.as_deref(), orig_key_cols)?;
+                let mut res = self.exec_select(&filtered, &active_rows, &q.cols, q.by.as_deref(), orig_key_cols)?;
                 if q.distinct {
                     if let K::Table(_) = &res {
                         res = distinct_op(&res)?;
@@ -292,6 +287,7 @@ impl<'a> Engine<'a> {
     fn exec_select(
         &mut self,
         filtered: &Flip,
+        rows: &RowNumbers,
         cols: &[ColSpec],
         by: Option<&[ColSpec]>,
         orig_keys: Option<Vec<SymId>>,
@@ -305,7 +301,7 @@ impl<'a> Engine<'a> {
                 let _ = &mut col_names;
                 let mut evaluated = Vec::with_capacity(cols.len());
                 for cs in cols {
-                    evaluated.push(self.eval_in_table_scope(filtered, &cs.expr)?);
+                    evaluated.push(self.eval_in_rows(filtered, rows.clone(), &cs.expr)?);
                 }
 
                 // Determine if any column evaluated to a vector matching `filtered.nrows()` (projection) vs all atoms (1-row summary)!
@@ -401,7 +397,7 @@ impl<'a> Engine<'a> {
                 // Evaluate `by` expressions over `filtered`
                 let mut by_vecs = Vec::with_capacity(by_specs.len());
                 for bs in by_specs {
-                    let v = self.eval_in_table_scope(filtered, &bs.expr)?;
+                    let v = self.eval_in_rows(filtered, rows.clone(), &bs.expr)?;
                     match v {
                         K::Vector(cv) if cv.len() == filtered.nrows() => by_vecs.push(cv),
                         atom if atom.is_atom() => by_vecs.push(ColVec::repeat(atom, filtered.nrows())),
@@ -413,7 +409,7 @@ impl<'a> Engine<'a> {
                     // `select ... by from t` (single group over whole table)
                     let mut out_vals = Vec::with_capacity(cols_ref.len());
                     for cs in cols_ref {
-                        let k = self.eval_in_table_scope(filtered, &cs.expr)?;
+                        let k = self.eval_in_rows(filtered, rows.clone(), &cs.expr)?;
                         out_vals.push(ColVec::from_atoms(vec![k]));
                     }
                     return Ok(K::Table(Arc::new(Flip::new(val_names, out_vals)?)));
@@ -438,7 +434,7 @@ impl<'a> Engine<'a> {
                     // Empty input with `by`: probe empty sub-flip to infer result types!
                     let mut empty_vals = Vec::with_capacity(cols_ref.len());
                     for cs in cols_ref {
-                        let sample = self.eval_in_table_scope(filtered, &cs.expr)?;
+                        let sample = self.eval_in_rows(filtered, rows.clone(), &cs.expr)?;
                         empty_vals.push(ColVec::from_atoms(vec![sample]).take(0));
                     }
                     let keys_flip = Flip::new(by_names, key_vals)?;
@@ -460,17 +456,19 @@ impl<'a> Engine<'a> {
                 // columns made of aggregates are computed for all groups at once, the others group by group
                 let at_once: Vec<Option<ColVec>> = cols_ref
                     .iter()
-                    .map(|cs| match self.by_groups(&scope, &sorted_groups, &cs.expr) {
+                    .map(|cs| match self.by_groups(&scope, rows, &sorted_groups, &cs.expr) {
                         Some(K::Vector(v)) if v.len() == ngroups => Some(v),
+                        // the same for every group, as in `select ok: 1b by ...`
+                        Some(atom) if atom.is_atom() => Some(ColVec::repeat(atom, ngroups)),
                         _ => None,
                     })
                     .collect();
                 let mut cells: Vec<Vec<K>> = vec![Vec::new(); cols_ref.len()];
                 if at_once.iter().any(Option::is_none) {
                     for grp_idx in &sorted_groups {
-                        let sub = scope.gather(grp_idx);
+                        let (sub, numbers) = (scope.gather(grp_idx), numbers_of(rows, grp_idx));
                         for (ci, cs) in cols_ref.iter().enumerate().filter(|(ci, _)| at_once[*ci].is_none()) {
-                            cells[ci].push(self.eval_in_table_scope_with_orig_i(&sub, grp_idx, &cs.expr)?);
+                            cells[ci].push(self.eval_in_rows(&sub, numbers.clone(), &cs.expr)?);
                         }
                     }
                 }
@@ -484,10 +482,10 @@ impl<'a> Engine<'a> {
         }
     }
 
-    fn exec_query_exec(&mut self, filtered: &Flip, cols: &[ColSpec], by: Option<&[ColSpec]>) -> KResult<K> {
+    fn exec_query_exec(&mut self, filtered: &Flip, rows: &RowNumbers, cols: &[ColSpec], by: Option<&[ColSpec]>) -> KResult<K> {
         if let Some(by_specs) = by {
             // `exec val by key from t` -> dictionary `keys ! vals`
-            let tbl = self.exec_select(filtered, cols, Some(by_specs), None)?;
+            let tbl = self.exec_select(filtered, rows, cols, Some(by_specs), None)?;
             if let K::KeyedTable(kt) = &tbl {
                 return Ok(exec_by_result(kt));
             }
@@ -498,12 +496,12 @@ impl<'a> Engine<'a> {
             return Ok(crate::engine::ops::first_op(&K::Table(Arc::new(filtered.clone()))));
         }
         if cols.len() == 1 && cols[0].name.is_none() {
-            return self.eval_in_table_scope(filtered, &cols[0].expr);
+            return self.eval_in_rows(filtered, rows.clone(), &cols[0].expr);
         }
         let names = resolve_col_names(cols);
         let mut vals = Vec::with_capacity(cols.len());
         for cs in cols {
-            vals.push(self.eval_in_table_scope(filtered, &cs.expr)?);
+            vals.push(self.eval_in_rows(filtered, rows.clone(), &cs.expr)?);
         }
         Ok(K::Dict(Arc::new(Dict {
             keys: Box::new(K::Vector(ColVec::Sym(Attr::None, Arc::new(names)))),
@@ -514,7 +512,7 @@ impl<'a> Engine<'a> {
     fn exec_update(
         &mut self,
         base_flip: &Flip,
-        active_rows: &[usize],
+        active_rows: &Arc<Vec<usize>>,
         cols: &[ColSpec],
         by: Option<&[ColSpec]>,
     ) -> KResult<Flip> {
@@ -525,6 +523,7 @@ impl<'a> Engine<'a> {
         let col_names = resolve_col_names(cols);
         let total = work.nrows();
         let all_selected = active_rows.len() == total;
+        let rows = (!all_selected).then(|| active_rows.clone());
 
         if let Some(by_specs) = by {
             // Grouped `update` (`update vwap: size wavg price by sym from t`): evaluate per group and scatter back!
@@ -532,7 +531,7 @@ impl<'a> Engine<'a> {
             let sub = if all_selected { read } else { read.gather(active_rows) };
             let mut by_vecs = Vec::with_capacity(by_specs.len());
             for bs in by_specs {
-                match self.eval_in_table_scope(&sub, &bs.expr)? {
+                match self.eval_in_rows(&sub, rows.clone(), &bs.expr)? {
                     K::Vector(cv) if cv.len() == sub.nrows() => by_vecs.push(cv),
                     atom if atom.is_atom() => by_vecs.push(ColVec::repeat(atom, sub.nrows())),
                     _ => return Err(KError::length("update by expression length mismatch")),
@@ -550,7 +549,7 @@ impl<'a> Engine<'a> {
 
                 for grp in &groups {
                     let gsub = sub.gather(grp);
-                    let gval = self.eval_in_table_scope(&gsub, &cs.expr)?;
+                    let gval = self.eval_in_rows(&gsub, numbers_of(&rows, grp), &cs.expr)?;
                     match gval {
                         K::Vector(cv) if cv.len() == grp.len() => {
                             for (j, &local_r) in grp.iter().enumerate() {
@@ -596,7 +595,7 @@ impl<'a> Engine<'a> {
         for (cname, cs) in col_names.into_iter().zip(cols) {
             let read = self.columns_read(&work, [&cs.expr]);
             let sub_cur = if all_selected { read } else { read.gather(active_rows) };
-            let val = self.eval_in_table_scope_with_orig_i(&sub_cur, active_rows, &cs.expr)?;
+            let val = self.eval_in_rows(&sub_cur, rows.clone(), &cs.expr)?;
             if all_selected {
                 let new_cv = match val {
                     K::Vector(cv) if cv.len() == total => cv,
@@ -846,6 +845,11 @@ pub fn resolve_col_names(specs: &[ColSpec]) -> Vec<SymId> {
         out.push(chosen);
     }
     out
+}
+
+/// The numbers in the whole table of the rows at `positions` among the rows numbered `rows`.
+fn numbers_of(rows: &RowNumbers, positions: &[usize]) -> RowNumbers {
+    Some(Arc::new(positions.iter().map(|&p| rows.as_ref().map_or(p, |rows| rows[p])).collect()))
 }
 
 /// The positions of the `true`s. Every position is written and then kept or not: there is no branch to mispredict.
