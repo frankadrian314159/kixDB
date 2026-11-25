@@ -752,7 +752,7 @@ fn incoming_rows(target: &K, rows: &K) -> KResult<(Flip, usize)> {
 
 /// The table `rows` make of `target`, the rows it had and how many came: by changes where they can be made to a copy,
 /// otherwise rebuilt.
-fn append_to_table(target: &K, rows: &K, allow_key_overwrite: bool) -> KResult<(K, usize, usize)> {
+pub(crate) fn append_to_table(target: &K, rows: &K, allow_key_overwrite: bool) -> KResult<(K, usize, usize)> {
     let (incoming, start) = incoming_rows(target, rows)?;
     let added = incoming.nrows();
     if let Some(change) = row_changes(target, &incoming, !allow_key_overwrite)? {

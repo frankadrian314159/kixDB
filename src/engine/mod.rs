@@ -243,6 +243,8 @@ pub struct Engine<'a> {
     pub session: &'a mut SessionState,
     locals: Vec<HashMap<SymId, K>>,
     table_scopes: Vec<TableScope>,
+    /// The views being computed.
+    viewing: Vec<SymId>,
     pub messages: Vec<String>,
     /// Suppress WAL/replication recording while replaying a log or installing a snapshot.
     pub replaying: bool,
@@ -266,6 +268,7 @@ impl<'a> Engine<'a> {
             session,
             locals: Vec::new(),
             table_scopes: Vec::new(),
+            viewing: Vec::new(),
             messages: Vec::new(),
             replaying: false,
         }
@@ -536,6 +539,10 @@ impl<'a> Engine<'a> {
     /// A view's value, which is kept for every reader. So it is computed from global names only, those of the view's own
     /// namespace first: the columns of a query or the variables of a function that reads it first play no part.
     fn eval_view(&mut self, view: &ViewDef) -> KResult<K> {
+        if self.viewing.contains(&view.name) {
+            return Err(KError::new("loop", format!("the view `{} depends on itself", resolve(view.name))));
+        }
+        self.viewing.push(view.name);
         let name = resolve(view.name);
         let ns = name.rfind('.').filter(|_| name.starts_with('.')).map_or("", |dot| &name[..dot]);
         let saved_ns = std::mem::replace(&mut self.session.current_ns, ns.to_string());
@@ -543,7 +550,31 @@ impl<'a> Engine<'a> {
         let value = self.eval_expr(&view.expr);
         (self.table_scopes, self.locals) = saved;
         self.session.current_ns = saved_ns;
+        self.viewing.pop();
         value
+    }
+
+    /// `.z.b`: for each name that views read, the views that read it.
+    fn dependencies(&self) -> K {
+        let mut views: Vec<&ViewDef> = self.ws.views.values().collect();
+        views.sort_by_key(|v| resolve(v.name));
+        let mut read: Vec<(SymId, Vec<SymId>)> = vec![];
+        for view in views {
+            view.expr.any(&mut |e| {
+                if let Expr::Var(name) = e {
+                    match read.iter().position(|r| r.0 == *name) {
+                        Some(i) if !read[i].1.contains(&view.name) => read[i].1.push(view.name),
+                        Some(_) => {}
+                        None if !crate::parser::is_builtin_verb(&resolve(*name)) => read.push((*name, vec![view.name])),
+                        None => {}
+                    }
+                }
+                false
+            });
+        }
+        let (names, by): (Vec<SymId>, Vec<K>) = read.into_iter().map(|(n, by)| (n, K::Vector(ColVec::Sym(Attr::None, Arc::new(by))))).unzip();
+        let keys = K::Vector(ColVec::Sym(Attr::None, Arc::new(names)));
+        K::Dict(Arc::new(Dict { keys: Box::new(keys), vals: Box::new(K::Vector(ColVec::General(Attr::None, Arc::new(by)))) }))
     }
 
     fn eval_builtin_ns(&self, s: &str) -> KResult<Option<K>> {
@@ -581,10 +612,11 @@ impl<'a> Engine<'a> {
                 Ok(Some(K::Time(ms)))
             }
             ".z.K" => Ok(Some(K::Float(4.1))),
+            ".z.b" => Ok(Some(self.dependencies())),
             ".z.i" => Ok(Some(K::Int(std::process::id() as i32))),
             ".z.u" => Ok(Some(K::Sym(intern(&self.session.login)))),
             ".z.o" => Ok(Some(K::Sym(intern(if cfg!(windows) { "w64" } else if cfg!(target_os = "macos") { "m64" } else { "l64" })))),
-            ".Q.en" | ".Q.dpft" | ".Q.s" | ".kix.dist" | ".kix.objects" | ".kix.def" => Ok(Some(K::Func(Func::Prim(intern(s))))),
+            ".Q.en" | ".Q.dpft" | ".Q.s" | ".Q.s1" | ".kix.dist" | ".kix.objects" | ".kix.def" => Ok(Some(K::Func(Func::Prim(intern(s))))),
             _ => Ok(None),
         }
     }
@@ -719,13 +751,20 @@ impl<'a> Engine<'a> {
                     self.record_ops(vec![LogOp::SetView { def: vdef.clone() }])?;
                     self.ws.vars.remove(&qname);
                     self.ws.views.insert(qname, vdef);
+                    self.ws.invalidate_views();
                     return Ok(K::Null);
                 }
 
                 let rhs = self.eval_step(val)?;
                 let final_val = if let Some(op_sym) = op {
                     let cur = self.get_var(*name)?;
-                    self.eval_binary_dispatch(&resolve(*op_sym), &cur, &rhs)?
+                    match (resolve(*op_sym).as_str(), &cur, &rhs) {
+                        (",", K::Vector(list), more) if !matches!(list, ColVec::General(..)) && more.type_num().abs() != list.type_num() && more.count() > 0 => {
+                            return Err(KError::ty("what is added must have the type of the list").into());
+                        }
+                        (",", K::Table(_), K::Vector(_)) => qsql::append_to_table(&cur, &rhs, false)?.0,
+                        (op, ..) => self.eval_binary_dispatch(op, &cur, &rhs)?,
+                    }
                 } else {
                     rhs
                 };
@@ -906,7 +945,7 @@ impl<'a> Engine<'a> {
                     ops::eval_unary_prim("value", x)
                 }
             }
-            ".Q.s" => Ok(K::string(&x.q_repr())),
+            ".Q.s" | ".Q.s1" => Ok(K::string(&x.q_repr())),
             ".kix.objects" => crate::inspect::workspace_objects_table(self.ws),
             ".kix.def" => {
                 let target = x.as_str().unwrap_or_else(|| x.cell_text());
@@ -997,6 +1036,10 @@ impl<'a> Engine<'a> {
                 let arg = args.first().and_then(|a| a.clone()).unwrap_or(K::Null);
                 client.query_k(&arg)
             }
+            K::Sym(s) if !resolve(*s).starts_with(':') => {
+                let named = self.get_var(*s)?;
+                self.apply_value(&named, args)
+            }
             other => ops::index_k(other, args),
         }
     }
@@ -1072,7 +1115,7 @@ impl<'a> Engine<'a> {
                 match n.as_str() {
                     "aj" | "aj0" | "ej" | "ssr" => 3,
                     "wj" | "wj1" | ".Q.dpft" => 4,
-                    ".Q.s" | ".kix.objects" | ".kix.def" => 1,
+                    ".Q.s" | ".Q.s1" | ".kix.objects" | ".kix.def" => 1,
                     ".kix.dist" => 2,
                     _ if is_unary_keyword(&n) => 1,
                     _ => 2,
@@ -1546,7 +1589,10 @@ impl<'a> Engine<'a> {
                     }
                     _ => return Err(KError::ty("invalid vector index in assignment")),
                 }
-                Ok(K::Vector(cv))
+                Ok(K::Vector(match cv {
+                    ColVec::General(_, items) => ColVec::from_atoms(Arc::unwrap_or_clone(items)),
+                    typed => typed,
+                }))
             }
             K::Dict(d) => {
                 let Some(k) = first.clone() else { return Ok(K::Dict(d)) };

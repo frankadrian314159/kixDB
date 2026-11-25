@@ -359,6 +359,10 @@ impl<'a> Parser<'a> {
         if !self.is_expr_end() {
             if let Some(bin_op) = self.peek_binary_op() {
                 self.next();
+                if self.is_expr_end() {
+                    let target = Box::new(Expr::Lit(K::Func(Func::Prim(intern(&bin_op)))));
+                    return Ok(Expr::Apply { target, args: vec![Some(lhs), None] });
+                }
                 // Special case: `0N!x` (debug print and return `x`) vs dict `!`
                 let rhs = self.parse_expr()?;
                 return Ok(Expr::Binary { op: intern(&bin_op), lhs: Box::new(lhs), rhs: Box::new(rhs) });

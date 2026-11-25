@@ -9,6 +9,18 @@ datetime, timespan, minute, second and time, with typed nulls and infinities (`0
 dictionaries; tables and keyed tables; functions. Vectors carry the attributes `` `s# `` `` `u# `` `` `p# `` `` `g# ``.
 Integer arithmetic and aggregates wrap on overflow.
 
+* Arithmetic on booleans, bytes, shorts and ints gives ints; `&` and `|` give the wider of their two types. `div` rounds
+  down and `mod` takes the divisor's sign. Floats compare as equal within a relative difference of 2^-43.
+* Month, date, datetime and timestamp compare in the finer of two types, as do minute, second, time and timespan. A list
+  such as `12:34 01:02:03` takes the finer type, or the type a letter after its last item names (`u v t n`). A date plus a
+  timespan is a timestamp.
+* A symbol compares only with a symbol (`'type`). Writing a value of another type into a simple list, or adding one with
+  `,:`, is `'type`; a general list whose items come to share a type becomes simple.
+* Verbs applied to two dictionaries work key by key over the keys of both; a value only one has is kept, and compared
+  with a null by comparisons. `d _ key` and `keys _ d` drop entries.
+* `0x0 vs n` and `0b vs n` give a number's bytes or bits and `sv` puts them together; with a base, or a list of bases,
+  they work in digits (`24 60 60 vs 3723`).
+
 ## Syntax
 
 * assignment `:`, global `::`, amend `x[i]:v`, `x+:1`, `@[d;i;f;y]`, deep amend `.[d;path;f;y]`
@@ -17,7 +29,8 @@ Integer arithmetic and aggregates wrap on overflow.
 * `$[c;t;f]`, `if[...]`, `do[...]`, `while[...]`
 * signal `'err`, protected evaluation `@[f;x;handler]` and `.[f;args;handler]`
 * views `v::expression`, which read global names only (those of the view's namespace first), never a query's columns or
-  a function's variables; namespaces (`\d .name`)
+  a function's variables; `.z.b` lists the views that read each name, and a view that depends on itself is `'loop`
+* namespaces (`\d .name`)
 
 ## Verbs
 
