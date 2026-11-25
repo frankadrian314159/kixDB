@@ -1,6 +1,6 @@
 //! `qSQL` execution (`select`, `exec`, `update`, `delete`), `fby` filter-by-group, and `insert`/`upsert`.
 use crate::ast::{ColSpec, Expr, QSql, QSqlKind};
-use crate::engine::ops::group_rows;
+use crate::engine::ops::{broadcast_atoms, distinct_op, eval_binary_prim, eval_unary_prim, group_rows, iasc_indices};
 use crate::engine::Engine;
 use crate::error::{KError, KResult};
 use crate::parser::infer_col_name;
@@ -11,6 +11,37 @@ use std::sync::Arc;
 
 /// Verbs whose argument names things only at run time.
 pub const DYNAMIC: [&str; 5] = ["value", "get", "eval", "reval", "system"];
+
+/// Verbs that give one value for the values of a group.
+const AGGREGATES: [&str; 13] =
+    ["sum", "count", "avg", "min", "max", "first", "last", "med", "prd", "var", "dev", "svar", "sdev"];
+/// Verbs that work item by item, with one argument and with two.
+const ITEMWISE_UNARY: [&str; 12] =
+    ["-", "neg", "abs", "sqrt", "exp", "log", "floor", "ceiling", "reciprocal", "signum", "null", "not"];
+const ITEMWISE_BINARY: [&str; 17] =
+    ["+", "-", "*", "%", "=", "<>", "<", "<=", ">", ">=", "&", "|", "and", "or", "div", "mod", "^"];
+
+fn is_one_of(op: SymId, verbs: &[&str]) -> bool {
+    verbs.contains(&resolve(op).as_str())
+}
+
+/// Whether row `r` of `e` depends only on row `r` of `flip`'s columns.
+fn row_by_row(flip: &Flip, e: &Expr) -> bool {
+    let rows = |e: &Expr| row_by_row(flip, e);
+    match e {
+        Expr::Lit(k) => k.is_atom(),
+        Expr::Var(s) => flip.col(*s).is_some() || resolve(*s) == "i",
+        Expr::Field(base, _) => matches!(&**base, Expr::Var(s) if flip.col(*s).is_some()),
+        Expr::Unary { op, arg } => is_one_of(*op, &ITEMWISE_UNARY) && rows(arg),
+        // the set that `in` looks in is the same for every row
+        Expr::Binary { op, lhs, rhs } if resolve(*op) == "in" => {
+            rows(lhs) && matches!(&**rhs, Expr::Lit(_) | Expr::Var(_)) && !matches!(&**rhs, Expr::Var(s) if flip.col(*s).is_some())
+        }
+        Expr::Binary { op, lhs, rhs } if resolve(*op) == "within" => rows(lhs) && matches!(&**rhs, Expr::Lit(_)),
+        Expr::Binary { op, lhs, rhs } => is_one_of(*op, &ITEMWISE_BINARY) && rows(lhs) && rows(rhs),
+        _ => false,
+    }
+}
 
 impl<'a> Engine<'a> {
     /// The names that `exprs` can read, or `None` when they reach names at run time (through a `DYNAMIC` verb, a view
@@ -44,6 +75,72 @@ impl<'a> Engine<'a> {
             keep.push(0);
         }
         Flip { cols: keep.iter().map(|&c| flip.cols[c]).collect(), vals: keep.iter().map(|&c| flip.vals[c].clone()).collect() }
+    }
+
+    /// The values of `e` on all rows of `flip`, when each depends on its own row only.
+    fn row_values(&mut self, flip: &Flip, e: &Expr) -> Option<ColVec> {
+        if !row_by_row(flip, e) {
+            return None;
+        }
+        match self.eval_in_table_scope(flip, e).ok()? {
+            // a computed general list may not have the type that a group's own values would
+            K::Vector(v) if v.len() == flip.nrows() && (matches!(e, Expr::Var(_)) || !matches!(v, ColVec::General(..))) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// `e` for all `groups` of `flip`'s rows at once: the arguments of its aggregates are computed once over all rows, so
+    /// that a group only gathers and aggregates values. The result has an item per group (or is an atom, for a constant);
+    /// `None` when `e` is more than aggregates and item-by-item verbs on them, or fails.
+    fn by_groups(&mut self, flip: &Flip, groups: &[Vec<usize>], e: &Expr) -> Option<K> {
+        let per_group = |f: &dyn Fn(&[usize]) -> KResult<K>| {
+            let items = groups.iter().map(|g| f(g)).collect::<KResult<Vec<K>>>().ok()?;
+            Some(K::Vector(ColVec::from_atoms(items)))
+        };
+        // the other verbs apply to each group's atom in turn, as they would group by group (`not` takes a vector of dates
+        // but no single date), and not to the lists that `first` of a nested column gives
+        let atoms = |k: K| (!matches!(k, K::Vector(ColVec::General(..)))).then_some(k);
+        match e {
+            Expr::Lit(k) if k.is_atom() => Some(k.clone()),
+            Expr::Unary { op, arg } if is_one_of(*op, &AGGREGATES) => {
+                let (arg, distinct) = match &**arg {
+                    Expr::Unary { op, arg } if resolve(*op) == "distinct" => (&**arg, true),
+                    other => (other, false),
+                };
+                let values = self.row_values(flip, arg)?;
+                let verb = resolve(*op);
+                per_group(&|g| {
+                    Ok(match (verb.as_str(), &values) {
+                        // the commonest aggregates read a group's rows where they are
+                        ("count", _) if !distinct => K::Long(g.len() as i64),
+                        ("first", _) if !distinct => values.get_atom(g[0]),
+                        ("sum", ColVec::Float(_, xs)) if !distinct => K::Float(g.iter().map(|&r| xs[r]).filter(|v| !v.is_nan()).sum()),
+                        ("sum", ColVec::Long(_, xs)) if !distinct => {
+                            K::Long(g.iter().map(|&r| xs[r]).filter(|&v| v != NULL_LONG).fold(0, i64::wrapping_add))
+                        }
+                        _ => {
+                            let x = K::Vector(values.gather(g));
+                            eval_unary_prim(&verb, &if distinct { distinct_op(&x)? } else { x })?
+                        }
+                    })
+                })
+            }
+            Expr::Binary { op, lhs, rhs } if is_one_of(*op, &["wsum", "wavg"]) => {
+                let (r, l) = (self.row_values(flip, rhs)?, self.row_values(flip, lhs)?);
+                let verb = resolve(*op);
+                per_group(&|g| eval_binary_prim(&verb, &K::Vector(l.gather(g)), &K::Vector(r.gather(g))))
+            }
+            Expr::Unary { op, arg } if is_one_of(*op, &ITEMWISE_UNARY) => {
+                let (x, verb) = (atoms(self.by_groups(flip, groups, arg)?)?, resolve(*op));
+                broadcast_atoms(&x, &K::Null, |a, _| eval_unary_prim(&verb, a)).ok()
+            }
+            Expr::Binary { op, lhs, rhs } if is_one_of(*op, &ITEMWISE_BINARY) => {
+                let (r, l) = (atoms(self.by_groups(flip, groups, rhs)?)?, atoms(self.by_groups(flip, groups, lhs)?)?);
+                let verb = resolve(*op);
+                broadcast_atoms(&l, &r, |a, b| eval_binary_prim(&verb, a, b)).ok()
+            }
+            _ => None,
+        }
     }
 
     pub fn eval_qsql(&mut self, q: &QSql) -> KResult<K> {
@@ -187,7 +284,7 @@ impl<'a> Engine<'a> {
                 let mut res = self.exec_select(&filtered, &q.cols, q.by.as_deref(), orig_key_cols)?;
                 if q.distinct {
                     if let K::Table(_) = &res {
-                        res = crate::engine::ops::distinct_op(&res)?;
+                        res = distinct_op(&res)?;
                     }
                 }
                 if let Some(lim_expr) = &q.limit {
@@ -335,18 +432,12 @@ impl<'a> Engine<'a> {
                 let (first_rows, mut groups) = group_rows(&by_vecs, filtered.nrows());
 
                 // Sort groups ascending by `by_vecs` keys (matching kdb+ `select ... by k from t`!)
+                // (stable sorts, from the last key to the first)
                 let mut group_order: Vec<usize> = (0..first_rows.len()).collect();
-                group_order.sort_by(|&ga, &gb| {
-                    let ra = first_rows[ga];
-                    let rb = first_rows[gb];
-                    for bv in &by_vecs {
-                        let ord = bv.get_atom(ra).k_cmp(&bv.get_atom(rb));
-                        if ord != std::cmp::Ordering::Equal {
-                            return ord;
-                        }
-                    }
-                    ra.cmp(&rb)
-                });
+                for bv in by_vecs.iter().rev() {
+                    let keys = bv.gather(&group_order.iter().map(|&g| first_rows[g]).collect::<Vec<_>>());
+                    group_order = iasc_indices(&keys, false).into_iter().map(|i| group_order[i]).collect();
+                }
                 let sorted_first_rows: Vec<usize> = group_order.iter().map(|&g| first_rows[g]).collect();
                 let sorted_groups: Vec<Vec<usize>> = group_order.into_iter().map(|g| std::mem::take(&mut groups[g])).collect();
 
@@ -356,7 +447,6 @@ impl<'a> Engine<'a> {
                 }
 
                 let ngroups = sorted_groups.len();
-                let mut agg_cols: Vec<Vec<K>> = vec![Vec::with_capacity(ngroups); cols_ref.len()];
 
                 if ngroups == 0 {
                     // Empty input with `by`: probe empty sub-flip to infer result types!
@@ -370,25 +460,37 @@ impl<'a> Engine<'a> {
                     return Ok(K::KeyedTable(Arc::new(KeyedTable { keys: keys_flip, vals: vals_flip })));
                 }
 
-                for grp_idx in &sorted_groups {
-                    // Build group sub-table, also binding any newly computed `by` aliases so `select ... by bar: 5 xbar t` can reference `bar`!
-                    let mut sub = filtered.gather(grp_idx);
-                    for (bn, bv) in by_names.iter().zip(&by_vecs) {
-                        let gcol = bv.gather(grp_idx);
-                        if let Some(pos) = sub.col_idx(*bn) {
-                            sub.vals[pos] = gcol;
-                        } else {
-                            sub.cols.push(*bn);
-                            sub.vals.push(gcol);
+                // bind the `by` names too, so `select ... by bar: 5 xbar t` can reference `bar`
+                let mut scope = filtered.clone();
+                for (bn, bv) in by_names.iter().zip(by_vecs) {
+                    match scope.col_idx(*bn) {
+                        Some(pos) => scope.vals[pos] = bv,
+                        None => {
+                            scope.cols.push(*bn);
+                            scope.vals.push(bv);
                         }
                     }
-                    for (ci, cs) in cols_ref.iter().enumerate() {
-                        let cell = self.eval_in_table_scope_with_orig_i(&sub, grp_idx, &cs.expr)?;
-                        agg_cols[ci].push(cell);
+                }
+                // columns made of aggregates are computed for all groups at once, the others group by group
+                let at_once: Vec<Option<ColVec>> = cols_ref
+                    .iter()
+                    .map(|cs| match self.by_groups(&scope, &sorted_groups, &cs.expr) {
+                        Some(K::Vector(v)) if v.len() == ngroups => Some(v),
+                        _ => None,
+                    })
+                    .collect();
+                let mut cells: Vec<Vec<K>> = vec![Vec::new(); cols_ref.len()];
+                if at_once.iter().any(Option::is_none) {
+                    for grp_idx in &sorted_groups {
+                        let sub = scope.gather(grp_idx);
+                        for (ci, cs) in cols_ref.iter().enumerate().filter(|(ci, _)| at_once[*ci].is_none()) {
+                            cells[ci].push(self.eval_in_table_scope_with_orig_i(&sub, grp_idx, &cs.expr)?);
+                        }
                     }
                 }
 
-                let out_vals: Vec<ColVec> = agg_cols.into_iter().map(ColVec::from_atoms).collect();
+                let out_vals: Vec<ColVec> =
+                    at_once.into_iter().zip(cells).map(|(v, c)| v.unwrap_or_else(|| ColVec::from_atoms(c))).collect();
                 let keys_flip = Flip::new(by_names, key_vals)?;
                 let vals_flip = Flip::new(val_names, out_vals)?;
                 Ok(K::KeyedTable(Arc::new(KeyedTable { keys: keys_flip, vals: vals_flip })))

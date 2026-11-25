@@ -666,7 +666,10 @@ fn first_rows(ids: &[usize]) -> Vec<usize> {
 pub fn group_rows(cols: &[ColVec], nrows: usize) -> (Vec<usize>, Vec<Vec<usize>>) {
     let ids = group_ids(cols, nrows);
     let first = first_rows(&ids);
-    let mut groups = vec![Vec::new(); first.len()];
+    // size each group's list before filling it: with many small groups, growing them costs more than counting
+    let mut sizes = vec![0; first.len()];
+    ids.iter().for_each(|&id| sizes[id] += 1);
+    let mut groups: Vec<Vec<usize>> = sizes.into_iter().map(Vec::with_capacity).collect();
     ids.into_iter().enumerate().for_each(|(r, id)| groups[id].push(r));
     (first, groups)
 }

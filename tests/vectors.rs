@@ -1,5 +1,6 @@
-//! The typed loops over whole vectors give what applying the verb atom by atom gives, and `where` reads only the
-//! columns a query names without changing what it can see.
+//! The typed loops over whole vectors give what applying the verb atom by atom gives, aggregates computed for all groups
+//! at once give what each group gives alone, and `where` reads only the columns a query names without changing what it
+//! can see.
 use kixdb::{Connection, Server};
 
 fn eval(c: &mut Connection, code: &str) -> String {
@@ -82,6 +83,45 @@ fn grouping_and_distinct_keep_the_order_of_first_appearance() {
         ("count distinct select a, b from t", "3"),
         ("exec m from update m: sum v by a, b from t", "6 2 7 7 6"),
         ("exec v from t where v = (max; v) fby ([] a; b)", "2 4 5"),
+    ] {
+        assert_eq!(eval(&mut c, code), expected, "{code}");
+    }
+}
+
+#[test]
+fn aggregates_over_all_groups_at_once_match_the_group_by_group_results() {
+    let mut c = Server::new().connect();
+    c.eval(
+        "t: ([] k: 2 1 2 1 3 2; j: 1 0N 3 4 5 6; f: 1.5 2 0n 4 5 6; s: `a`b`a``b`a; d: 2000.01.01 + 5 0N 3 1 2 4; \
+         w: (\"p\"; \"qq\"; \"\"; \"r\"; \"s\"; \"t\"))",
+    )
+    .unwrap();
+    c.eval("some: 1 3 5").unwrap();
+    let aggregates = ["sum", "count", "avg", "min", "max", "first", "last", "med", "prd", "var", "dev", "svar", "sdev"];
+    let mut exprs: Vec<String> = aggregates.iter().flat_map(|a| ["j", "f", "s", "d", "w", "i"].map(|x| format!("{a} {x}"))).collect();
+    exprs.extend(
+        [
+            "count distinct s", "last distinct j", "sum f * 1 - j", "sum j in some", "sum not s in `a`c", "sum j within 2 5",
+            "(sum j * s = `a) % sum j", "100.0 * (sum f) % count i", "0 ^ min j", "neg max f", "(first d) + count i",
+            "j wsum f", "j wavg f", "not min d", "null first w", "count first w", "sum 1", "first some", "sum j + some",
+        ]
+        .map(String::from),
+    );
+    for e in &exprs {
+        for tail in ["by k from t", "by s, k from t where i <> 2", "by k: 2 xbar k from t"] {
+            // a lambda around the expression has it evaluated group by group
+            let (whole, each) = (format!("select r: {e} {tail}"), format!("select r: {{x}} {e} {tail}"));
+            match eval(&mut c, &whole) {
+                error if error.starts_with('\'') => assert_eq!(error, eval(&mut c, &each), "{whole}"),
+                _ => agree(&mut c, &whole, &each),
+            }
+        }
+    }
+    for (code, expected) in [
+        ("value exec sum j by k from t", "4 10 5"),
+        // keys sort by every column, the first one first
+        ("(key select count i by s, k from t) ~ ([] s: ``a`b`b; k: 1 2 1 3)", "1b"),
+        ("exec r from select r: (sum j) % count i, q: sums j by k from t", "2 3.3333333 5"),
     ] {
         assert_eq!(eval(&mut c, code), expected, "{code}");
     }
