@@ -89,6 +89,33 @@ fn grouping_and_distinct_keep_the_order_of_first_appearance() {
 }
 
 #[test]
+fn narrow_and_wide_ranges_of_values_look_up_and_group_alike() {
+    let mut c = Server::new().connect();
+    // `a` spans few values (found in a table with a slot for each), `w` the same ones spread far apart (hashed)
+    c.eval("a: -3 + 2000?7; b: 2000?`x`y`z; d: 1999.12.29 + a; w: a * 1000000000000").unwrap();
+    c.eval("t: ([] a; b; d; w); p: 2000?100000; q: 2000?100000").unwrap();
+    // long lists, with values below, between and above theirs, and nulls and infinities on either side
+    for list in ["-3 -1 1 2 3 5 7 9 11 13", "til 100", "-100 + til 98", "0N 0W -0W 1 2 3 4 5 6 7", "(til 10), 1000000000000"] {
+        for values in ["a", "a, 0N 0W -0W"] {
+            agree(&mut c, &format!("({values}) in {list}"), &format!("{{x in {list}}} each ({values})"));
+        }
+    }
+    agree(&mut c, "d in 1999.12.29 + til 10", "a in til 10");
+    for (narrow, wide) in [
+        ("value group a", "value group w"),
+        ("value group d", "value group w"),
+        ("1000000000000 * distinct a", "distinct w"),
+        ("value select i by a, b from t", "value select i by w, b from t"),
+        ("value select i by b, a from t", "value select i by b, w from t"),
+        // two columns whose pairs are too many for a table
+        ("count distinct ([] p; q)", "count distinct flip (p; q)"),
+    ] {
+        agree(&mut c, narrow, wide);
+    }
+    assert_eq!(eval(&mut c, "(count distinct `long$(); count select by a, b from 0#t; (`long$()) in til 20)"), "(0;0;`boolean$())");
+}
+
+#[test]
 fn aggregates_over_all_groups_at_once_match_the_group_by_group_results() {
     let mut c = Server::new().connect();
     c.eval(

@@ -631,22 +631,54 @@ fn reverse_op(x: &K) -> KResult<K> {
     }
 }
 
+/// The most slots a table that finds keys for `rows` rows may have: beyond that, filling it costs more than hashing.
+/// (The minimum is small because `distinct` and `in` may be called once per group, on a few rows each time.)
+fn table_room(rows: usize) -> usize {
+    rows.saturating_mul(4).saturating_add(256)
+}
+
+/// The lowest of `keys` (read as signed) and how many values reach from it to the highest, when a table with a slot for
+/// each of those has at most `room` slots.
+fn narrow(keys: &[u64], room: usize) -> Option<(u64, usize)> {
+    let (lo, hi) = keys.iter().fold((i64::MAX, i64::MIN), |(lo, hi), &k| (lo.min(k as i64), hi.max(k as i64)));
+    let span = usize::try_from(hi.checked_sub(lo)?).ok()?.checked_add(1)?;
+    (span <= room).then_some((lo as u64, span))
+}
+
 /// A group number for every row: rows alike in all of `cols` share one, numbered in order of first appearance.
 fn group_ids(cols: &[ColVec], nrows: usize) -> Vec<usize> {
-    // split the groups made so far by one more column
-    fn refine<T: Hash + Eq>(ids: &mut [usize], keys: impl Iterator<Item = T>) {
+    // split the groups made so far by one more column, and count the groups there are then
+    fn refine<T: Hash + Eq>(ids: &mut [usize], keys: impl Iterator<Item = T>) -> usize {
         let mut seen = HashMap::new();
         for (id, key) in ids.iter_mut().zip(keys) {
             let next = seen.len();
             *id = *seen.entry((*id, key)).or_insert(next);
         }
+        seen.len()
+    }
+    // the same with a slot for every pair of a group so far and a key; a slot holds the new group's number plus one
+    fn refine_narrow(ids: &mut [usize], keys: &[u64], groups: usize, lo: u64, span: usize) -> usize {
+        let (mut slots, mut count) = (vec![0usize; groups * span], 0);
+        for (id, key) in ids.iter_mut().zip(keys) {
+            let slot = &mut slots[*id * span + key.wrapping_sub(lo) as usize];
+            if *slot == 0 {
+                count += 1;
+                *slot = count;
+            }
+            *id = *slot - 1;
+        }
+        count
     }
     let mut ids = vec![0; nrows];
+    let mut groups = 1;
     for c in cols {
-        match c.key_bits() {
-            Some(keys) => refine(&mut ids, keys.into_iter()),
+        groups = match c.key_bits() {
+            Some(keys) => match narrow(&keys, table_room(nrows) / groups.max(1)) {
+                Some((lo, span)) => refine_narrow(&mut ids, &keys, groups, lo, span),
+                None => refine(&mut ids, keys.into_iter()),
+            },
             None => refine(&mut ids, (0..nrows).map(|r| c.get_atom(r).hash_key())),
-        }
+        };
     }
     ids
 }
@@ -672,6 +704,25 @@ pub fn group_rows(cols: &[ColVec], nrows: usize) -> (Vec<usize>, Vec<Vec<usize>>
     let mut groups: Vec<Vec<usize>> = sizes.into_iter().map(Vec::with_capacity).collect();
     ids.into_iter().enumerate().for_each(|(r, id)| groups[id].push(r));
     (first, groups)
+}
+
+/// The row numbers of `cols` in ascending order of their values, the first column deciding first; ties keep their order.
+pub fn sort_order(cols: &[ColVec], nrows: usize) -> Vec<usize> {
+    // stable sorts, from the last column to the first
+    cols.iter().rev().fold((0..nrows).collect(), |order: Vec<usize>, c| {
+        iasc_indices(&c.gather(&order), false).into_iter().map(|i| order[i]).collect()
+    })
+}
+
+/// An aggregate of the values in one group's `rows`; the commonest read them where they are, without a copy.
+pub fn aggregate_rows(verb: &str, values: &ColVec, rows: &[usize]) -> KResult<K> {
+    Ok(match (verb, values) {
+        ("count", _) => K::Long(rows.len() as i64),
+        ("first", _) => values.get_atom(rows[0]),
+        ("sum", ColVec::Float(_, xs)) => K::Float(rows.iter().map(|&r| xs[r]).filter(|v| !v.is_nan()).sum()),
+        ("sum", ColVec::Long(_, xs)) => K::Long(rows.iter().map(|&r| xs[r]).filter(|&v| v != NULL_LONG).fold(0, i64::wrapping_add)),
+        _ => eval_unary_prim(verb, &K::Vector(values.gather(rows)))?,
+    })
 }
 
 pub fn distinct_op(x: &K) -> KResult<K> {
@@ -2324,9 +2375,13 @@ fn in_op(lhs: &K, rhs: &K) -> KResult<K> {
         };
         if have.type_num() == want.type_num() {
             if let (Some(have), Some(want)) = (have.key_bits(), want.key_bits()) {
-                // a short list is quicker to scan than to hash into
+                // a short list is quick to scan; a narrow range of values has a slot for each; others are hashed
                 return Ok(bool_vec(if want.len() <= 8 {
                     have.iter().map(|x| want.contains(x)).collect()
+                } else if let Some((lo, span)) = narrow(&want, table_room(have.len() + want.len())) {
+                    let mut slots = vec![false; span];
+                    want.iter().for_each(|x| slots[x.wrapping_sub(lo) as usize] = true);
+                    have.iter().map(|x| slots.get(x.wrapping_sub(lo) as usize) == Some(&true)).collect()
                 } else {
                     let set: HashSet<u64> = want.into_iter().collect();
                     have.iter().map(|x| set.contains(x)).collect()

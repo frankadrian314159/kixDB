@@ -74,6 +74,12 @@ fn queries_are_pushed_to_the_shards() {
         "two-phase",
     );
     p.plan("select spread: (max price) - min price, mid: 0.5 * (max price) + min price by ex from trade", "two-phase");
+    // every kind of merge over many groups of two keys
+    p.plan(
+        "select s: sum size, a: avg price, d: dev price, v: svar price, w: size wavg price, ws: size wsum price, c: count i, \
+         p: prd 1 + size mod 2, hi: max sym by trader, ex from trade",
+        "two-phase",
+    );
     p.plan("select sum size by 5 xbar time.minute from trade", "two-phase");
     p.plan("select n: count i, max time by ex, trader from trade where size > 100", "two-phase");
     p.plan("exec sum size from trade", "two-phase");

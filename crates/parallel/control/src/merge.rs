@@ -1,7 +1,7 @@
 //! Two-phase aggregation: what each shard computes for an aggregate, and how the control node puts the shards' partial
 //! states together.
 use kixdb::ast::{ColSpec, Expr};
-use kixdb::engine::ops::{eval_unary_prim, minmax_op, sum_op};
+use kixdb::engine::ops::aggregate_rows;
 use kixdb::sym::{intern, resolve, SymId};
 use kixdb::{ColVec, KResult, K};
 
@@ -159,16 +159,12 @@ pub fn analyze(specs: &[ColSpec], checks: &Checks) -> Option<Aggs> {
     Some(out)
 }
 
-fn vector(values: &[K]) -> K {
-    K::Vector(ColVec::from_atoms(values.to_vec()))
+fn floats(values: &ColVec, rows: &[usize]) -> Vec<f64> {
+    rows.iter().map(|&r| values.get_atom(r).as_f64().unwrap_or(f64::NAN)).collect()
 }
 
-fn floats(values: &[K]) -> Vec<f64> {
-    values.iter().map(|v| v.as_f64().unwrap_or(f64::NAN)).collect()
-}
-
-fn total(values: &[K]) -> f64 {
-    floats(values).into_iter().filter(|v| !v.is_nan()).sum()
+fn total(values: &ColVec, rows: &[usize]) -> f64 {
+    floats(values, rows).into_iter().filter(|v| !v.is_nan()).sum()
 }
 
 impl Aggs {
@@ -176,24 +172,31 @@ impl Aggs {
         self.leaves.len()
     }
 
-    /// Merge one group: `partial[c]` holds the value of partial column `c` on each shard that has the group.
-    pub fn merge(&self, leaf: usize, partial: &[Vec<K>]) -> KResult<K> {
+    /// Aggregate `leaf` of every group, in the order given: `partial[c]` holds partial column `c` of all shards' answers,
+    /// and a group lists its rows there.
+    pub fn merge(&self, leaf: usize, partial: &[ColVec], groups: &[Vec<usize>]) -> KResult<Vec<K>> {
+        groups.iter().map(|g| self.merge_group(leaf, partial, g)).collect()
+    }
+
+    fn merge_group(&self, leaf: usize, partial: &[ColVec], rows: &[usize]) -> KResult<K> {
         let (kind, at) = self.leaves[leaf];
-        let col = |i: usize| partial[at + i].as_slice();
+        let col = |i: usize| &partial[at + i];
+        let combine = |verb: &str| aggregate_rows(verb, col(0), rows);
         Ok(match kind {
-            Leaf::Sum | Leaf::Count => sum_op(&vector(col(0)))?,
-            Leaf::Min => minmax_op(&vector(col(0)), true)?,
-            Leaf::Max => minmax_op(&vector(col(0)), false)?,
-            Leaf::Prd => eval_unary_prim("prd", &vector(col(0)))?,
-            Leaf::Wsum => K::Float(total(col(0))),
+            Leaf::Sum | Leaf::Count => combine("sum")?,
+            Leaf::Min => combine("min")?,
+            Leaf::Max => combine("max")?,
+            Leaf::Prd => combine("prd")?,
+            Leaf::Wsum => K::Float(total(col(0), rows)),
             Leaf::Avg | Leaf::Wavg => {
-                let (num, den) = (total(col(0)), total(col(1)));
+                let (num, den) = (total(col(0), rows), total(col(1), rows));
                 K::Float(if den == 0.0 { f64::NAN } else { num / den })
             }
             Leaf::Var { sample, root } => {
                 // Chan's method for combining counts, means and sums of squared deviations
                 let (mut n, mut mean, mut m2) = (0.0f64, 0.0f64, 0.0f64);
-                for ((ni, mi), vi) in floats(col(0)).into_iter().zip(floats(col(1))).zip(floats(col(2))) {
+                let [counts, means, variances] = [0, 1, 2].map(|i| floats(col(i), rows));
+                for ((ni, mi), vi) in counts.into_iter().zip(means).zip(variances) {
                     if ni == 0.0 {
                         continue;
                     }

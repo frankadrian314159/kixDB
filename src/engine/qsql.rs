@@ -1,6 +1,8 @@
 //! `qSQL` execution (`select`, `exec`, `update`, `delete`), `fby` filter-by-group, and `insert`/`upsert`.
 use crate::ast::{ColSpec, Expr, QSql, QSqlKind};
-use crate::engine::ops::{broadcast_atoms, distinct_op, eval_binary_prim, eval_unary_prim, group_rows, iasc_indices};
+use crate::engine::ops::{
+    aggregate_rows, broadcast_atoms, distinct_op, eval_binary_prim, eval_unary_prim, group_rows, sort_order,
+};
 use crate::engine::Engine;
 use crate::error::{KError, KResult};
 use crate::parser::infer_col_name;
@@ -109,20 +111,9 @@ impl<'a> Engine<'a> {
                 };
                 let values = self.row_values(flip, arg)?;
                 let verb = resolve(*op);
-                per_group(&|g| {
-                    Ok(match (verb.as_str(), &values) {
-                        // the commonest aggregates read a group's rows where they are
-                        ("count", _) if !distinct => K::Long(g.len() as i64),
-                        ("first", _) if !distinct => values.get_atom(g[0]),
-                        ("sum", ColVec::Float(_, xs)) if !distinct => K::Float(g.iter().map(|&r| xs[r]).filter(|v| !v.is_nan()).sum()),
-                        ("sum", ColVec::Long(_, xs)) if !distinct => {
-                            K::Long(g.iter().map(|&r| xs[r]).filter(|&v| v != NULL_LONG).fold(0, i64::wrapping_add))
-                        }
-                        _ => {
-                            let x = K::Vector(values.gather(g));
-                            eval_unary_prim(&verb, &if distinct { distinct_op(&x)? } else { x })?
-                        }
-                    })
+                per_group(&|g| match distinct {
+                    true => eval_unary_prim(&verb, &distinct_op(&K::Vector(values.gather(g)))?),
+                    false => aggregate_rows(&verb, &values, g),
                 })
             }
             Expr::Binary { op, lhs, rhs } if is_one_of(*op, &["wsum", "wavg"]) => {
@@ -432,16 +423,11 @@ impl<'a> Engine<'a> {
                 let (first_rows, mut groups) = group_rows(&by_vecs, filtered.nrows());
 
                 // Sort groups ascending by `by_vecs` keys (matching kdb+ `select ... by k from t`!)
-                // (stable sorts, from the last key to the first)
-                let mut group_order: Vec<usize> = (0..first_rows.len()).collect();
-                for bv in by_vecs.iter().rev() {
-                    let keys = bv.gather(&group_order.iter().map(|&g| first_rows[g]).collect::<Vec<_>>());
-                    group_order = iasc_indices(&keys, false).into_iter().map(|i| group_order[i]).collect();
-                }
-                let sorted_first_rows: Vec<usize> = group_order.iter().map(|&g| first_rows[g]).collect();
+                let keys: Vec<ColVec> = by_vecs.iter().map(|bv| bv.gather(&first_rows)).collect();
+                let group_order = sort_order(&keys, first_rows.len());
+                let mut key_vals: Vec<ColVec> = keys.iter().map(|k| k.gather(&group_order)).collect();
                 let sorted_groups: Vec<Vec<usize>> = group_order.into_iter().map(|g| std::mem::take(&mut groups[g])).collect();
 
-                let mut key_vals: Vec<ColVec> = by_vecs.iter().map(|bv| bv.gather(&sorted_first_rows)).collect();
                 if by_vecs.len() == 1 && !key_vals.is_empty() {
                     key_vals[0].set_attr_unchecked(Attr::Sorted);
                 }

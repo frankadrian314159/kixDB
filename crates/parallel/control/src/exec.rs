@@ -6,12 +6,11 @@ use crate::Inner;
 use futures::future::try_join_all;
 use kix_shared_ces::wire::{ord_var, LoadMode, LoadReq, MutateReq, ShuffleReq, Work, ORD_COL};
 use kixdb::ast::{ColSpec, Expr, QSql, QSqlKind};
-use kixdb::engine::ops::{distinct_op, sublist_op};
+use kixdb::engine::ops::{distinct_op, group_rows, sort_order, sublist_op};
 use kixdb::engine::qsql::{exec_by_result, resolve_col_names};
 use kixdb::parser::parse_script;
 use kixdb::sym::{intern, resolve, SymId};
 use kixdb::{Attr, ColVec, Connection, Dict, Flip, KError, KResult, KeyedTable, K};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Replace every mention of `name` in `e` by `with`.
@@ -61,18 +60,6 @@ pub fn concat(parts: Vec<Flip>) -> KResult<Flip> {
         }
     }
     Ok(acc)
-}
-
-/// Row numbers of `f` ordered by `cols` (stable).
-fn order_by(f: &Flip, cols: &[usize]) -> Vec<usize> {
-    let mut idx: Vec<usize> = (0..f.nrows()).collect();
-    idx.sort_by(|&a, &b| {
-        cols.iter()
-            .map(|&c| f.vals[c].get_atom(a).k_cmp(&f.vals[c].get_atom(b)))
-            .find(|o| o.is_ne())
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    idx
 }
 
 /// Put rows that carry ordinals back in order and remove the ordinal column.
@@ -229,7 +216,7 @@ impl Inner {
         let flips = answers.into_iter().map(flip_of).collect::<KResult<Vec<_>>>()?;
         let nkeys = flips[0].1;
         let all = concat(flips.into_iter().map(|f| f.0).collect())?;
-        let mut sorted = all.gather(&order_by(&all, &(0..nkeys).collect::<Vec<_>>()));
+        let mut sorted = all.gather(&sort_order(&all.vals[..nkeys], all.nrows()));
         if nkeys == 1 {
             sorted.vals[0].set_attr_unchecked(Attr::Sorted);
         }
@@ -277,26 +264,13 @@ impl Inner {
             return mirror.eval_expr(&push.original);
         }
         // the rows of each group, the groups in key order
-        let mut groups: Vec<Vec<usize>> = Vec::new();
-        let mut seen: HashMap<Vec<u8>, usize> = HashMap::new();
-        for r in 0..all.nrows() {
-            let key: Vec<u8> = all.vals[..nkeys].iter().flat_map(|c| c.get_atom(r).hash_key()).collect();
-            let g = *seen.entry(key).or_insert_with(|| {
-                groups.push(Vec::new());
-                groups.len() - 1
-            });
-            groups[g].push(r);
-        }
-        let first = all.gather(&groups.iter().map(|g| g[0]).collect::<Vec<_>>());
-        let order = order_by(&first, &(0..nkeys).collect::<Vec<_>>());
-
-        let mut merged: Vec<Vec<K>> = vec![Vec::with_capacity(order.len()); aggs.leaf_count()];
-        for &g in &order {
-            let partial: Vec<Vec<K>> = all.vals[nkeys..].iter().map(|c| groups[g].iter().map(|&r| c.get_atom(r)).collect()).collect();
-            for (leaf, out) in merged.iter_mut().enumerate() {
-                out.push(aggs.merge(leaf, &partial)?);
-            }
-        }
+        let (first_rows, mut groups) = group_rows(&all.vals[..nkeys], all.nrows());
+        let first_keys: Vec<ColVec> = all.vals[..nkeys].iter().map(|c| c.gather(&first_rows)).collect();
+        let order = sort_order(&first_keys, first_rows.len());
+        let groups: Vec<Vec<usize>> = order.iter().map(|&g| std::mem::take(&mut groups[g])).collect();
+        let merged = (0..aggs.leaf_count())
+            .map(|leaf| aggs.merge(leaf, &all.vals[nkeys..], &groups))
+            .collect::<KResult<Vec<_>>>()?;
         let grouped = push.query.by.is_some();
         let leaves: Vec<K> = merged
             .into_iter()
@@ -318,7 +292,7 @@ impl Inner {
             let cols = values.into_iter().map(|v| ColVec::from_atoms(vec![v])).collect();
             return self.limit(push, K::Table(Arc::new(Flip::new(val_names, cols)?)));
         }
-        let mut keys = Flip { cols: empty_keys.cols, vals: first.vals[..nkeys].iter().map(|c| c.gather(&order)).collect() };
+        let mut keys = Flip { cols: empty_keys.cols, vals: first_keys.iter().map(|c| c.gather(&order)).collect() };
         if nkeys == 1 {
             keys.vals[0].set_attr_unchecked(Attr::Sorted);
         }
