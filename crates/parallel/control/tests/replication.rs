@@ -33,11 +33,11 @@ fn replica(runtime: &tokio::runtime::Runtime, dir: &Path, listener: tokio::net::
 
 impl Group {
     fn start(snapshot_every: u64) -> Group {
-        Group::start_with(snapshot_every, "")
+        Group::start_with("", |rc| rc.snapshot_every = snapshot_every)
     }
 
-    /// A group whose replicas all begin with the data `preload` makes (it is not in their logs).
-    fn start_with(snapshot_every: u64, preload: &str) -> Group {
+    /// A group whose replicas, set up by `configure`, all begin with the data `preload` makes (it is not in their logs).
+    fn start_with(preload: &str, configure: impl Fn(&mut ReplicaConfig)) -> Group {
         let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
         let dir = tempfile::tempdir().unwrap();
         for id in (1..=3).filter(|_| !preload.is_empty()) {
@@ -51,7 +51,7 @@ impl Group {
             .enumerate()
             .map(|(i, l)| {
                 let peers = (0..3).filter(|&p| p != i).map(|p| (p as u64 + 1, addrs[p].clone())).collect();
-                Some(replica(&runtime, dir.path(), l, |rc| rc.snapshot_every = snapshot_every, i as u64 + 1, peers))
+                Some(replica(&runtime, dir.path(), l, &configure, i as u64 + 1, peers))
             })
             .collect();
         Group { runtime, dir, replicas, addrs }
@@ -233,7 +233,9 @@ async fn slow_link(listener: tokio::net::TcpListener, to: String, rate: usize, s
 #[test]
 fn a_replica_behind_a_slow_link_is_sent_its_snapshot_once() {
     // four megabytes on each replica, and then small changes until the log is cut: only a snapshot can pass the data on
-    let mut group = Group::start_with(10, "big: ([] v: 0.5 + til 524288)");
+    // (the snapshot is sent as several pieces)
+    kix_shared_ces::pieces::PIECE.store(1 << 20, Relaxed);
+    let mut group = Group::start_with("big: ([] v: 0.5 + til 524288)", |rc| rc.snapshot_every = 10);
     let leader = group.leader();
     let mut engine = group.replicas[leader].as_ref().unwrap().server.connect_internal();
     for i in 0..12 {
@@ -259,6 +261,36 @@ fn a_replica_behind_a_slow_link_is_sent_its_snapshot_once() {
     let leading = group.replicas[leader].as_ref().unwrap().replica.as_ref().unwrap();
     wait("the replica to be added", || leading.add_replica(4, &public).ok());
     assert!(leading.members().iter().any(|m| m.0 == 4 && m.2));
+    for i in 0..group.replicas.len() {
+        group.kill(i);
+    }
+}
+
+#[test]
+fn a_leader_whose_engine_is_stuck_hands_over() {
+    let mut group = Group::start_with("", |rc| rc.stall_limit = Duration::from_millis(500));
+    let stuck = group.leader();
+    let cluster = Cluster::connect(&config(&[group.address()])).unwrap();
+    let mut s = cluster.session();
+    s.eval("t: ([] a: 1 2 3)").unwrap();
+    // something takes the leader's engine and keeps it, with a request waiting for it
+    let engine = group.replicas[stuck].as_ref().unwrap().server.clone();
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let (holding, now_held) = std::sync::mpsc::channel();
+    let hold = std::thread::spawn(move || {
+        engine.read_workspace(|_| {
+            holding.send(()).unwrap();
+            held.recv().ok();
+        })
+    });
+    now_held.recv().unwrap();
+    let mut waiting = cluster.session();
+    let waiting = std::thread::spawn(move || waiting.eval("count t"));
+    wait("another leader", || (group.leader() != stuck).then_some(()));
+    assert_eq!(s.eval("count t").unwrap(), K::Long(3));
+    release.send(()).unwrap();
+    hold.join().unwrap();
+    assert_eq!(waiting.join().unwrap().unwrap(), K::Long(3));
     for i in 0..group.replicas.len() {
         group.kill(i);
     }

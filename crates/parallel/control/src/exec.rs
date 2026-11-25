@@ -144,7 +144,7 @@ impl Inner {
             format!("delete {ORD_COL} from {sorted}")
         };
         let query = parse_script(&finish)?.remove(0);
-        self.mutate_all(&MutateReq { table: temp, query, apply: true }).map(|_| ())
+        self.mutate_all(&MutateReq { table: temp, query }).map(|_| ())
     }
 
     /// Run `push`; `mirror` evaluates what the control node computes itself.

@@ -6,7 +6,7 @@ use crate::{Conf, Entry, NodeId};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const LOG: &str = "raft.log";
@@ -31,11 +31,10 @@ pub struct Snapshot {
 }
 
 pub trait Storage {
-    fn load(&self) -> (HardState, Vec<Entry>, Option<Snapshot>);
+    /// Everything stored, asked for once, when a node starts.
+    fn load(&mut self) -> (HardState, Vec<Entry>, Option<Snapshot>);
     /// The snapshot alone.
-    fn snapshot(&self) -> Option<Snapshot> {
-        self.load().2
-    }
+    fn snapshot(&self) -> Option<Snapshot>;
     fn save_hard_state(&mut self, hs: &HardState);
     fn append_entries(&mut self, from_index: u64, entries: &[Entry]);
     fn save_snapshot(&mut self, snap: &Snapshot, remaining_entries: &[Entry]);
@@ -55,7 +54,7 @@ impl MemStorage {
 }
 
 impl Storage for MemStorage {
-    fn load(&self) -> (HardState, Vec<Entry>, Option<Snapshot>) {
+    fn load(&mut self) -> (HardState, Vec<Entry>, Option<Snapshot>) {
         (self.hs.clone(), self.entries.clone(), self.snapshot.clone())
     }
 
@@ -111,47 +110,49 @@ fn unframe(bytes: &[u8]) -> Option<&[u8]> {
     (len > 0 && crc32fast::hash(payload).to_le_bytes() == bytes[4..8]).then_some(payload)
 }
 
+/// The log lives in its file: only `Raft` holds the entries in memory. The snapshot is kept here too, as reading it back
+/// would hold a node up for too long each time one is sent.
 pub struct FileStorage {
     dir: PathBuf,
-    mem: MemStorage,
+    hs: HardState,
     sync: bool,
-    /// `raft.log`, open for appending.
+    /// `raft.log`, open for writing, and the length of its sound records.
     log: Option<File>,
+    len: u64,
+    /// Records a failed write left to be written.
+    pending: Vec<u8>,
+    /// The entries read when opening, until `load` takes them.
+    loaded: Vec<Entry>,
+    snapshot: Option<Snapshot>,
 }
 
 impl FileStorage {
     pub fn open(dir: impl AsRef<Path>, sync: bool) -> Result<Self, String> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let mut s = Self { dir, mem: MemStorage::new(), sync, log: None };
-        let read = |name: &str| match fs::read(s.dir.join(name)) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(format!("{}: {e}", s.dir.join(name).display())),
-        };
-        let damaged = |name: &str| format!("{} is damaged", s.dir.join(name).display());
-        let old = read(OLD)?;
+        let mut s = Self { dir, hs: HardState::default(), sync, log: None, len: 0, pending: vec![], loaded: vec![], snapshot: None };
+        let io = |e: std::io::Error| e.to_string();
+        let old = s.read(OLD)?;
         if old.as_deref() != Some(MOVED) {
             // a new directory, or one of an earlier version
+            let mut mem = MemStorage::new();
             if let Some(bytes) = old {
                 let sound = bytes.len() >= 8 && &bytes[..4] == b"KXRF" && crc32fast::hash(&bytes[8..]).to_le_bytes() == bytes[4..8];
-                let p: Old = sound.then(|| postcard::from_bytes(&bytes[8..]).ok()).flatten().ok_or_else(|| damaged(OLD))?;
-                s.mem = MemStorage { hs: p.hs, entries: p.entries, snapshot: p.snapshot };
+                let p: Old = sound.then(|| postcard::from_bytes(&bytes[8..]).ok()).flatten().ok_or_else(|| s.damaged(OLD))?;
+                mem = MemStorage { hs: p.hs, entries: p.entries, snapshot: p.snapshot };
             }
-            let io = |e: std::io::Error| e.to_string();
-            if let Some(snap) = &s.mem.snapshot {
+            if let Some(snap) = &mem.snapshot {
                 s.replace(SNAP, &frame(snap)).map_err(io)?;
             }
-            s.rewrite_log().map_err(io)?;
+            s.hs = mem.hs;
+            s.rewrite_log(&mem.entries).map_err(io)?;
             s.replace(OLD, MOVED).map_err(io)?;
+            (s.loaded, s.snapshot) = (mem.entries, mem.snapshot);
             return Ok(s);
         }
-        if let Some(bytes) = read(SNAP)? {
-            let whole = unframe(&bytes).filter(|p| p.len() + 8 == bytes.len());
-            s.mem.snapshot = Some(whole.and_then(|p| postcard::from_bytes(p).ok()).ok_or_else(|| damaged(SNAP))?);
-        }
-        let bytes = read(LOG)?.ok_or_else(|| damaged(LOG))?;
-        let mut at = 0;
+        s.snapshot = s.read_snapshot()?;
+        let bytes = s.read(LOG)?.ok_or_else(|| s.damaged(LOG))?;
+        let (mut at, mut mem) = (0, MemStorage::new());
         while at < bytes.len() {
             let rest = &bytes[at..];
             let Some((payload, record)) = unframe(rest).and_then(|p| Some((p, postcard::from_bytes::<Record>(p).ok()?))) else {
@@ -160,28 +161,37 @@ impl FileStorage {
                 if len.saturating_add(8) >= rest.len() || rest.iter().all(|&b| b == 0) {
                     break;
                 }
-                return Err(damaged(LOG));
+                return Err(s.damaged(LOG));
             };
             at += 8 + payload.len();
             match record {
-                Record::Hard(hs) => s.mem.hs = hs,
-                Record::Entries(from, entries) => s.mem.append_entries(from, &entries),
+                Record::Hard(hs) => mem.hs = hs,
+                Record::Entries(from, entries) => mem.append_entries(from, &entries),
             }
         }
-        // a crash between writing a snapshot and cutting the log leaves entries the snapshot stands for
-        let covered = s.mem.snapshot.as_ref().map_or(0, |snap| snap.index);
-        s.mem.entries.retain(|e| e.index > covered);
-        let io = |e: std::io::Error| e.to_string();
-        if at < bytes.len() {
-            // (a handle that only appends may not shorten a file on Windows)
-            OpenOptions::new().write(true).open(s.dir.join(LOG)).and_then(|f| f.set_len(at as u64)).map_err(io)?;
-        }
-        s.log = Some(s.append_to_log().map_err(io)?);
+        (s.hs, s.loaded, s.len) = (mem.hs, mem.entries, at as u64);
+        s.log = Some(s.open_log().map_err(io)?);
+        // cut off what is not sound
+        s.write_pending().map_err(io)?;
         Ok(s)
     }
 
-    fn append_to_log(&self) -> std::io::Result<File> {
-        OpenOptions::new().append(true).open(self.dir.join(LOG))
+    fn damaged(&self, name: &str) -> String {
+        format!("{} is damaged", self.dir.join(name).display())
+    }
+
+    fn read(&self, name: &str) -> Result<Option<Vec<u8>>, String> {
+        match fs::read(self.dir.join(name)) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("{}: {e}", self.dir.join(name).display())),
+        }
+    }
+
+    fn read_snapshot(&self) -> Result<Option<Snapshot>, String> {
+        let Some(bytes) = self.read(SNAP)? else { return Ok(None) };
+        let whole = unframe(&bytes).filter(|p| p.len() + 8 == bytes.len());
+        whole.and_then(|p| postcard::from_bytes(p).ok()).map(Some).ok_or_else(|| self.damaged(SNAP))
     }
 
     /// Write a file whole: it holds either what it held or `bytes`.
@@ -196,53 +206,69 @@ impl FileStorage {
         fs::rename(&tmp, self.dir.join(name))
     }
 
-    fn rewrite_log(&mut self) -> std::io::Result<()> {
-        let mut bytes = frame(&Record::Hard(self.mem.hs.clone()));
-        if let Some(first) = self.mem.entries.first() {
-            bytes.extend(frame(&Record::Entries(first.index, Cow::Borrowed(&self.mem.entries))));
+    fn open_log(&self) -> std::io::Result<File> {
+        OpenOptions::new().write(true).open(self.dir.join(LOG))
+    }
+
+    fn rewrite_log(&mut self, entries: &[Entry]) -> std::io::Result<()> {
+        let mut bytes = frame(&Record::Hard(self.hs.clone()));
+        if let Some(first) = entries.first() {
+            bytes.extend(frame(&Record::Entries(first.index, Cow::Borrowed(entries))));
         }
         // (closed first: Windows does not replace a file that is open)
         self.log = None;
         self.replace(LOG, &bytes)?;
-        self.log = Some(self.append_to_log()?);
+        self.log = Some(self.open_log()?);
+        self.len = bytes.len() as u64;
+        self.pending.clear();
+        Ok(())
+    }
+
+    /// Put the records not yet written after the sound ones, dropping anything else there.
+    fn write_pending(&mut self) -> std::io::Result<()> {
+        let Some(f) = self.log.as_mut() else { return Err(std::io::Error::other("the log is not open")) };
+        f.set_len(self.len)?;
+        f.seek(SeekFrom::Start(self.len))?;
+        f.write_all(&self.pending)?;
+        if self.sync {
+            f.sync_data()?;
+        }
+        self.len += self.pending.len() as u64;
+        self.pending.clear();
         Ok(())
     }
 
     fn append(&mut self, record: &Record) {
-        let sync = self.sync;
-        let written = self.log.as_mut().is_some_and(|f| f.write_all(&frame(record)).and_then(|_| if sync { f.sync_data() } else { Ok(()) }).is_ok());
-        // after a failed write the end of the file is unknown: write it afresh
-        if !written {
-            if let Err(e) = self.rewrite_log() {
-                eprintln!("raft: writing {} failed: {e}", self.dir.join(LOG).display());
-            }
+        self.pending.extend(frame(record));
+        // a record that cannot be written is kept, to go before the next one
+        if let Err(e) = self.write_pending() {
+            eprintln!("raft: writing {} failed: {e}", self.dir.join(LOG).display());
         }
     }
 }
 
 impl Storage for FileStorage {
-    fn load(&self) -> (HardState, Vec<Entry>, Option<Snapshot>) {
-        self.mem.load()
+    fn load(&mut self) -> (HardState, Vec<Entry>, Option<Snapshot>) {
+        (self.hs.clone(), std::mem::take(&mut self.loaded), self.snapshot())
     }
 
     fn snapshot(&self) -> Option<Snapshot> {
-        self.mem.snapshot()
+        self.snapshot.clone()
     }
 
     fn save_hard_state(&mut self, hs: &HardState) {
-        self.mem.save_hard_state(hs);
+        self.hs = hs.clone();
         self.append(&Record::Hard(hs.clone()));
     }
 
     fn append_entries(&mut self, from_index: u64, entries: &[Entry]) {
-        self.mem.append_entries(from_index, entries);
         self.append(&Record::Entries(from_index, Cow::Borrowed(entries)));
     }
 
     fn save_snapshot(&mut self, snap: &Snapshot, remaining_entries: &[Entry]) {
-        self.mem.save_snapshot(snap, remaining_entries);
+        self.snapshot = Some(snap.clone());
         // the snapshot first: until the log is cut it still holds what the snapshot stands for
-        if let Err(e) = self.replace(SNAP, &frame(snap)).and_then(|_| self.rewrite_log()) {
+        if let Err(e) = self.replace(SNAP, &frame(snap)).and_then(|_| self.rewrite_log(remaining_entries)) {
             eprintln!("raft: saving the snapshot in {} failed: {e}", self.dir.display());
         }
     }
@@ -276,9 +302,9 @@ mod tests {
         s.append_entries(5, &[entry(5, 55)]);
         assert!(size(LOG) < log + 450);
         assert_eq!(fs::read(dir.path().join(SNAP)).unwrap(), snap);
-        let kept = s.load();
         drop(s);
-        assert_eq!(open().unwrap().load(), kept);
+        let kept = open().unwrap().load();
+        assert_eq!(kept.0, HardState { term: 4, voted_for: Some(2) });
         assert_eq!(kept.1, [entry(3, 3), entry(4, 4), entry(5, 55)]);
 
         // an unfinished last record is dropped, and writing goes on after the sound ones
@@ -297,9 +323,6 @@ mod tests {
             assert!(open().is_err(), "{name}");
             fs::write(dir.path().join(name), sound).unwrap();
         }
-        // a snapshot written just before a crash stands for the entries the log still holds
-        fs::write(dir.path().join(SNAP), frame(&snapshot(4))).unwrap();
-        assert_eq!(open().unwrap().load().1, [entry(5, 55)]);
     }
 
     #[test]

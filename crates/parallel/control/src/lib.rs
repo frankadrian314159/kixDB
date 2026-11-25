@@ -10,6 +10,7 @@
 //!   tables it changed are distributed again.
 mod catalog;
 pub mod client;
+mod commit;
 mod exec;
 mod merge;
 mod plan;
@@ -31,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 /// A table with at most this many rows is copied to every shard for a join, rather than shuffled.
@@ -60,6 +61,10 @@ struct Inner {
     next_temp: AtomicU64,
     broadcast_limit: AtomicUsize,
     state_path: Option<PathBuf>,
+    /// Since when some shard may hold a change waiting to be resolved (and when to try).
+    unsettled: Mutex<Option<Instant>>,
+    /// Changes every shard committed, which their primaries have yet to be told of: `(primary, txid)`.
+    finished: Mutex<Vec<(usize, u64)>>,
     _state_lock: Option<std::fs::File>,
 }
 
@@ -195,6 +200,9 @@ impl Cluster {
             next_temp: AtomicU64::new(0),
             broadcast_limit: AtomicUsize::new(BROADCAST_LIMIT),
             state_path,
+            // (a control node before this one may have left changes half made)
+            unsettled: Mutex::new(Some(Instant::now())),
+            finished: Mutex::default(),
             _state_lock: state_lock,
         };
         let cluster = Cluster { inner: Arc::new(inner) };

@@ -171,8 +171,8 @@ impl Server {
         Ok(true)
     }
 
-    /// Log the next change to each variable the engine now holds as its whole new value: for a new member of a group,
-    /// whose readers may not have the values it read from its own storage.
+    /// Log the next change to each variable the engine now holds as its whole new value: for the first start of a
+    /// group's member, whose readers may not have the values it read from its own storage.
     pub fn log_values_whole(&self) {
         let mut g = self.shared.ws.write().unwrap_or_else(|e| e.into_inner());
         let names: Vec<_> = g.vars.keys().copied().collect();
@@ -268,6 +268,11 @@ pub struct Connection {
 }
 
 impl Connection {
+    /// A flag that, once set, stops this connection's evaluation before its next step (`'stop`), for good.
+    pub fn cancel_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.session.cancel.clone()
+    }
+
     /// Evaluate `q` source code and return the resulting `K` value directly.
     pub fn eval(&mut self, q_code: &str) -> KResult<K> {
         if let Some(int) = self.interceptor.as_mut() {

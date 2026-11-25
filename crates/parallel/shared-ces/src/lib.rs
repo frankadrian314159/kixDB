@@ -5,9 +5,11 @@
 //! - [`wire`]: Flight action and ticket messages encoded with `postcard`
 //! - [`metrics`]: node resource & engine telemetry with Prometheus exposition
 //! - [`tls`]: mutual TLS between nodes, and the certificates for it
+//! - [`pieces`]: actions too large for one message
 pub mod arrowconv;
 pub mod config;
 pub mod metrics;
+pub mod pieces;
 pub mod route;
 pub mod tls;
 pub mod wire;

@@ -172,7 +172,12 @@ pub struct Raft<S: Storage> {
     storage: S,
     snap_index: u64,
     snap_term: u64,
+    /// The entry the log starts after: the snapshot's, or one a little before it.
+    base_index: u64,
+    base_term: u64,
     log: Vec<Entry>,
+    /// How many entries a cut keeps behind its snapshot (within a batch's size), for replicas a little way behind.
+    pub trailing: u64,
     pub commit_index: u64,
     applied_to_ready: u64,
     election_ticks: u32,
@@ -187,15 +192,17 @@ pub struct Raft<S: Storage> {
     recent_ack: HashSet<NodeId>,
     /// A majority answered during the last complete election window (or elected us).
     lease_held: bool,
+    /// This node should not lead for now.
+    unfit: bool,
     outbox: Vec<(NodeId, Msg)>,
     pending_snap: Option<Snapshot>,
     sending: HashMap<NodeId, Sending>,
 }
 
 impl<S: Storage> Raft<S> {
-    pub fn new(cfg: Config, storage: S) -> Self {
-        let (hs, entries, snap) = storage.load();
-        let (mut snap_index, mut snap_term, mut conf) = match &snap {
+    pub fn new(cfg: Config, mut storage: S) -> Self {
+        let (hs, mut entries, snap) = storage.load();
+        let (snap_index, snap_term, mut conf) = match &snap {
             Some(sn) => (sn.index, sn.term, sn.conf.clone()),
             None => {
                 let mut voters = Vec::new();
@@ -214,12 +221,23 @@ impl<S: Storage> Raft<S> {
                 (0, 0, Conf { voters, learners: vec![] })
             }
         };
-        for e in &entries {
+        // entries from before the snapshot are of use only if they lead up to it (the first marks where the log starts)
+        if !entries.iter().any(|e| e.index == snap_index && e.term == snap_term) {
+            entries.retain(|e| e.index > snap_index);
+        }
+        let (base_index, base_term) = match entries.first() {
+            Some(first) if first.index <= snap_index => {
+                let base = (first.index, first.term);
+                entries.remove(0);
+                base
+            }
+            _ => (snap_index, snap_term),
+        };
+        for e in entries.iter().filter(|e| e.index > snap_index) {
             if let Some(c) = &e.conf {
                 conf = c.clone();
             }
         }
-        let _ = (&mut snap_index, &mut snap_term);
         let mut r = Self {
             id: cfg.id,
             role: Role::Follower,
@@ -230,7 +248,10 @@ impl<S: Storage> Raft<S> {
             storage,
             snap_index,
             snap_term,
+            base_index,
+            base_term,
             log: entries,
+            trailing: 0,
             commit_index: snap_index,
             applied_to_ready: snap_index,
             election_ticks: cfg.election_ticks.max(4),
@@ -244,6 +265,7 @@ impl<S: Storage> Raft<S> {
             match_index: HashMap::new(),
             recent_ack: HashSet::new(),
             lease_held: false,
+            unfit: false,
             outbox: Vec::new(),
             pending_snap: None,
             sending: HashMap::new(),
@@ -269,21 +291,17 @@ impl<S: Storage> Raft<S> {
     }
 
     pub fn last_index(&self) -> u64 {
-        self.log.last().map(|e| e.index).unwrap_or(self.snap_index)
+        self.log.last().map(|e| e.index).unwrap_or(self.base_index)
     }
 
     pub fn term_at(&self, index: u64) -> Option<u64> {
         if index == 0 {
             return Some(0);
         }
-        if index == self.snap_index {
-            return Some(self.snap_term);
+        if index == self.base_index {
+            return Some(self.base_term);
         }
-        if index < self.snap_index {
-            return None;
-        }
-        let offset = (index - self.snap_index - 1) as usize;
-        self.log.get(offset).map(|e| e.term)
+        self.entry(index).map(|e| e.term)
     }
 
     pub fn last_term(&self) -> u64 {
@@ -320,7 +338,20 @@ impl<S: Storage> Raft<S> {
 
     /// The log entry at `index`, if it has not been compacted away.
     pub fn entry(&self, index: u64) -> Option<&Entry> {
-        self.log.get(index.checked_sub(self.snap_index + 1)? as usize)
+        self.log.get(index.checked_sub(self.base_index + 1)? as usize)
+    }
+
+    /// While a node is unfit it hands over any leadership and calls no election; it still votes and takes the log.
+    pub fn set_unfit(&mut self, unfit: bool) {
+        self.unfit = unfit;
+        if unfit && self.role != Role::Follower {
+            self.become_follower(self.term, None);
+        }
+    }
+
+    /// The size of the entries the latest snapshot does not stand for.
+    pub fn bytes_since_snapshot(&self) -> u64 {
+        self.log.iter().rev().take_while(|e| e.index > self.snap_index).map(|e| e.data.len() as u64).sum()
     }
 
     /// The transport's report on a message that `carries` state up to `upto`: delivered, or given up on. Every one must
@@ -358,7 +389,7 @@ impl<S: Storage> Raft<S> {
                 }
             }
             Role::Follower | Role::Candidate => {
-                if self.conf.voters.is_empty() || !self.conf.is_voter(self.id) {
+                if self.unfit || self.conf.voters.is_empty() || !self.conf.is_voter(self.id) {
                     return;
                 }
                 if self.conf.voters.len() == 1 && self.role != Role::Leader {
@@ -513,10 +544,20 @@ impl<S: Storage> Raft<S> {
             conf: self.conf.clone(),
             data,
         };
-        self.log.retain(|e| e.index > index);
         self.snap_index = index;
         self.snap_term = term;
-        self.storage.save_snapshot(&snap, &self.log);
+        // the log now starts after `base`
+        let (mut base, mut size) = (index, 0);
+        while base > self.base_index + 1 && index - base < self.trailing && size < MAX_BATCH {
+            size += self.entry(base).map_or(0, |e| e.data.len());
+            base -= 1;
+        }
+        let mut kept = self.log.split_off((base - self.base_index - 1) as usize);
+        (self.base_index, self.base_term) = (base, kept[0].term);
+        // (storage is given the entry at `base` too: it is how a restart knows the term there)
+        self.storage.save_snapshot(&snap, &kept);
+        kept.remove(0);
+        self.log = kept;
     }
 
     fn broadcast_append(&mut self) {
@@ -531,13 +572,13 @@ impl<S: Storage> Raft<S> {
         let msg = if self.sending.contains_key(&peer) {
             // an empty append every log matches: it keeps the replica from calling an election while it waits
             Msg::Append { term: self.term, prev_index: 0, prev_term: 0, entries: vec![], commit: self.commit_index }
-        } else if next <= self.snap_index {
+        } else if next <= self.base_index {
             let Some(snap) = self.storage.snapshot() else { return };
             Msg::Snapshot { term: self.term, snap }
         } else {
             let prev_index = next - 1;
             let prev_term = self.term_at(prev_index).unwrap_or(0);
-            let offset = (next - self.snap_index - 1) as usize;
+            let offset = (next - self.base_index - 1) as usize;
             let mut size = 0;
             let fits = |e: &&Entry| {
                 let room = size < MAX_BATCH;
@@ -648,7 +689,7 @@ impl<S: Storage> Raft<S> {
                     }
                 }
                 if let Some(first_new) = changed_from {
-                    let pos = (first_new - self.snap_index - 1) as usize;
+                    let pos = (first_new - self.base_index - 1) as usize;
                     let tail = self.log[pos..].to_vec();
                     self.storage.append_entries(first_new, &tail);
                 }
@@ -708,6 +749,7 @@ impl<S: Storage> Raft<S> {
                     self.log.retain(|e| e.index > snap.index);
                     self.snap_index = snap.index;
                     self.snap_term = snap.term;
+                    (self.base_index, self.base_term) = (snap.index, snap.term);
                     self.conf = snap.conf.clone();
                     self.commit_index = snap.index;
                     self.applied_to_ready = snap.index;
@@ -741,12 +783,7 @@ impl<S: Storage> Raft<S> {
         let mut committed = Vec::new();
         if self.commit_index > self.applied_to_ready {
             for idx in (self.applied_to_ready + 1)..=self.commit_index {
-                if idx > self.snap_index {
-                    let pos = (idx - self.snap_index - 1) as usize;
-                    if let Some(e) = self.log.get(pos) {
-                        committed.push(e.clone());
-                    }
-                }
+                committed.extend(self.entry(idx).cloned());
             }
             self.applied_to_ready = self.commit_index;
         }
@@ -852,6 +889,61 @@ mod tests {
         assert!(batches(&mut leader).is_empty());
         reply(&mut leader, 5);
         assert_eq!(batches(&mut leader), [[6]]);
+    }
+
+    #[test]
+    fn a_cut_keeps_entries_for_a_replica_a_little_way_behind() {
+        let config = || Config { id: 1, peers: vec![2], election_ticks: 8, heartbeat_ticks: 2, seed: 1, join: false };
+        let storage = std::rc::Rc::new(std::cell::RefCell::new(MemStorage::new()));
+        let mut leader = Raft::new(config(), Shared(storage.clone()));
+        while leader.role != Role::Candidate {
+            leader.tick();
+        }
+        let term = leader.term;
+        leader.step(2, Msg::VoteReply { term, granted: true });
+        for k in 0..9 {
+            leader.propose(vec![k; 10]).unwrap();
+        }
+        let reply = |leader: &mut Raft<Shared>, success, match_index| leader.step(2, Msg::AppendReply { term, success, match_index });
+        reply(&mut leader, true, 10);
+        leader.trailing = 3;
+        leader.compact(10, b"state".to_vec());
+        assert_eq!((leader.snapshot_index(), leader.bytes_since_snapshot()), (10, 0));
+        assert!(leader.entry(7).is_none() && leader.entry(8).is_some() && leader.term_at(7) == Some(term));
+        // what a replica is sent when its log ends at `last`
+        let mut sent = |last| {
+            leader.sent(2, 10, false);
+            leader.ready();
+            reply(&mut leader, false, last);
+            leader.ready().messages.pop().unwrap().1
+        };
+        assert!(matches!(sent(7), Msg::Append { prev_index: 7, .. }));
+        assert!(matches!(sent(6), Msg::Snapshot { .. }));
+        // a restart finds the same log
+        let again = Raft::new(config(), Shared(storage.clone()));
+        assert!(again.entry(7).is_none() && again.entry(8).is_some() && again.term_at(7) == Some(term));
+        assert_eq!((again.last_index(), again.commit_index), (10, 10));
+    }
+
+    #[derive(Clone)]
+    struct Shared(std::rc::Rc<std::cell::RefCell<MemStorage>>);
+
+    impl Storage for Shared {
+        fn load(&mut self) -> (HardState, Vec<Entry>, Option<Snapshot>) {
+            self.0.borrow_mut().load()
+        }
+        fn save_hard_state(&mut self, hs: &HardState) {
+            self.0.borrow_mut().save_hard_state(hs)
+        }
+        fn append_entries(&mut self, from: u64, entries: &[Entry]) {
+            self.0.borrow_mut().append_entries(from, entries)
+        }
+        fn save_snapshot(&mut self, snap: &Snapshot, rest: &[Entry]) {
+            self.0.borrow_mut().save_snapshot(snap, rest)
+        }
+        fn snapshot(&self) -> Option<Snapshot> {
+            self.0.borrow().snapshot()
+        }
     }
 
     #[test]

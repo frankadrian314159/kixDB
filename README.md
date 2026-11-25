@@ -45,8 +45,8 @@ kix --connect 127.0.0.1:5000
 ```
 
 Tables are spread over the shards and queries give the answers one server would give. Shards can be replicated with
-Raft. Read [what the cluster does not guarantee](docs/distributed.md#limits) before relying on it: in particular a write
-that spans shards is not atomic. Nodes talk over [mutual TLS](docs/distributed.md#security), unless started with
+Raft, and a write that spans shards is made [on all of them or none](docs/distributed.md#writes-that-span-shards). Read
+[what the cluster does not guarantee](docs/distributed.md#limits) before relying on it. Nodes talk over [mutual TLS](docs/distributed.md#security), unless started with
 `--insecure`.
 
 ## Layout

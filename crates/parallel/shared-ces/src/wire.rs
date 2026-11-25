@@ -15,6 +15,7 @@ pub const ACTION_STATUS: &str = "status";
 pub const ACTION_METRICS: &str = "metrics";
 pub const ACTION_MEMBERS: &str = "members";
 pub const ACTION_RAFT: &str = "raft";
+pub const ACTION_TXN: &str = "txn";
 
 /// Message prefix of the status with which a Raft follower redirects to the current leader (followed by its address).
 pub const NOT_LEADER_PREFIX: &str = "NOTLEADER|";
@@ -78,14 +79,50 @@ impl LoadReq {
     }
 }
 
+/// One shard's part of a change that spans shards.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum TxnOp {
+    Load(LoadReq),
+    Mutate(MutateReq),
+}
+
+impl TxnOp {
+    /// Whether it changes anything (a duplicate check only looks).
+    pub fn changes(&self) -> bool {
+        !matches!(self, TxnOp::Load(LoadReq { mode: LoadMode::CheckInsert, .. }))
+    }
+}
+
+/// A step of a two-phase commit (`txid` names the change).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum TxnReq {
+    /// Work the operations out and hold them. `primary` is the shard whose commit decides for all.
+    Prepare { txid: u64, primary: u32, ops: Vec<TxnOp> },
+    /// Make the change held; `primary` when this shard is the one that decides. `forget` names changes every shard has
+    /// committed, which a primary need not remember (told along with the next commit, to spare a request).
+    Commit { txid: u64, primary: bool, forget: Vec<u64> },
+    /// Drop the change held, unless this shard, as primary, committed it.
+    Abort { txid: u64 },
+    /// Which change is held.
+    Pending,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum TxnReply {
+    Done,
+    /// The answers of the mutations among the operations (IPC-encoded), in order.
+    Prepared(Vec<Vec<u8>>),
+    Outcome { committed: bool },
+    /// The change held, and its primary.
+    Pending(Option<(u64, u32)>),
+}
+
 /// Run an `update` / `delete` over a table slice. `query` reads the slice (with its [`ORD_COL`] column when the table
-/// has ordinals) and returns the new one. With `apply` false the query is only evaluated, so that the control node can
-/// find an error on any shard before any shard changes.
+/// has ordinals) and returns the new one.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MutateReq {
     pub table: String,
     pub query: Expr,
-    pub apply: bool,
 }
 
 /// Shard-to-shard exchange: evaluate `scan` (a table), partition its rows by the hash of the `key_cols` (none: every

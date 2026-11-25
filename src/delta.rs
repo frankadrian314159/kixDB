@@ -1,7 +1,7 @@
 //! What changed between two values of a variable, so that the log and the replicas need only that: the columns of a
-//! table (or a vector) that changed, and of those that only grew, only the new items.
+//! table (or a vector) that changed, of those that only grew only the new items, and of rows only removed their numbers.
 use crate::sym::SymId;
-use crate::types::{ColVec, K};
+use crate::types::{Attr, ColVec, K};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -16,6 +16,17 @@ pub enum ColChange {
 pub type Changes = Vec<(u32, ColChange)>;
 
 type Columns<'a> = (Vec<&'a ColVec>, [&'a [SymId]; 2]);
+
+/// Rows removed from a vector or table whose other rows stayed as they were.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Removed {
+    /// The rows there were.
+    pub at: u64,
+    /// The numbers of those removed, rising.
+    pub rows: Vec<u64>,
+    /// The attributes the columns are left with.
+    pub attrs: Vec<Attr>,
+}
 
 /// The columns of a vector (just itself) or a table, with the column names.
 fn columns(v: &K) -> Option<Columns<'_>> {
@@ -52,6 +63,42 @@ fn begins(a: &ColVec, b: &ColVec) -> bool {
         };
     }
     on!(Bool Guid Byte Short Int Long Char Sym Timestamp Month Date Timespan Minute Second Time; Real Float Datetime)
+}
+
+/// Whether row `i` of `a` and row `j` of `b`, a column of the same type, hold the same bits.
+fn same_item(a: &ColVec, i: usize, b: &ColVec, j: usize) -> bool {
+    macro_rules! on {
+        ($($same:ident)*; $($float:ident)*) => {
+            match (a, b) {
+                $((ColVec::$same(_, x), ColVec::$same(_, y)) => x[i] == y[j],)*
+                $((ColVec::$float(_, x), ColVec::$float(_, y)) => x[i].to_bits() == y[j].to_bits(),)*
+                (ColVec::General(_, x), ColVec::General(_, y)) => identical(&x[i], &y[j]),
+                _ => false,
+            }
+        };
+    }
+    on!(Bool Guid Byte Short Int Long Char Sym Timestamp Month Date Timespan Minute Second Time; Real Float Datetime)
+}
+
+/// The rows whose removal turns `old` into `new`, when that is how they differ and fewer rows go than stay.
+pub fn removed(old: &K, new: &K) -> Option<Removed> {
+    let ((a, a_names), (b, b_names)) = (columns(old)?, columns(new)?);
+    let (n, m) = (a.first()?.len(), b.first()?.len());
+    if std::mem::discriminant(old) != std::mem::discriminant(new) || a_names != b_names || n <= m || n - m >= m {
+        return None;
+    }
+    // each row of `old` is either the next row of `new` or one that was removed
+    let (mut rows, mut kept) = (vec![], 0);
+    for i in 0..n {
+        if kept < m && a.iter().zip(&b).all(|(a, b)| same_item(a, i, b, kept)) {
+            kept += 1;
+        } else if rows.len() < n - m {
+            rows.push(i as u64);
+        } else {
+            return None;
+        }
+    }
+    (kept == m).then(|| Removed { at: n as u64, rows, attrs: b.iter().map(|c| c.attr()).collect() })
 }
 
 /// The changes that turn `old` into `new`, or `None` when `new` is as well written whole: it is not a vector or table
@@ -93,17 +140,48 @@ fn extend(col: &mut ColVec, at: u64, tail: &ColVec) -> bool {
     on!(General Bool Guid Byte Short Int Long Real Float Char Sym Timestamp Month Date Datetime Timespan Minute Second Time)
 }
 
-/// Make `changes` to `value`; `false` if they were not made from a value like it.
-pub fn patch(value: &mut K, changes: &Changes) -> bool {
-    let mut cols: Vec<&mut ColVec> = match value {
+/// The columns of a vector or table, to change.
+fn columns_mut(value: &mut K) -> Option<Vec<&mut ColVec>> {
+    Some(match value {
         K::Vector(c) => vec![c],
         K::Table(f) => Arc::make_mut(f).vals.iter_mut().collect(),
         K::KeyedTable(t) => {
             let t = Arc::make_mut(t);
             t.keys.vals.iter_mut().chain(&mut t.vals.vals).collect()
         }
-        _ => return false,
-    };
+        _ => return None,
+    })
+}
+
+/// Remove rows from `value`; `false` if they were not found in a value like it.
+pub fn remove(value: &mut K, removed: &Removed) -> bool {
+    let Some(mut cols) = columns_mut(value) else { return false };
+    if cols.len() != removed.attrs.len() || cols.iter().any(|c| c.len() as u64 != removed.at) {
+        return false;
+    }
+    for (col, &attr) in cols.iter_mut().zip(&removed.attrs) {
+        macro_rules! on {
+            ($($v:ident)*) => {
+                match &mut **col {
+                    $(ColVec::$v(_, x) => {
+                        let (mut row, mut gone) = (0, removed.rows.iter().peekable());
+                        Arc::make_mut(x).retain(|_| {
+                            row += 1;
+                            gone.next_if_eq(&&(row - 1)).is_none()
+                        });
+                    })*
+                }
+            };
+        }
+        on!(General Bool Guid Byte Short Int Long Real Float Char Sym Timestamp Month Date Datetime Timespan Minute Second Time);
+        col.set_attr_unchecked(attr);
+    }
+    true
+}
+
+/// Make `changes` to `value`; `false` if they were not made from a value like it.
+pub fn patch(value: &mut K, changes: &Changes) -> bool {
+    let Some(mut cols) = columns_mut(value) else { return false };
     changes.iter().all(|(i, change)| match (cols.get_mut(*i as usize), change) {
         (Some(col), ColChange::Append { at, tail }) => extend(col, *at, tail),
         (Some(col), ColChange::Replace(new)) => {

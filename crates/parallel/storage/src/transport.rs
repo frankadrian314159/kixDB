@@ -7,6 +7,7 @@ use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::Action;
 use futures::TryStreamExt;
 use kix_raft::{Msg, NodeId};
+use kix_shared_ces::pieces::pieces;
 use kix_shared_ces::tls::{self, NodeTls};
 use kix_shared_ces::wire::{self, LoadReq, ACTION_LOAD, ACTION_RAFT};
 use std::collections::HashMap;
@@ -17,7 +18,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tonic::transport::Channel;
 use tonic::Status;
 
-/// The largest message either side accepts.
+/// The largest message either side accepts (larger actions are sent in pieces).
 pub const MAX_MESSAGE: usize = 256 * 1024 * 1024;
 
 /// A message gets a second for each this many bytes, beyond the 2 seconds every one gets, before it is given up on.
@@ -36,8 +37,11 @@ async fn act(ch: Channel, kind: &str, body: Vec<u8>) -> Result<(), Status> {
         FlightError::Tonic(s) => *s,
         other => Status::unavailable(other.to_string()),
     };
-    let mut results = FlightClient::new_from_inner(client).do_action(Action::new(kind, body)).await.map_err(status)?;
-    while results.try_next().await.map_err(status)?.is_some() {}
+    let mut client = FlightClient::new_from_inner(client);
+    for (kind, body) in pieces(kind, body) {
+        let mut results = client.do_action(Action::new(kind, body)).await.map_err(status)?;
+        while results.try_next().await.map_err(status)?.is_some() {}
+    }
     Ok(())
 }
 

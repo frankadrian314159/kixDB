@@ -9,6 +9,8 @@
 //!
 //! Other flags: `--join` (a new replica that waits for `ADD REPLICA`), `--addr HOST:PORT` (how the others reach this
 //! replica, when not the listen address), `--snapshot-every N` (applied entries between Raft snapshots; 5000),
+//! `--log-limit-mb N` (size of the entries that calls for a snapshot sooner; 256; 0: none), `--stall-timeout SECS` (a
+//! leader busy this long with one request hands over; 300; 0: never),
 //! `--drain-secs N` (how long requests may take to finish when the node is told to stop; 15) and `--metrics-listen
 //! HOST:PORT` (serve `/metrics` in the Prometheus text format and `/health`). The node stops gracefully on SIGTERM and
 //! Ctrl-C: it refuses new work, lets requests finish, forces the log and writes a checkpoint, then closes its listener.
@@ -30,7 +32,8 @@ fn usage() -> ! {
     eprintln!(
         "usage: kix-shard --id N --listen HOST:PORT [--data DIR] [--metrics-listen HOST:PORT] [--drain-secs N]\n       \
          kix-shard --id N --listen HOST:PORT --data DIR --replica R --peers R2=HOST:PORT,R3=HOST:PORT\n                 \
-         [--raft-dir DIR] [--join] [--addr HOST:PORT] [--snapshot-every N]\n\
+         [--raft-dir DIR] [--join] [--addr HOST:PORT] [--snapshot-every N] [--log-limit-mb N]\n                 \
+         [--stall-timeout SECS]\n\
          both need --node-ca FILE --node-cert FILE --node-key FILE, or --insecure"
     );
     std::process::exit(2);
@@ -51,6 +54,7 @@ async fn main() {
     let mut peers: Vec<(u64, String)> = vec![];
     let (mut raft_dir, mut addr, mut metrics_listen) = (None::<String>, None::<String>, None::<String>);
     let (mut join, mut snapshot_every, mut drain_secs) = (false, None::<u64>, 15u64);
+    let (mut log_limit, mut stall) = (None::<u64>, None::<u64>);
     let mut tls = TlsFlags::default();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -68,6 +72,8 @@ async fn main() {
             "--drain-secs" => drain_secs = parsed(args.next()),
             "--metrics-listen" => metrics_listen = args.next(),
             "--snapshot-every" => snapshot_every = Some(parsed(args.next())),
+            "--log-limit-mb" => log_limit = Some(parsed(args.next())),
+            "--stall-timeout" => stall = Some(parsed(args.next())),
             "--peers" => {
                 for p in args.next().unwrap_or_default().split(',').filter(|p| !p.is_empty()) {
                     let Some((n, a)) = p.split_once('=') else { usage() };
@@ -99,6 +105,12 @@ async fn main() {
             rc.addr = addr.unwrap_or_else(|| listen.to_string());
             if let Some(n) = snapshot_every {
                 rc.snapshot_every = n;
+            }
+            if let Some(mb) = log_limit {
+                rc.log_limit = mb << 20;
+            }
+            if let Some(secs) = stall {
+                rc.stall_limit = Duration::from_secs(secs);
             }
             ShardNode::replicated(id, server, rc).unwrap_or_else(|e| fail(format!("cannot start the replica: {e}")))
         }

@@ -16,6 +16,7 @@ use chrono::{Datelike, Local, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -151,6 +152,8 @@ pub struct SessionState {
     pub current_ns: String,
     pub handles: HashMap<i32, crate::ipc::IpcClient>,
     pub next_handle: i32,
+    /// Set (from any thread) to stop what the session is evaluating before its next step, with `'stop`.
+    pub cancel: Arc<AtomicBool>,
 }
 
 impl SessionState {
@@ -161,6 +164,7 @@ impl SessionState {
             current_ns: String::new(),
             handles: HashMap::new(),
             next_handle: 3,
+            cancel: Arc::default(),
         }
     }
 }
@@ -327,10 +331,12 @@ impl<'a> Engine<'a> {
                     // only what changed, if every reader of the record has the old value and this record's first change
                     // to the name is this one
                     let known = logged && !self.ws.unlogged.contains(name) && !self.ws.views.contains_key(name) && !changes[..i].iter().any(|c| c.0 == *name);
-                    match self.ws.vars.get(name).filter(|_| known).and_then(|old| crate::delta::diff(old, val)) {
-                        Some(changes) => LogOp::ChangeVar { name: *name, changes },
-                        None => LogOp::SetVar { name: *name, val: val.clone() },
-                    }
+                    let old = self.ws.vars.get(name).filter(|_| known);
+                    let part = old.and_then(|old| match crate::delta::diff(old, val) {
+                        Some(changes) => Some(LogOp::ChangeVar { name: *name, changes }),
+                        None => crate::delta::removed(old, val).map(|removed| LogOp::RemoveRows { name: *name, removed }),
+                    });
+                    part.unwrap_or_else(|| LogOp::SetVar { name: *name, val: val.clone() })
                 }
                 None => LogOp::DropVar { name: *name },
             })
@@ -502,6 +508,9 @@ impl<'a> Engine<'a> {
     }
 
     fn eval_step(&mut self, expr: &Expr) -> Result<K, StepErr> {
+        if self.session.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(KError::new("stop", "the request was cancelled").into());
+        }
         match expr {
             Expr::Nop => Ok(K::Null),
             Expr::Lit(k) => Ok(k.clone()),

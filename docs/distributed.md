@@ -8,7 +8,7 @@ data. Clients use the same kdb+ IPC protocol as with one server. The control nod
 | `kix-control` | the control node: distribution, query planning, merging, IPC gateway |
 | `kix-storage` | a shard: a complete single-node engine behind an Arrow Flight service, optionally a Raft replica |
 | `kix-raft` | Raft: election, log replication, leader lease, snapshots, membership; tested under a simulated faulty network |
-| `kix-shared-ces` | configuration, wire messages, Arrow conversion, key routing, metrics |
+| `kix-shared-ces` | configuration, wire messages, Arrow conversion, key routing, TLS, metrics |
 
 ## Running
 
@@ -190,6 +190,25 @@ gathered.
   alone and no distribution column changes. They are evaluated on every shard before any applies, so an error changes nothing.
 * Any other change gathers the table, applies it on the control node, and distributes the table again.
 
+### Writes that span shards
+
+A change that touches more than one shard, including a statement that changes several tables, is made on all of them or on
+none (two-phase commit):
+
+1. Every shard **prepares** its part: it works it out, so that an error on any shard (a duplicate key, a type) stops the
+   change, and stores the request (logged, and replicated on a replicated shard).
+2. The first of the shards, the **primary**, commits and remembers that it did; then the others commit.
+
+Whether the primary committed decides for all. If a shard does not prepare, the change is abandoned. If the control node
+or a shard fails during step 2, the change is finished or abandoned when they can be reached again: the next statement
+(and any control node started later; no state file is needed for this) asks the primary, and has the others follow. A
+statement tries at once after a failure, then every 5 seconds.
+
+* Until then a shard holding a prepared change takes no other (`'cluster`), and if the primary had committed, a shard
+  that has not heard yet still shows its old rows.
+* If the primary stops answering just as it is asked to commit, the statement says the change may or may not be made.
+* Such a change stores its rows twice and takes two or three times as long as one that a single shard can make.
+
 ## Concurrency
 
 There is one control node. Pushed-down reads and selective partial gathers (`slice`) share the cluster concurrently
@@ -200,15 +219,25 @@ writes and full-table mirror gathers take exclusive cluster access.
 
 A replicated shard elects a leader. A change takes effect only after a majority of replicas has logged it; without a
 majority writes fail with `'cluster`. When the leader dies the control node finds the new one. Replicas cut their Raft
-log with snapshots (`--snapshot-every`, 5,000 entries), and one that fell behind is sent a snapshot.
+log with snapshots (`--snapshot-every`, 5,000 entries, or sooner when the entries since the last reach `--log-limit-mb`,
+256, as the log is held in memory). A cut keeps up to a quarter of `--snapshot-every` entries (at most 1,000, and 4 MB)
+behind it, so that a replica a little way behind is sent entries; one further behind is sent the snapshot.
 
 The leader has one thing on its way to each replica at a time, a snapshot or a batch of log records (a batch takes no
 further record once it holds 4 MB), over a connection of its own; heartbeats go on meanwhile. It is given 2 seconds and
-a second more for each megabyte before it is sent again. Neither a snapshot nor a record can be larger than 256 MB.
+a second more for each megabyte before it is sent again.
+
+A snapshot, a batch of records or a table load larger than 64 MB is sent in pieces of that size, so that none of them has
+a size limit of its own; the node that receives one holds it in memory until it is whole. (A single statement sent to a
+shard, with any values written in it, must still fit in 256 MB.)
 
 A log record holds what changed ([storage.md](storage.md)): an `insert` replicates its rows, an `update` the columns it
-assigns (the first change to a table after a replica starts replicates it whole). A `delete` or a re-sort always does,
-so on a table of many megabytes it takes correspondingly long, and can time out.
+assigns, a `delete` the numbers of its rows. A re-sort, a `delete` of most rows and, in a group just made from existing
+data, the first change to each table replicate the table whole. To make a group from an existing directory, copy it to
+every replica before starting them.
+
+**Keep any one change to a replicated shard well under 64 MB.** While a replica handles a message that large, its
+heartbeats wait, so the leader can change and the statement fail (`'cluster`).
 
 A replica keeps its Raft state in `raft.log`, to which records are added and which is written afresh when it is cut, and
 `raft.snap`, the latest snapshot. It takes over the single `raft.bin` of earlier versions, which cannot read the new
@@ -243,15 +272,22 @@ shards must match.
 ## When a shard does not answer
 
 * **A node or link gone silent:** while a request is open, nodes ping one another; a connection that answers nothing for
-  15 seconds is given up. A read of a replicated shard then tries its other replicas.
+  15 seconds is given up. A read of a replicated shard then tries its other replicas. A ping waits behind the data
+  already on its way, so links between nodes need at least about 100 kB/s: at 20 kB/s a large transfer is taken for
+  silence.
 * **A shard that takes too long:** `kix-cluster --request-timeout SECS` (300; 0: no limit; from Rust,
   `Cluster::set_request_timeout`) fails a statement whose shard has not answered in that time, and statements waiting
   behind it go on. Raise it if queries or loads legitimately take longer. Requests for status and metrics get at most 10
   seconds.
-* **A change that fails this way may still be made:** the error says so. The shard goes on with what it was doing, and
-  other shards may already have applied their part. Check the data before running the statement again.
-* A replica whose engine is stuck can remain the leader, since replication goes on without the engine: its requests fail
-  until it is restarted.
+* **A change on one shard that fails this way may still be made:** the error says so; check the data before running the
+  statement again. A change that spans shards is abandoned by all unless its primary committed (see
+  [Writes that span shards](#writes-that-span-shards)).
+* When a caller gives up, the shard stops the request's evaluation before its next step (`'stop`): loops and statements
+  of several steps end, though one operation on a large vector finishes first. What the request had already changed stays.
+* **A replicated shard's leader** whose engine has been busy with one request for `kix-shard --stall-timeout SECS` (300;
+  0: never) hands leadership to another replica, and takes it up again only when that request has ended. A long query
+  that is not stuck counts too; keep the setting above your longest.
+* A shard that is not replicated and truly stuck fails its requests until it is restarted.
 
 ## Operations
 
@@ -261,15 +297,14 @@ shards must match.
 
 ## Limits
 
-* **A write that spans shards is not atomic.** There is no two-phase commit: if a shard fails while a statement is being
-  applied, other shards keep their part. This includes the redistribution after a gathered change.
+* **Upgrade the control node and all shards together:** the messages between them change from version to version.
 * **Every node is trusted fully.** A certificate of the cluster's authority gives full access to every shard, and
   certificates cannot be revoked one by one (see [Security](#security)).
 * **The control node is a single point of failure**, and gathering needs memory there for the whole table.
 * **The number of shards is fixed** when the cluster is created. There is no rebalancing.
 * **Floating point sums** added in two phases can differ from one server's in the last digits.
 * A shard runs one request at a time.
-* A change that is not an append or an assignment to some columns (a `delete`, a re-sort) is logged and replicated as the
-  whole new value of the table's slice (see [storage.md](storage.md)). A replica's log is held in memory until it is cut.
+* A change that is not an append, an assignment to some columns or a removal of rows (a re-sort, for one) is logged and
+  replicated as the whole new value of the table's slice (see [storage.md](storage.md)).
 * Tables move between shards (shuffle and broadcast) as kdb+ IPC bytes inside Flight actions; query results stream as
   Arrow batches.

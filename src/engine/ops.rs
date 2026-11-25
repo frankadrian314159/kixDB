@@ -2335,7 +2335,7 @@ fn find_or_roll_op(lhs: &K, rhs: &K) -> KResult<K> {
 
     // 2. Find (`vec ? x`): first index of each item of `rhs` in `lhs` (`count lhs` if not found, as in kdb+!)
     if let K::Vector(hay) = lhs {
-        if hay.attr() != Attr::None {
+        if crate::index::finds(hay) {
             if let K::Vector(needles) = rhs {
                 let out: Vec<i64> = (0..needles.len())
                     .map(|i| crate::index::find_first(hay, &needles.get_atom(i)).unwrap_or_else(|| hay.len()) as i64)

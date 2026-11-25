@@ -33,6 +33,8 @@ pub(crate) enum Input {
     Message(NodeId, Msg),
     /// Whether what was sent to this replica, up to an index, was delivered.
     Sent(NodeId, u64, bool),
+    /// Whether this node is fit to lead.
+    Unfit(bool),
 }
 
 /// A Raft message on the wire.
@@ -60,8 +62,12 @@ pub struct ReplicaConfig {
     pub join: bool,
     /// Take a snapshot and cut the log after this many applied entries (0: never).
     pub snapshot_every: u64,
+    /// Take one too when the entries since the last hold this many bytes, as the log is kept in memory (0: no limit).
+    pub log_limit: u64,
     /// How long a change waits for a majority.
     pub commit_timeout: Duration,
+    /// A leader whose engine has been busy with one request for this long hands over (zero: never).
+    pub stall_limit: Duration,
     /// Mutual TLS between the replicas and towards callers; `None`: unprotected connections.
     pub tls: Option<NodeTls>,
 }
@@ -79,7 +85,9 @@ impl ReplicaConfig {
             addr: String::new(),
             join: false,
             snapshot_every: 5000,
+            log_limit: 256 << 20,
             commit_timeout: Duration::from_secs(10),
+            stall_limit: Duration::from_secs(300),
             tls: None,
         }
     }
@@ -136,8 +144,12 @@ impl Replica {
         if let Some(snapshot) = storage.snapshot() {
             server.restore_state(&snapshot.data).map_err(std::io::Error::other)?;
         }
-        server.log_values_whole();
-        let raft = Raft::new(raft_cfg, storage);
+        let mut raft = Raft::new(raft_cfg, storage);
+        // a group being made from existing data: its other members may not hold what this one does
+        if raft.term == 0 && raft.last_index() == 0 {
+            server.log_values_whole();
+        }
+        raft.trailing = (cfg.snapshot_every / 4).min(1000);
         let (otx, orx) = tokio::sync::mpsc::unbounded_channel();
         let (itx, irx) = mpsc::channel();
         let (atx, arx) = mpsc::channel();
@@ -159,8 +171,8 @@ impl Replica {
         transport::spawn_sender(cfg.node_id, book, cfg.tls.clone(), orx, replica.inbox.clone());
         let (me, tick) = (replica.clone(), Duration::from_millis(cfg.tick_ms.max(1)));
         std::thread::Builder::new().name(format!("raft-{}", cfg.node_id)).spawn(move || me.run(irx, tick))?;
-        let (me, every) = (replica.clone(), cfg.snapshot_every);
-        std::thread::Builder::new().name(format!("raft-apply-{}", cfg.node_id)).spawn(move || me.applier(arx, every))?;
+        let (me, every, limit) = (replica.clone(), cfg.snapshot_every, cfg.log_limit);
+        std::thread::Builder::new().name(format!("raft-apply-{}", cfg.node_id)).spawn(move || me.applier(arx, every, limit))?;
         Ok(replica)
     }
 
@@ -174,6 +186,11 @@ impl Replica {
 
     fn stopped(&self) -> bool {
         lock(&self.apply).is_none()
+    }
+
+    /// Say whether this node's engine is stuck, so that another should lead.
+    pub fn set_unfit(&self, unfit: bool) {
+        let _ = self.inbox.send(Input::Unfit(unfit));
     }
 
     /// A message from a peer.
@@ -260,6 +277,7 @@ impl Replica {
                 match input {
                     Input::Message(from, msg) => raft.step(from, msg),
                     Input::Sent(to, upto, delivered) => raft.sent(to, upto, delivered),
+                    Input::Unfit(unfit) => raft.set_unfit(unfit),
                     Input::Wake => {}
                 }
             }
@@ -272,7 +290,7 @@ impl Replica {
         }
     }
 
-    fn applier(self: Arc<Self>, entries: mpsc::Receiver<Apply>, snapshot_every: u64) {
+    fn applier(self: Arc<Self>, entries: mpsc::Receiver<Apply>, snapshot_every: u64, log_limit: u64) {
         while let Ok(item) = entries.recv() {
             let index = match item {
                 Apply::Snapshot(s) => {
@@ -295,7 +313,11 @@ impl Replica {
             };
             lock(&self.shared).applied_index = index;
             self.cv.notify_all();
-            if snapshot_every > 0 && index >= self.snapshot_index() + snapshot_every {
+            let due = {
+                let raft = lock(&self.raft);
+                (snapshot_every > 0 && index >= raft.snapshot_index() + snapshot_every) || (log_limit > 0 && raft.bytes_since_snapshot() >= log_limit)
+            };
+            if due {
                 // the export waits for statements in progress, so the state holds everything up to `index`
                 match self.server.export_state() {
                     Ok(data) => lock(&self.raft).compact(index, data),

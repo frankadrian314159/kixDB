@@ -36,10 +36,9 @@ fn key_buckets(left: &[&ColVec], nleft: usize, right: &[&ColVec], nright: usize)
 
 /// Probe row index in `kt` for each row of `left_key_cols` (`None` on miss).
 fn probe_keyed_table(kt: &KeyedTable, left_key_cols: &[&ColVec], nrows: usize) -> Vec<Option<usize>> {
-    // The index that a key column's attribute gives spares a few probes of a large table from reading every key. A
-    // general list is always looked up that way, as its index may match numbers of unlike types by value.
-    let by_index = |k: &ColVec| nrows.saturating_mul(4) < kt.nrows() || matches!(k, ColVec::General(..));
-    if kt.keys.ncols() == 1 && kt.keys.vals[0].attr() != Attr::None && -kt.keys.vals[0].type_num() == -left_key_cols[0].type_num() && by_index(&kt.keys.vals[0]) {
+    // The index that a key column's attribute gives spares a few probes of a large table from reading every key.
+    let few = nrows.saturating_mul(4) < kt.nrows();
+    if few && kt.keys.ncols() == 1 && crate::index::finds(&kt.keys.vals[0]) && kt.keys.vals[0].type_num() == left_key_cols[0].type_num() {
         let kcol = &kt.keys.vals[0];
         let lcol = left_key_cols[0];
         let klen = kcol.len();

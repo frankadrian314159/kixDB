@@ -14,14 +14,15 @@ use futures::stream::{self, BoxStream};
 use futures::{StreamExt, TryStreamExt};
 use kix_shared_ces::arrowconv;
 use kix_shared_ces::metrics::NodeMetrics;
+use kix_shared_ces::pieces::{Assembly, ACTION_PIECE};
 use kix_shared_ces::route::shard_for_keys;
 use kix_shared_ces::NodeTls;
-use kix_shared_ces::wire::{self, ord_var, Fragment, LoadMode, LoadReq, MemberReq, MutateReq, ShardStatus, ShuffleReq, Work};
+use kix_shared_ces::wire::{self, ord_var, Fragment, LoadMode, LoadReq, MemberReq, MutateReq, ShardStatus, ShuffleReq, TxnReq, Work};
 use kixdb::engine::joins::union_join;
 use kixdb::ipc::encode_k_payload;
-use kixdb::sym::intern;
+use kixdb::sym::{intern, SymId};
 use kixdb::{Attr, ColVec, Connection, Flip, KError, KResult, KeyedTable, Server, K};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -29,6 +30,7 @@ use std::time::{Duration, Instant};
 use tonic::{Request, Response, Status, Streaming};
 
 pub mod replica;
+mod txn;
 mod transport;
 pub use replica::{Replica, ReplicaConfig};
 use transport::MAX_MESSAGE;
@@ -45,10 +47,33 @@ struct Core {
     /// One change of a table slice at a time: each reads the slice, then writes it.
     writes: Mutex<()>,
     peers: transport::Peers,
+    /// Actions arriving in pieces.
+    pieces: Assembly,
     started: Instant,
     in_flight: AtomicU64,
     statements: AtomicU64,
     draining: AtomicBool,
+    /// When each piece of engine work now running began, oldest first.
+    running: Mutex<BTreeMap<u64, Instant>>,
+    next_work: AtomicU64,
+}
+
+/// A piece of engine work, listed in `Core::running` while it runs.
+struct Running<'a>(&'a Core, u64);
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        self.0.running.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.1);
+    }
+}
+
+/// Stops the engine work of a request that is dropped, as one is when its caller gives up.
+struct Cancel(Arc<AtomicBool>);
+
+impl Drop for Cancel {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
 
 /// A request being served (counted until it ends).
@@ -95,19 +120,27 @@ fn row_keys(f: &Flip, nkeys: usize) -> Vec<Vec<u8>> {
     (0..f.nrows()).map(|r| f.vals[..nkeys].iter().flat_map(|c| c.get_atom(r).hash_key()).collect()).collect()
 }
 
-/// Carry out a load on the engine behind `conn`.
-fn apply_load(conn: &mut Connection, req: &LoadReq) -> KResult<()> {
+/// Variables to set (`Some`) or drop (`None`).
+type Changes = Vec<(SymId, Option<K>)>;
+
+/// What a load would change on the engine behind `conn`, were `staged` made first.
+fn load_changes(conn: &mut Connection, staged: &Changes, req: &LoadReq) -> KResult<Changes> {
     let (table, ords) = (intern(&req.table), intern(&ord_var(&req.table)));
     if req.mode == LoadMode::Drop {
-        return conn.set_vars(vec![(table, None), (ords, None)]);
+        return Ok(vec![(table, None), (ords, None)]);
     }
     let rows = req.rows()?;
     if req.mode == LoadMode::Replace {
         let ordinals = req.ords.clone().map(long_vec);
-        return conn.set_vars(vec![(table, Some(rows)), (ords, ordinals)]);
+        return Ok(vec![(table, Some(rows)), (ords, ordinals)]);
     }
     let incoming = unkeyed(&rows)?;
-    let current = conn.get_var_direct(&req.table)?;
+    let mut value = |name: &str| match staged.iter().find(|c| c.0 == intern(name)) {
+        Some((_, Some(v))) => Ok(v.clone()),
+        Some((_, None)) => Err(KError::value(name.to_string())),
+        None => conn.get_var_direct(name),
+    };
+    let current = value(&req.table)?;
     // the incoming rows that become new rows of the slice
     let (merged, added): (K, Vec<usize>) = match (&current, req.mode) {
         (K::Table(t), LoadMode::Append) => (K::Table(Arc::new(t.concat(&incoming)?)), (0..incoming.nrows()).collect()),
@@ -118,7 +151,7 @@ fn apply_load(conn: &mut Connection, req: &LoadReq) -> KResult<()> {
             if req.mode == LoadMode::CheckInsert {
                 return match new.iter().any(|k| seen.contains(k)) {
                     true => Err(KError::new("insert", "duplicate key in keyed table insert")),
-                    false => Ok(()),
+                    false => Ok(vec![]),
                 };
             }
             let added = new.into_iter().enumerate().filter_map(|(i, k)| seen.insert(k).then_some(i)).collect();
@@ -128,18 +161,18 @@ fn apply_load(conn: &mut Connection, req: &LoadReq) -> KResult<()> {
     };
     let mut changes = vec![(table, Some(merged))];
     if let Some(new) = &req.ords {
-        let mut all = match conn.get_var_direct(&ord_var(&req.table))? {
+        let mut all = match value(&ord_var(&req.table))? {
             K::Vector(ColVec::Long(_, v)) => (*v).clone(),
             _ => return Err(KError::new("cluster", "row ordinals are missing")),
         };
         all.extend(added.iter().map(|&i| new[i]));
         changes.push((ords, Some(long_vec(all))));
     }
-    conn.set_vars(changes)
+    Ok(changes)
 }
 
-/// Run an `update` / `delete` over a slice; returns the empty table with the resulting columns.
-fn apply_mutation(conn: &mut Connection, req: &MutateReq) -> KResult<K> {
+/// Work out an `update` / `delete` over a slice: the empty table with the resulting columns, and what would change.
+fn mutation_changes(conn: &mut Connection, req: &MutateReq) -> KResult<(K, Changes)> {
     let result = conn.eval_expr(&req.query)?;
     let nkeys = match &result {
         K::KeyedTable(kt) => kt.keys.ncols(),
@@ -151,14 +184,11 @@ fn apply_mutation(conn: &mut Connection, req: &MutateReq) -> KResult<K> {
         K::Vector(flip.vals.remove(i))
     });
     let schema = KeyedTable::from_flip_nkeys(&flip.take(0), nkeys)?;
-    if req.apply {
-        let mut changes = vec![(intern(&req.table), Some(KeyedTable::from_flip_nkeys(&flip, nkeys)?))];
-        if let Some(o) = ordinals {
-            changes.push((intern(&ord_var(&req.table)), Some(o)));
-        }
-        conn.set_vars(changes)?;
+    let mut changes = vec![(intern(&req.table), Some(KeyedTable::from_flip_nkeys(&flip, nkeys)?))];
+    if let Some(o) = ordinals {
+        changes.push((intern(&ord_var(&req.table)), Some(o)));
     }
-    Ok(schema)
+    Ok((schema, changes))
 }
 
 fn evaluate(conn: &mut Connection, work: &Work) -> KResult<K> {
@@ -207,8 +237,20 @@ impl Core {
 
     /// Run engine work on a blocking thread.
     async fn blocking<T: Send + 'static>(self: &Arc<Self>, work: impl FnOnce(&Core, &mut Connection) -> KResult<T> + Send + 'static) -> Result<T, Status> {
+        let conn = self.server.connect_internal();
+        let _stop_if_dropped = Cancel(conn.cancel_flag());
+        self.to_the_end(conn, work).await
+    }
+
+    /// Run engine work on a blocking thread, whether or not its caller waits for it.
+    async fn to_the_end<T: Send + 'static>(self: &Arc<Self>, mut conn: Connection, work: impl FnOnce(&Core, &mut Connection) -> KResult<T> + Send + 'static) -> Result<T, Status> {
         let core = self.clone();
-        tokio::task::spawn_blocking(move || work(&core, &mut core.server.connect_internal()))
+        tokio::task::spawn_blocking(move || {
+            let id = core.next_work.fetch_add(1, Ordering::Relaxed);
+            core.running.lock().unwrap_or_else(|e| e.into_inner()).insert(id, Instant::now());
+            let _listed = Running(&core, id);
+            work(&core, &mut conn)
+        })
             .await
             .map_err(|e| internal(format!("the request panicked: {e}")))?
             .map_err(|e| wire::status_of(&e))
@@ -217,7 +259,9 @@ impl Core {
     async fn load(self: &Arc<Self>, req: LoadReq) -> Result<(), Status> {
         self.blocking(move |core, conn| {
             let _one = core.writes.lock().unwrap_or_else(|e| e.into_inner());
-            apply_load(conn, &req)
+            txn::check_free(&core.server, &req.table)?;
+            let changes = load_changes(conn, &vec![], &req)?;
+            conn.set_vars(changes)
         })
         .await
     }
@@ -321,8 +365,27 @@ impl ShardNode {
     /// log in `cfg.dir`. Must be called inside a tokio runtime.
     pub fn replicated(shard_id: u32, server: Server, cfg: ReplicaConfig) -> std::io::Result<ShardNode> {
         let tls = cfg.tls.clone();
+        let limit = cfg.stall_limit;
         let replica = Replica::start(cfg, server.clone())?;
-        Ok(ShardNode::build(shard_id, server, Some(replica)).with_tls(tls))
+        let node = ShardNode::build(shard_id, server, Some(replica.clone())).with_tls(tls);
+        if !limit.is_zero() {
+            // (it ends with the node, which it does not keep alive)
+            let core = Arc::downgrade(&node.core);
+            tokio::spawn(async move {
+                let mut stuck = false;
+                while let Some(core) = core.upgrade() {
+                    let oldest = core.running.lock().unwrap_or_else(|e| e.into_inner()).values().next().copied();
+                    let now = oldest.is_some_and(|since| since.elapsed() >= limit);
+                    if now != stuck {
+                        stuck = now;
+                        replica.set_unfit(stuck);
+                    }
+                    drop(core);
+                    tokio::time::sleep(limit.min(Duration::from_secs(1)) / 5).await;
+                }
+            });
+        }
+        Ok(node)
     }
 
     /// Require mutual TLS of every caller and use it towards the other shards (`None`: unprotected connections). A
@@ -339,10 +402,13 @@ impl ShardNode {
             replica,
             writes: Mutex::default(),
             peers: Default::default(),
+            pieces: Assembly::default(),
             started: Instant::now(),
             in_flight: AtomicU64::new(0),
             statements: AtomicU64::new(0),
             draining: AtomicBool::new(false),
+            running: Mutex::default(),
+            next_work: AtomicU64::new(0),
         };
         ShardNode { core: Arc::new(core) }
     }
@@ -386,8 +452,13 @@ impl FlightService for ShardNode {
     }
 
     async fn do_action(&self, request: Request<Action>) -> Result<Response<Self::DoActionStream>, Status> {
-        let action = request.into_inner();
+        let mut action = request.into_inner();
         let core = &self.core;
+        let reply = |body: Vec<u8>| Response::new(stream::iter(vec![Ok(arrow_flight::Result { body: body.into() })]).boxed());
+        if action.r#type == ACTION_PIECE {
+            let Some((kind, body)) = core.pieces.add(&action.body).map_err(Status::invalid_argument)? else { return Ok(reply(vec![])) };
+            action = Action::new(kind, body);
+        }
         let encode = |r: Result<Vec<u8>, postcard::Error>| r.map_err(internal);
         let body: Vec<u8> = match action.r#type.as_str() {
             wire::ACTION_LOAD => {
@@ -401,9 +472,27 @@ impl FlightService for ShardNode {
                 let _busy = core.admit()?;
                 core.blocking(move |core, conn| {
                     let _one = core.writes.lock().unwrap_or_else(|e| e.into_inner());
-                    Ok(encode_k_payload(&apply_mutation(conn, &req)?))
+                    txn::check_free(&core.server, &req.table)?;
+                    let (schema, changes) = mutation_changes(conn, &req)?;
+                    conn.set_vars(changes)?;
+                    Ok(encode_k_payload(&schema))
                 })
                 .await?
+            }
+            wire::ACTION_TXN => {
+                let req: TxnReq = decode(&action.body)?;
+                let _busy = core.admit()?;
+                // a commit goes on without its caller: it must not stop half decided
+                let commits = matches!(req, TxnReq::Commit { .. });
+                let work = move |core: &Core, conn: &mut Connection| {
+                    let _one = core.writes.lock().unwrap_or_else(|e| e.into_inner());
+                    txn::run(&core.server, conn, req)
+                };
+                let reply = match commits {
+                    true => core.to_the_end(core.server.connect_internal(), work).await?,
+                    false => core.blocking(work).await?,
+                };
+                encode(postcard::to_allocvec(&reply))?
             }
             wire::ACTION_SHUFFLE => {
                 let req: ShuffleReq = decode(&action.body)?;
@@ -446,12 +535,11 @@ impl FlightService for ShardNode {
             }
             other => return Err(Status::unimplemented(format!("unknown action {other}"))),
         };
-        let one = arrow_flight::Result { body: body.into() };
-        Ok(Response::new(stream::iter(vec![Ok(one)]).boxed()))
+        Ok(reply(body))
     }
 
     async fn list_actions(&self, _r: Request<Empty>) -> Result<Response<Self::ListActionsStream>, Status> {
-        let names = [wire::ACTION_LOAD, wire::ACTION_MUTATE, wire::ACTION_SHUFFLE, wire::ACTION_STATUS, wire::ACTION_METRICS, wire::ACTION_MEMBERS, wire::ACTION_RAFT];
+        let names = [wire::ACTION_LOAD, wire::ACTION_MUTATE, wire::ACTION_SHUFFLE, wire::ACTION_STATUS, wire::ACTION_METRICS, wire::ACTION_MEMBERS, wire::ACTION_RAFT, wire::ACTION_TXN];
         let acts = names.map(|n| Ok(ActionType { r#type: n.to_string(), description: String::new() }));
         Ok(Response::new(stream::iter(acts).boxed()))
     }

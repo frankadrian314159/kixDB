@@ -6,8 +6,9 @@ use arrow_flight::{Action, Ticket};
 use futures::TryStreamExt;
 use kix_shared_ces::arrowconv;
 use kix_shared_ces::metrics::NodeMetrics;
+use kix_shared_ces::pieces::pieces;
 use kix_shared_ces::tls::{self, NodeTls};
-use kix_shared_ces::wire::{self, Fragment, LoadReq, MemberInfo, MemberReq, MutateReq, ShardStatus, ShuffleReq, Work};
+use kix_shared_ces::wire::{self, Fragment, LoadReq, MemberInfo, MemberReq, MutateReq, ShardStatus, ShuffleReq, TxnReply, TxnReq, Work};
 use kixdb::ipc::decode_k_payload;
 use kixdb::{KError, KResult, K};
 use std::future::Future;
@@ -25,6 +26,8 @@ const UNPACK_ELSEWHERE: usize = 16_384;
 const FAILOVER: Duration = Duration::from_secs(8);
 /// How long a shard may take over a request, unless told otherwise.
 pub const REQUEST_LIMIT: Duration = Duration::from_secs(300);
+/// What a change that was not answered in time says of itself.
+pub(crate) const UNKNOWN: &str = "; the change may or may not have been made";
 /// The longest a request for a shard's status or metrics may take: they are answered at once by a healthy shard.
 const PROBE_LIMIT: Duration = Duration::from_secs(10);
 
@@ -134,7 +137,7 @@ impl ShardClient {
             let n = replicas.len();
             let i = self.current.load(Ordering::Relaxed) % n;
             let late = || {
-                let unknown = if idempotent { "" } else { "; the change may or may not have been made" };
+                let unknown = if idempotent { "" } else { UNKNOWN };
                 Status::deadline_exceeded(format!("no answer within {limit:?}{unknown}"))
             };
             let s = match tokio::time::timeout(limit, call(replicas[i].1.clone())).await.unwrap_or_else(|_| Err(late())) {
@@ -172,15 +175,20 @@ impl ShardClient {
             wire::ACTION_STATUS | wire::ACTION_METRICS => self.limit().min(PROBE_LIMIT),
             _ => self.limit(),
         };
+        // a large request goes as pieces, one after another; the answer comes with the last
+        let parts = pieces(kind, payload);
         self.on_leader(idempotent, limit, |ch| {
-            let payload = payload.clone();
+            let parts = parts.clone();
             async move {
-                let mut results = client(ch).do_action(Action::new(kind, payload)).await.map_err(status_of)?;
-                let first = results.try_next().await.map_err(status_of)?;
-                // read the stream to its end: dropping it half read resets it, and a server that sees many resets closes
-                // the connection
-                while results.try_next().await.map_err(status_of)?.is_some() {}
-                Ok(first.map(|b| b.to_vec()).unwrap_or_default())
+                let (mut client, mut answer) = (client(ch), vec![]);
+                for (kind, body) in parts {
+                    let mut results = client.do_action(Action::new(kind, body)).await.map_err(status_of)?;
+                    answer = results.try_next().await.map_err(status_of)?.map(|b| b.to_vec()).unwrap_or_default();
+                    // read the stream to its end: dropping it half read resets it, and a server that sees many resets
+                    // closes the connection
+                    while results.try_next().await.map_err(status_of)?.is_some() {}
+                }
+                Ok(answer)
             }
         })
         .await
@@ -246,6 +254,15 @@ impl ShardClient {
             self.current.store(0, Ordering::Relaxed);
         }
         Ok(members)
+    }
+
+    /// A step of a two-phase commit.
+    pub async fn txn(&self, req: &TxnReq) -> KResult<TxnReply> {
+        let bytes = match req {
+            TxnReq::Pending => self.send(true, wire::ACTION_TXN, body(req)?).await?,
+            _ => self.change(wire::ACTION_TXN, body(req)?).await?,
+        };
+        reply(&bytes)
     }
 
     pub async fn status(&self) -> KResult<ShardStatus> {

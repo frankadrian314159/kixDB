@@ -59,6 +59,14 @@ fn a_follower_given_the_changes_holds_the_same_values() {
         "update m: n from `t",
         "delete m from `t",
         "delete from `t where s = `b",
+        "w: ([] g: (1; \"a\"; `x; 2.5; 3); n: `s#til 5)",
+        "delete from `w where n = 2",
+        "kd: ([k: `a`b`c`d] v: 1 2 3 4)",
+        "delete from `kd where k = `b",
+        "dv: `g#`a`b`a`c`a",
+        "dv: dv where dv <> `c",
+        "dup: 1 1 1 2 1",
+        "dup: dup where dup <> 2",
         "t: `s xasc t",
         "t: t",
         "k: ([sym: `a`b] v: 1 2)",
@@ -100,6 +108,10 @@ fn appends_and_column_updates_log_only_what_changed() {
     let whole = pair.run("big: ([] a: 0.5 + til 100000; b: 1.5 + til 100000; c: 2.5 + til 100000); v: 0.5 + til 100000");
     assert!(whole > 3_000_000, "{whole}");
     for q in ["`big insert (1.0; 2.0; 3.0)", "v,: 4.0", "big,: ([] a: 1 2.0; b: 3 4.0; c: 5 6.0)"] {
+        let size = pair.run(q);
+        assert!(size < 200, "{q}: {size} bytes");
+    }
+    for q in ["delete from `big where a in 10.5 5000.5 99999.5", "v: v where v <> 7.5"] {
         let size = pair.run(q);
         assert!(size < 200, "{q}: {size} bytes");
     }

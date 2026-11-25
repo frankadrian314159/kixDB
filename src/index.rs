@@ -172,8 +172,21 @@ pub fn sorted_eq_range(cv: &ColVec, needle: &K) -> Range<usize> {
     }
 }
 
+/// Whether `find_first` can look `hay` up: it has an attribute, other than `s#` on a general list, whose order compares
+/// numbers of unlike types by value where a search without it tells them apart.
+pub fn finds(hay: &ColVec) -> bool {
+    match hay.attr() {
+        Attr::None => false,
+        Attr::Sorted => !matches!(hay, ColVec::General(..)),
+        _ => true,
+    }
+}
+
 /// Accelerated first-match lookup (`vec ? atom`, `lj`, `ij`, keyed table probe). Returns `Some(hay.len())` on miss when accelerated.
 pub fn find_first(hay: &ColVec, needle: &K) -> Option<usize> {
+    if !finds(hay) {
+        return None;
+    }
     match hay.attr() {
         Attr::None => None,
         Attr::Sorted => {

@@ -36,6 +36,8 @@ pub enum LogOp {
     SetDist { table: SymId, mode: DistMode },
     /// A new value of a vector or table as what changed in it (see `delta.rs`).
     ChangeVar { name: SymId, changes: delta::Changes },
+    /// A vector or table with some of its rows removed.
+    RemoveRows { name: SymId, removed: delta::Removed },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -210,6 +212,10 @@ impl Persist {
     }
 }
 
+fn mismatch(name: SymId) -> KError {
+    KError::io(format!("the log changes '{}', whose value is not the one it was made from", resolve(name)))
+}
+
 pub fn apply_record(ws: &mut Workspace, rec: &WalRecord) -> KResult<()> {
     for op in &rec.ops {
         match op {
@@ -231,7 +237,13 @@ pub fn apply_record(ws: &mut Workspace, rec: &WalRecord) -> KResult<()> {
             LogOp::ChangeVar { name, changes } => {
                 ws.views.remove(name);
                 if !ws.vars.get_mut(name).is_some_and(|v| delta::patch(v, changes)) {
-                    return Err(KError::io(format!("the log changes '{}', whose value is not the one it was made from", resolve(*name))));
+                    return Err(mismatch(*name));
+                }
+            }
+            LogOp::RemoveRows { name, removed } => {
+                ws.views.remove(name);
+                if !ws.vars.get_mut(name).is_some_and(|v| delta::remove(v, removed)) {
+                    return Err(mismatch(*name));
                 }
             }
         }

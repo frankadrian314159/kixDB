@@ -8,8 +8,7 @@ use crate::catalog::{column_type, rekey, schema_of, unkey, with_attrs, Names, Ta
 use crate::exec::{augmented, in_order};
 use crate::plan::{has_query, is_constant, rowwise, scan_filters, Layout, Planner, Push};
 use crate::Inner;
-use futures::future::try_join_all;
-use kix_shared_ces::wire::{LoadMode, LoadReq, MemberReq, MutateReq, Work, ORD_COL};
+use kix_shared_ces::wire::{LoadMode, LoadReq, MemberReq, MutateReq, TxnOp, Work, ORD_COL};
 use kixdb::ast::{ColSpec, Expr, QSql, QSqlKind};
 use kixdb::engine::qsql::resolve_col_names;
 use kixdb::engine::DistMode;
@@ -26,6 +25,8 @@ pub struct ClusterSession {
     /// This session's connection to the mirror engine (it holds the current namespace and IPC handles).
     conn: Connection,
     plan: Vec<String>,
+    /// The shard operations of the change being made, committed together.
+    changes: Vec<(usize, TxnOp)>,
 }
 
 fn cluster_error(message: impl Into<String>) -> KError {
@@ -99,7 +100,7 @@ struct Mutation {
 impl ClusterSession {
     pub(crate) fn new(inner: Arc<Inner>) -> ClusterSession {
         let conn = inner.mirror.connect_internal();
-        ClusterSession { inner, conn, plan: vec![] }
+        ClusterSession { inner, conn, plan: vec![], changes: vec![] }
     }
 
     /// How the statements of the last request ran.
@@ -259,6 +260,10 @@ impl ClusterSession {
 
     fn statement(&mut self, e: &Expr) -> KResult<K> {
         let inner = self.inner.clone();
+        if inner.unsettled() {
+            let _alone = inner.gate.write().unwrap_or_else(|e| e.into_inner());
+            inner.resolve();
+        }
         {
             let _shared = inner.gate.read().unwrap_or_else(|e| e.into_inner());
             if let Some(v) = self.read(e)? {
@@ -432,6 +437,8 @@ impl ClusterSession {
         let refs = self.names().refs(e);
         let before: BTreeSet<SymId> = self.names().all_tables().into_iter().collect();
         let wanted = if refs.dynamic { before.clone() } else { refs.tables };
+        // what the mirror goes back to if the shards do not take the change
+        let undo = self.inner.mirror.export_state()?;
         let mut originals = vec![];
         for &name in &wanted {
             let t = self.names().table(name).ok_or_else(|| cluster_error(format!("table {name} disappeared")))?;
@@ -447,13 +454,14 @@ impl ClusterSession {
         }
         let result = self.conn.eval_expr(e);
         // whatever changed is distributed again, also when the statement failed part way
-        let written = self.write_back(originals, before);
+        let written = self.write_back(originals, before, &undo);
         let v = result?;
         written?;
         Ok(v)
     }
 
-    fn write_back(&mut self, originals: Vec<(Table, K)>, before: BTreeSet<SymId>) -> KResult<()> {
+    /// Distribute the tables that changed, on every shard or none; `undo` is the mirror as it was.
+    fn write_back(&mut self, originals: Vec<(Table, K)>, before: BTreeSet<SymId>, undo: &[u8]) -> KResult<()> {
         let mut first_error = None;
         let mut names: BTreeSet<SymId> = self.names().all_tables().into_iter().collect();
         names.extend(originals.iter().map(|(t, _)| t.name));
@@ -475,7 +483,9 @@ impl ClusterSession {
                     }
                 }
                 (original, None) if original.is_some() || before.contains(&name) => {
-                    self.inner.load_all(&LoadReq::new(resolve(name), LoadMode::Drop, &K::Null, None))
+                    let drop = LoadReq::new(resolve(name), LoadMode::Drop, &K::Null, None);
+                    self.changes.extend((0..self.inner.shards.len()).map(|s| (s, TxnOp::Load(drop.clone()))));
+                    Ok(())
                 }
                 _ => Ok(()),
             };
@@ -487,7 +497,26 @@ impl ClusterSession {
                 first_error.get_or_insert(e);
             }
         }
-        first_error.map_or(Ok(()), Err)
+        let done = match first_error {
+            Some(e) => Err(e),
+            None => self.commit().map(|_| ()),
+        };
+        self.undo_unless(done, undo)
+    }
+
+    /// Commit the operations gathered.
+    fn commit(&mut self) -> KResult<Vec<K>> {
+        let changes = std::mem::take(&mut self.changes);
+        self.inner.commit(changes)
+    }
+
+    /// Put the mirror back as it was when a change was not made.
+    fn undo_unless(&mut self, done: KResult<()>, undo: &[u8]) -> KResult<()> {
+        if done.is_err() {
+            self.changes.clear();
+            self.inner.mirror.install_state(undo)?;
+        }
+        done
     }
 
     /// A query over one partitioned table that cannot be pushed down: gather only the rows its leading filters keep and
@@ -578,7 +607,7 @@ impl ClusterSession {
             .into_iter()
             .map(|(part, ords)| LoadReq::new(resolve(name), LoadMode::Replace, &rekey(with_attrs(part, &flip), nkeys), ords))
             .collect();
-        self.inner.wait(try_join_all(self.inner.shards.iter().zip(&loads).map(|(s, l)| s.load(l))))?;
+        self.changes.extend(loads.into_iter().map(TxnOp::Load).enumerate());
         let (kind, by) = match &mode {
             DistMode::Replicated => ("replicated", None),
             DistMode::Sharded { key } => ("sharded", Some(K::Sym(*key))),
@@ -610,17 +639,17 @@ impl ClusterSession {
             return self.conn.eval_expr(&declare);
         };
         let full = self.inner.gather(&t)?;
+        let undo = self.inner.mirror.export_state()?;
         self.conn.eval_expr(&declare)?;
         let mode = self.inner.mirror.read_workspace(|ws| ws.dist.get(&name).cloned()).unwrap_or(DistMode::Replicated);
         let (flip, nkeys) = unkey(&full).ok_or_else(|| cluster_error("not a table"))?;
         if !fits(&mode, &flip, nkeys) {
-            // put the old declaration back
-            let old = t.mode.clone();
-            self.distribute(t.name, &full, Some(old))?;
-            return Err(KError::domain("distribution columns must be columns of the table, and key columns of a keyed table"));
+            let wrong = KError::domain("distribution columns must be columns of the table, and key columns of a keyed table");
+            return self.undo_unless(Err(wrong), &undo).map(|_| K::Null);
         }
         self.note(format!("redistribute {}", t.name));
-        self.distribute(t.name, &full, Some(mode))?;
+        let done = self.distribute(t.name, &full, Some(mode)).and_then(|_| self.commit().map(|_| ()));
+        self.undo_unless(done, &undo)?;
         Ok(K::Sym(name))
     }
 
@@ -670,14 +699,11 @@ impl ClusterSession {
             modes.insert(0, LoadMode::CheckInsert);
         }
         for mode in modes {
-            let loads: Vec<(usize, LoadReq)> = parts
-                .iter()
-                .enumerate()
-                .filter(|(_, p)| p.0.nrows() > 0)
-                .map(|(s, (part, ords))| (s, LoadReq::new(resolve(t.name), mode, &K::Table(Arc::new(part.clone())), ords.clone())))
-                .collect();
-            self.inner.wait(try_join_all(loads.iter().map(|(s, l)| self.inner.shards[*s].load(l))))?;
+            let some = parts.iter().enumerate().filter(|(_, p)| p.0.nrows() > 0);
+            let load = |(s, (part, ords)): (usize, &(Flip, Option<Vec<i64>>))| (s, TxnOp::Load(LoadReq::new(resolve(t.name), mode, &K::Table(Arc::new(part.clone())), ords.clone())));
+            self.changes.extend(some.map(load));
         }
+        self.commit()?;
         self.note(format!("{verb}: {} row(s) split over the shards", coerced.nrows()));
         self.conn.set_vars(vec![(t.name, Some(rekey(schema, t.nkeys)))])?;
         Ok(match verb {
@@ -759,11 +785,9 @@ impl ClusterSession {
         let Mutation { table: t, mut query } = m;
         let (kind, assigned) = (query.kind, resolve_col_names(&query.cols));
         *query.from = augmented(t.name);
-        let mut req = MutateReq { table: resolve(t.name), query: Expr::Query(Box::new(query)), apply: false };
-        // an error on any shard is found before any shard changes
-        self.inner.mutate_all(&req)?;
-        req.apply = true;
-        let results = self.inner.mutate_all(&req)?;
+        let req = MutateReq { table: resolve(t.name), query: Expr::Query(Box::new(query)) };
+        self.changes.extend((0..self.inner.shards.len()).map(|s| (s, TxnOp::Mutate(req.clone()))));
+        let results = self.commit()?;
         self.note("update / delete run on every shard");
         let mut schemas = results.iter().filter_map(unkey);
         let (mut schema, nkeys) = schemas.next().ok_or_else(|| cluster_error("no shard answered"))?;
@@ -800,8 +824,9 @@ impl ClusterSession {
             "l" if std::path::Path::new(arg).is_dir() => {
                 // splayed tables become distributed tables; partitioned ones stay mounted on the control node
                 let before: BTreeSet<SymId> = self.names().all_tables().into_iter().collect();
+                let undo = self.inner.mirror.export_state()?;
                 let result = self.conn.eval_expr(whole);
-                self.write_back(vec![], before)?;
+                self.write_back(vec![], before, &undo)?;
                 result
             }
             "l" => {

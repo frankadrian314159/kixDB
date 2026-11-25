@@ -221,3 +221,15 @@ fn a_view_is_computed_from_global_names_whoever_reads_it_first() {
     c.eval("x:: nowhere + 1").unwrap();
     assert!(c.eval("select x from ([] nowhere: 1 2)").is_err());
 }
+
+#[test]
+fn an_attribute_does_not_change_what_a_general_list_matches() {
+    // a sorted general list once matched numbers of unlike types by value
+    let mut c = Server::new().connect();
+    c.eval("p: ([a: (1; 2.5; 3)] v: 10 20 30); s: ([a: `s#(1; 2.5; 3)] v: 10 20 30); l: ([] a: (1i; 2.5e; 3; 1.0))").unwrap();
+    for code in ["l lj {}", "l ij {}", "(key {})[`a] ? (1i; 3)", "(key {})[`a] ? 1i"] {
+        let (plain, sorted) = (code.replace("{}", "p"), code.replace("{}", "s"));
+        assert_eq!(c.eval(&sorted).unwrap(), c.eval(&plain).unwrap(), "{code}");
+    }
+    assert_eq!(c.eval("exec v from l ij s").unwrap().to_string(), ",30");
+}

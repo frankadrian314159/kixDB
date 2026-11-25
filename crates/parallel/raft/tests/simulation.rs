@@ -22,8 +22,11 @@ impl Rng {
 struct Disk(std::rc::Rc<std::cell::RefCell<MemStorage>>);
 
 impl Storage for Disk {
-    fn load(&self) -> (kix_raft::HardState, Vec<kix_raft::Entry>, Option<kix_raft::Snapshot>) {
-        self.0.borrow().load()
+    fn load(&mut self) -> (kix_raft::HardState, Vec<kix_raft::Entry>, Option<kix_raft::Snapshot>) {
+        self.0.borrow_mut().load()
+    }
+    fn snapshot(&self) -> Option<kix_raft::Snapshot> {
+        self.0.borrow().snapshot()
     }
     fn save_hard_state(&mut self, hs: &kix_raft::HardState) {
         self.0.borrow_mut().save_hard_state(hs)
@@ -83,7 +86,7 @@ impl Sim {
     }
 
     fn restart(&mut self, id: NodeId) {
-        let disk = self.disks[&id].clone();
+        let mut disk = self.disks[&id].clone();
         // the state machine is rebuilt from the snapshot and the entries committed again
         let state = disk.load().2.map(|s| decode(&s.data)).unwrap_or_default();
         self.applied.insert(id, state);
