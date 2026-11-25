@@ -29,9 +29,10 @@ fn a_request_a_stuck_shard_does_not_answer_fails() {
         })
     });
     now_held.recv().unwrap();
-    // the statement, and the one waiting behind it, fail instead of waiting
+    // reads go on meanwhile; a change, and the one waiting behind it, fail instead of waiting
+    assert_eq!(s.eval("count t").unwrap(), K::Long(4));
     let start = Instant::now();
-    for statement in ["`t insert (`e; 5)", "count t"] {
+    for statement in ["`t upsert ([] sym: `a`b`c`d`e`f`g`h; v: 8#0)", "update v: 0 from `t"] {
         let e = s.eval(statement).unwrap_err();
         assert!(e.signal == "cluster" && e.detail.contains("shard 0") && e.detail.contains("no answer within 1s"), "{e}");
     }

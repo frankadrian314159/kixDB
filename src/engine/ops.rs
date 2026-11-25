@@ -8,6 +8,8 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
+use std::ops::Range;
+use crate::engine::par;
 use std::sync::Arc;
 
 // ----- Temporal / Dict / Table `.field` Extraction --------------------------
@@ -669,14 +671,29 @@ pub(crate) fn group_ids(cols: &[ColVec], nrows: usize) -> Vec<usize> {
         }
         count
     }
+    // the rows `of` alone, by the columns' keys
+    let number = |keys: &[Vec<u64>], of: Range<usize>, ids: &mut [usize]| {
+        let (mut groups, n) = (1, of.len());
+        ids.fill(0);
+        for keys in keys.iter().map(|k| &k[of.clone()]) {
+            groups = match narrow(keys, table_room(n) / groups.max(1)) {
+                Some((lo, span)) => refine_narrow(ids, keys, groups, lo, span),
+                None => refine(ids, keys.iter().copied()),
+            };
+        }
+    };
+    // numbers, temporals and symbols give keys; a large input is numbered a piece at a time
+    if let Some(keys) = cols.iter().map(|c| c.key_bits()).collect::<Option<Vec<_>>>() {
+        let mut ids = vec![0; nrows];
+        if !(par::split(nrows) && par::group(&keys, &mut ids, |of, ids| number(&keys, of, ids))) {
+            number(&keys, 0..nrows, &mut ids);
+        }
+        return ids;
+    }
     let mut ids = vec![0; nrows];
-    let mut groups = 1;
     for c in cols {
-        groups = match c.key_bits() {
-            Some(keys) => match narrow(&keys, table_room(nrows) / groups.max(1)) {
-                Some((lo, span)) => refine_narrow(&mut ids, &keys, groups, lo, span),
-                None => refine(&mut ids, keys.into_iter()),
-            },
+        match c.key_bits() {
+            Some(keys) => refine(&mut ids, keys.into_iter()),
             None => refine(&mut ids, (0..nrows).map(|r| c.get_atom(r).hash_key())),
         };
     }
@@ -937,7 +954,12 @@ fn str_transform(x: &K, f: &dyn Fn(&str) -> String) -> KResult<K> {
 
 /// The sum of the non-null values; integer overflow wraps, as in q.
 fn wrapping_total(xs: &[i64]) -> i64 {
-    xs.iter().filter(|&&v| v != NULL_LONG).fold(0, |a, &v| a.wrapping_add(v))
+    let total = |xs: &[i64]| xs.iter().filter(|&&v| v != NULL_LONG).fold(0i64, |a, &v| a.wrapping_add(v));
+    par::pieces(xs, total).into_iter().fold(0, i64::wrapping_add)
+}
+
+fn float_total(xs: &[f64]) -> f64 {
+    par::pieces(xs, |p| p.iter().filter(|v| !v.is_nan()).copied().sum::<f64>()).into_iter().sum()
 }
 
 pub fn sum_op(x: &K) -> KResult<K> {
@@ -955,7 +977,7 @@ pub fn sum_op(x: &K) -> KResult<K> {
         ColVec::Long(_, xs) => Ok(K::Long(wrapping_total(xs))),
         ColVec::Timespan(_, xs) => Ok(K::Timespan(wrapping_total(xs))),
         ColVec::Real(_, xs) => Ok(K::Float(xs.iter().filter(|v| !v.is_nan()).map(|&v| v as f64).sum())),
-        ColVec::Float(_, xs) => Ok(K::Float(xs.iter().filter(|v| !v.is_nan()).copied().sum())),
+        ColVec::Float(_, xs) => Ok(K::Float(float_total(xs))),
         ColVec::General(_, xs) if xs.is_empty() => Ok(K::Long(0)),
         ColVec::General(_, xs) => {
             let mut acc = xs[0].clone();
@@ -991,24 +1013,32 @@ pub fn minmax_op(x: &K, is_min: bool) -> KResult<K> {
     let K::Vector(cv) = x else {
         return Err(KError::ty("min/max requires vector"));
     };
-    let mut best: Option<K> = None;
-    for i in 0..cv.len() {
-        let a = cv.get_atom(i);
-        if a.is_null() {
-            continue;
-        }
-        best = Some(match best {
-            None => a,
-            Some(cur) => {
-                let cmp = a.k_cmp(&cur);
-                if (is_min && cmp == Ordering::Less) || (!is_min && cmp == Ordering::Greater) {
-                    a
-                } else {
-                    cur
-                }
-            }
-        });
+    // the first of the values that none beats, in a typed loop for numbers and times
+    macro_rules! extreme {
+        ($variant:ident, $xs:expr, $is_null:expr) => {{
+            let better = |a, b| if (is_min && b < a) || (!is_min && b > a) { b } else { a };
+            let of = |p: &[_]| p.iter().copied().filter(|v| !$is_null(v)).reduce(better);
+            par::pieces($xs, of).into_iter().flatten().reduce(better).map(K::$variant)
+        }};
     }
+    let best: Option<K> = match cv {
+        ColVec::Short(_, xs) => extreme!(Short, xs, |v: &i16| *v == NULL_SHORT),
+        ColVec::Int(_, xs) => extreme!(Int, xs, |v: &i32| *v == NULL_INT),
+        ColVec::Long(_, xs) => extreme!(Long, xs, |v: &i64| *v == NULL_LONG),
+        ColVec::Float(_, xs) => extreme!(Float, xs, |v: &f64| v.is_nan()),
+        ColVec::Date(_, xs) => extreme!(Date, xs, |v: &i32| *v == NULL_INT),
+        ColVec::Time(_, xs) => extreme!(Time, xs, |v: &i32| *v == NULL_INT),
+        ColVec::Timestamp(_, xs) => extreme!(Timestamp, xs, |v: &i64| *v == NULL_LONG),
+        ColVec::Timespan(_, xs) => extreme!(Timespan, xs, |v: &i64| *v == NULL_LONG),
+        _ => (0..cv.len()).map(|i| cv.get_atom(i)).filter(|a| !a.is_null()).reduce(|cur, a| {
+            let cmp = a.k_cmp(&cur);
+            if (is_min && cmp == Ordering::Less) || (!is_min && cmp == Ordering::Greater) {
+                a
+            } else {
+                cur
+            }
+        }),
+    };
     Ok(best.unwrap_or_else(|| match cv {
         ColVec::Long(_, _) => K::Long(if is_min { INF_LONG } else { NINF_LONG }),
         ColVec::Int(_, _) => K::Int(if is_min { INF_INT } else { NINF_INT }),
@@ -1028,14 +1058,8 @@ pub fn avg_op(x: &K) -> KResult<K> {
         return Ok(K::Float(f64::NAN));
     }
     let fs = cv.as_f64_vec().ok_or_else(|| KError::ty("avg requires numeric vector"))?;
-    let mut s = 0.0;
-    let mut n = 0usize;
-    for v in fs {
-        if !v.is_nan() {
-            s += v;
-            n += 1;
-        }
-    }
+    let n: usize = par::pieces(&fs, |p| p.iter().filter(|v| !v.is_nan()).count()).into_iter().sum();
+    let s = float_total(&fs);
     Ok(K::Float(if n == 0 { f64::NAN } else { s / (n as f64) }))
 }
 
@@ -1486,7 +1510,7 @@ fn arith_op(lhs: &K, rhs: &K, op: ArithOp) -> KResult<K> {
     broadcast_atoms(lhs, rhs, |a, b| arith_atom(a, b, op))
 }
 
-fn float_arith_op(lhs: &K, rhs: &K, f: impl Fn(f64, f64) -> f64 + Copy) -> KResult<K> {
+fn float_arith_op(lhs: &K, rhs: &K, f: impl Fn(f64, f64) -> f64 + Copy + Sync) -> KResult<K> {
     if let Some((a, b)) = operands(lhs, rhs) {
         if let (Some(x), Some(y)) = (floats(&a), floats(&b)) {
             return Ok(float_vec(zip(&x, &y, |&x, &y| f(x, y))));
@@ -1647,13 +1671,13 @@ fn operands(lhs: &K, rhs: &K) -> Option<(ColVec, ColVec)> {
 }
 
 /// `f` of two operands element by element, one of length 1 serving every element of the other.
-fn zip<A, B, T>(x: &[A], y: &[B], f: impl Fn(&A, &B) -> T) -> Vec<T> {
+fn zip<A: Sync, B: Sync, T: Send>(x: &[A], y: &[B], f: impl Fn(&A, &B) -> T + Sync) -> Vec<T> {
     if x.len() == y.len() {
-        x.iter().zip(y).map(|(x, y)| f(x, y)).collect()
+        par::map2(x, y, f)
     } else if y.len() == 1 {
-        x.iter().map(|x| f(x, &y[0])).collect()
+        par::map(x, |x| f(x, &y[0]))
     } else {
-        y.iter().map(|y| f(&x[0], y)).collect()
+        par::map(y, |y| f(&x[0], y))
     }
 }
 
@@ -2481,15 +2505,11 @@ fn like_op(lhs: &K, rhs: &K) -> KResult<K> {
         K::Sym(s) => Ok(K::Bool(symbol(*s))),
         K::Char(c) => Ok(K::Bool(found(&(*c as char).to_string()))),
         K::Vector(ColVec::Char(_, bs)) => Ok(K::Bool(text(bs))),
-        K::Vector(ColVec::Sym(_, xs)) => Ok(bool_vec(xs.iter().map(|&s| symbol(s)).collect())),
-        K::Vector(ColVec::General(_, xs)) => Ok(bool_vec(
-            xs.iter()
-                .map(|x| match x {
-                    K::Vector(ColVec::Char(_, bs)) => text(bs),
-                    other => other.as_str().is_some_and(|s| found(&s)),
-                })
-                .collect(),
-        )),
+        K::Vector(ColVec::Sym(_, xs)) => Ok(bool_vec(par::map(xs, |&s| symbol(s)))),
+        K::Vector(ColVec::General(_, xs)) => Ok(bool_vec(par::map(xs, |x| match x {
+            K::Vector(ColVec::Char(_, bs)) => text(bs),
+            other => other.as_str().is_some_and(|s| found(&s)),
+        }))),
         _ => Err(KError::ty("like LHS must be string, symbol, or list of strings/symbols")),
     }
 }

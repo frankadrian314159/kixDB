@@ -15,13 +15,18 @@ records (`StorageOptions::checkpoint_every`), on `.checkpoint`, and when the ser
 loaded and the log replayed; an incomplete record at the end of the log is discarded.
 
 For a vector, table or keyed table that keeps its columns, a log record holds **only what changed**: the rows added to
-the end, and whole any column that changed in another way; or the numbers of the rows removed. So an `insert` costs the
-size of the new rows, an `update` the size of the columns it assigns, and a `delete` a few bytes a row it removes.
-Reordering rows, removing more rows than stay, changing which columns a table has, a first assignment, other kinds of
-value, the first change to a value read from a file and, in a replica of a group just made, the first change to a value
-it held already write the whole value. The old and new values are compared to find what changed, which takes time in
-proportion to their size. `kix-serve --no-sync` skips the flush per record, at the risk of losing the
-latest changes in a crash.
+the end; the rows set in a column, if at most one in eight was, and otherwise the whole column; or the numbers of the
+rows removed. So an `insert` costs the size of the new rows, an `update` the size of the rows or columns it assigns, and
+a `delete` a few bytes a row it removes. Reordering rows, removing more rows than stay, changing which columns a table
+has, a first assignment, other kinds of value, the first change to a value read from a file and, in a replica of a group
+just made, the first change to a value it held already write the whole value. `kix-serve --no-sync` skips the flush per
+record, at the risk of losing the latest changes in a crash.
+
+An `insert` or `upsert` into a global table changes it where it is: it copies no more than the rows it touches (but a
+column that a running query still reads is copied first), and an `upsert` looks once through the keys. It rebuilds the
+table if a column holds mixed values or would change type. For other changes the old and new values are compared to
+find what changed, which takes time in proportion to their size. An `upsert` into a keyed table that holds a key twice
+sets the first such row and keeps the others (unless the table is rebuilt, which keeps one row a key).
 
 Earlier versions cannot read these records. Before going back to one, close the server cleanly, which folds the log into
 the snapshot: an earlier version discards the log from the first record it cannot read.

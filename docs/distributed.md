@@ -215,10 +215,19 @@ There is one control node. Pushed-down reads and selective partial gathers (`sli
 (and temporary `.kix.tmp.*` broadcast/shuffle join tables stay in shard RAM without writing to the WAL or Raft log);
 writes and full-table mirror gathers take exclusive cluster access.
 
+A shard runs requests that only read side by side and changes one at a time, and shares work on large vectors among its
+threads, as a [single server does](ipc.md#concurrency). Shard processes on one machine each use all of its threads
+unless `RAYON_NUM_THREADS` says otherwise.
+
+The control node remembers how many rows tables have, to plan joins and number inserted rows without asking the shards
+each time.
+
 ## Replication
 
 A replicated shard elects a leader. A change takes effect only after a majority of replicas has logged it; without a
-majority writes fail with `'cluster`. When the leader dies the control node finds the new one. Replicas cut their Raft
+majority writes fail with `'cluster`. When the leader dies the control node finds the new one: before a change it asks
+who leads, unless the replica it takes to lead answered in the last half second, in which case a change made just as that
+replica stops can fail. Replicas cut their Raft
 log with snapshots (`--snapshot-every`, 5,000 entries, or sooner when the entries since the last reach `--log-limit-mb`,
 256, as the log is held in memory). A cut keeps up to a quarter of `--snapshot-every` entries (at most 1,000, and 4 MB)
 behind it, so that a replica a little way behind is sent entries; one further behind is sent the snapshot.
@@ -231,8 +240,8 @@ A snapshot, a batch of records or a table load larger than 64 MB is sent in piec
 a size limit of its own; the node that receives one holds it in memory until it is whole. (A single statement sent to a
 shard, with any values written in it, must still fit in 256 MB.)
 
-A log record holds what changed ([storage.md](storage.md)): an `insert` replicates its rows, an `update` the columns it
-assigns, a `delete` the numbers of its rows. A re-sort, a `delete` of most rows and, in a group just made from existing
+A log record holds what changed ([storage.md](storage.md)): an `insert` replicates its rows, an `update` the rows or
+columns it assigns, a `delete` the numbers of its rows. A re-sort, a `delete` of most rows and, in a group just made from existing
 data, the first change to each table replicate the table whole. To make a group from an existing directory, copy it to
 every replica before starting them.
 
@@ -303,8 +312,8 @@ shards must match.
 * **The control node is a single point of failure**, and gathering needs memory there for the whole table.
 * **The number of shards is fixed** when the cluster is created. There is no rebalancing.
 * **Floating point sums** added in two phases can differ from one server's in the last digits.
-* A shard runs one request at a time.
-* A change that is not an append, an assignment to some columns or a removal of rows (a re-sort, for one) is logged and
+* A shard makes one change at a time.
+* A change that is not an append, an assignment to some rows or columns or a removal of rows (a re-sort, for one) is logged and
   replicated as the whole new value of the table's slice (see [storage.md](storage.md)).
 * Tables move between shards (shuffle and broadcast) as kdb+ IPC bytes inside Flight actions; query results stream as
   Arrow batches.

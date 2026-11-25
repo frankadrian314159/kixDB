@@ -62,6 +62,10 @@ Raft, and a write that spans shards is made [on all of them or none](docs/distri
 
 `cargo build` and `cargo test` at the root cover the single-node package only; add `--workspace` for the cluster.
 
+Building needs a C compiler (on Windows, the Visual Studio build tools) for the [mimalloc](https://crates.io/crates/mimalloc)
+memory allocator, which the servers and the desktop app use because the engine runs markedly faster with it. `--no-default-features` leaves
+it out of `kix-serve` and `kix-gui`; the cluster's programs always use it.
+
 ## Documentation
 
 * [Language](docs/language.md)

@@ -72,6 +72,11 @@ fn a_follower_given_the_changes_holds_the_same_values() {
         "k: ([sym: `a`b] v: 1 2)",
         "`k upsert (`c; 3)",
         "`k upsert (`a; 9)",
+        "`k upsert ([] sym: `z`z`a; v: 1 0N 7)",
+        "m: ([a: 1 2; b: `x`y] v: 10 20; w: 1.5 2.5)",
+        "`m upsert ([] a: 2 3 3 1; b: `y`z`z`x; v: 0N 30 31 11; w: 9 0n 8.0 0n)",
+        "`m insert (7; `x; 1; 1.0)",
+        "m,: ([a: enlist 1; b: enlist `x] v: enlist 5; w: enlist 5.0)",
         "v: `s#til 10",
         "v,: 10 11",
         "v,: 0",
@@ -115,6 +120,12 @@ fn appends_and_column_updates_log_only_what_changed() {
         let size = pair.run(q);
         assert!(size < 200, "{q}: {size} bytes");
     }
+    // a few values of a column are replicated by themselves, as are the rows of a keyed table that are set
+    let few = pair.run("update b: 0.0 from `big where a < 50");
+    assert!((300..1500).contains(&few), "{few}");
+    pair.run("keyed: ([id: til 100000] x: til 100000; y: 0.5 + til 100000)");
+    let one_key = pair.run("`keyed upsert (7; 1; 2.0)");
+    assert!(one_key < 200, "{one_key}");
     let one_column = pair.run("update b: b + 1 from `big");
     assert!((700_000..900_000).contains(&one_column), "{one_column}");
 }

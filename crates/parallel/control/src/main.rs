@@ -26,6 +26,10 @@ use std::io::BufRead;
 use std::process::ExitCode;
 use std::time::Duration;
 
+/// mimalloc runs the engine markedly faster than the system allocator.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn usage() -> ! {
     eprintln!(
         "usage: kix-cluster --config cluster.json [--state FILE] --listen PORT [--bind ADDR] [-u USER:PASSWORD]\n                   \

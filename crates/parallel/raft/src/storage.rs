@@ -27,6 +27,7 @@ pub struct Snapshot {
     pub index: u64,
     pub term: u64,
     pub conf: Conf,
+    #[serde(with = "crate::bytes")]
     pub data: Vec<u8>,
 }
 

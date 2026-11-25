@@ -34,6 +34,26 @@ fn key_buckets(left: &[&ColVec], nleft: usize, right: &[&ColVec], nright: usize)
     (buckets, probe)
 }
 
+/// The row of `kt` with the key of each row of `keys` (`None` where it has none): one pass over the keys of `kt`,
+/// without copying them where there is one key column.
+pub fn match_keys(kt: &KeyedTable, keys: &[&ColVec], nrows: usize) -> Vec<Option<usize>> {
+    if let ([have], [want]) = (kt.keys.vals.as_slice(), keys) {
+        if have.type_num() == want.type_num() && want.len() < have.len() {
+            if let (Some(wanted), Some(have)) = (want.key_bits(), have.key_bits()) {
+                let mut rows: HashMap<u64, Option<usize>> = wanted.iter().map(|&k| (k, None)).collect();
+                // from the end, so that the first row with a key is the one kept
+                for (r, bits) in have.iter().enumerate().rev() {
+                    if let Some(at) = rows.get_mut(bits) {
+                        *at = Some(r);
+                    }
+                }
+                return wanted.iter().map(|k| rows[k]).collect();
+            }
+        }
+    }
+    probe_keyed_table(kt, keys, nrows)
+}
+
 /// Probe row index in `kt` for each row of `left_key_cols` (`None` on miss).
 fn probe_keyed_table(kt: &KeyedTable, left_key_cols: &[&ColVec], nrows: usize) -> Vec<Option<usize>> {
     // The index that a key column's attribute gives spares a few probes of a large table from reading every key.
@@ -305,52 +325,30 @@ pub fn union_join(lhs: &K, rhs: &K) -> KResult<K> {
                     proto_v.push(v.take(0));
                 }
             }
-            let mut key_rows: Vec<Vec<K>> = Vec::new();
-            let mut val_rows: Vec<Vec<K>> = Vec::new();
+            let (na, nb) = (ka.nrows(), kb.nrows());
             let keys: Vec<ColVec> = ka.keys.vals.iter().zip(&kb.keys.vals).map(|(a, b)| a.concat(b)).collect();
             // the number of each row's key among the rows of both tables, in order of first appearance
-            let mut ids = group_ids(&keys, ka.nrows() + kb.nrows()).into_iter();
-
-            for src in [ka.as_ref(), kb.as_ref()] {
-                for (r, idx) in (0..src.nrows()).zip(ids.by_ref()) {
-                    if idx < key_rows.len() {
-                        for (vi, &vc) in all_vcols.iter().enumerate() {
-                            if let Some(sc) = src.vals.col(vc) {
-                                let v = sc.get_atom(r);
-                                if !v.is_null() {
-                                    val_rows[idx][vi] = v;
-                                }
-                            }
+            let ids = group_ids(&keys, na + nb);
+            let first = first_rows(&ids);
+            let kvals = keys.iter().map(|k| k.gather(&first)).collect();
+            let vvals = all_vcols
+                .iter()
+                .enumerate()
+                .map(|(c, &name)| {
+                    let side = |t: &KeyedTable, n| t.vals.col(name).cloned().unwrap_or_else(|| proto_v[c].gather(&vec![usize::MAX; n]));
+                    let column = side(ka, na).concat(&side(kb, nb));
+                    // each key takes the value of its first row, then of any later row whose value is not null
+                    let mut from = first.clone();
+                    for (r, &id) in ids.iter().enumerate() {
+                        let has = (if r < na { &ka.vals } else { &kb.vals }).col(name).is_some();
+                        if r != first[id] && has && !column.get_atom(r).is_null() {
+                            from[id] = r;
                         }
-                    } else {
-                        key_rows.push(src.keys.vals.iter().map(|c| c.get_atom(r)).collect());
-                        val_rows.push(
-                            all_vcols
-                                .iter()
-                                .enumerate()
-                                .map(|(vi, &vc)| src.vals.col(vc).map(|c| c.get_atom(r)).unwrap_or_else(|| proto_v[vi].null_atom()))
-                                .collect(),
-                        );
                     }
-                }
-            }
-
-            let nrows = key_rows.len();
-            let kvals: Vec<ColVec> = (0..ka.keys.ncols())
-                .map(|c| {
-                    if nrows == 0 {
-                        ka.keys.vals[c].take(0)
-                    } else {
-                        ColVec::from_atoms(key_rows.iter().map(|r| r[c].clone()).collect())
-                    }
-                })
-                .collect();
-            let vvals: Vec<ColVec> = (0..all_vcols.len())
-                .map(|c| {
-                    if nrows == 0 {
-                        proto_v[c].clone()
-                    } else {
-                        ColVec::from_atoms(val_rows.iter().map(|r| r[c].clone()).collect())
+                    match column.gather(&from) {
+                        // (values of one type among mixed ones make a column of that type)
+                        ColVec::General(_, items) if !items.is_empty() => ColVec::from_atoms((*items).clone()),
+                        typed => typed,
                     }
                 })
                 .collect();

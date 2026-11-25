@@ -3,11 +3,15 @@ use crate::ast::{ColSpec, Expr, QSql, QSqlKind};
 use crate::engine::ops::{
     aggregate_rows, broadcast_atoms, distinct_op, eval_binary_prim, eval_unary_prim, group_rows, sort_order,
 };
-use crate::engine::{Engine, RowNumbers};
+use crate::engine::joins::match_keys;
+use crate::engine::par::{self, true_rows};
+use crate::engine::writes::row_changes;
+use crate::engine::{Engine, RowNumbers, Write};
 use crate::error::{KError, KResult};
 use crate::parser::infer_col_name;
 use crate::sym::{intern, resolve, SymId};
 use crate::types::*;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -95,8 +99,13 @@ impl<'a> Engine<'a> {
     /// that a group only gathers and aggregates values. The result has an item per group (or is an atom, for a constant);
     /// `None` when `e` is more than aggregates and item-by-item verbs on them, or fails.
     fn by_groups(&mut self, flip: &Flip, rows: &RowNumbers, groups: &[Vec<usize>], e: &Expr) -> Option<K> {
-        let per_group = |f: &dyn Fn(&[usize]) -> KResult<K>| {
-            let items = groups.iter().map(|g| f(g)).collect::<KResult<Vec<K>>>().ok()?;
+        // (many rows: the groups are shared out among threads)
+        let per_group = |f: &(dyn Fn(&[usize]) -> KResult<K> + Sync)| {
+            let items: KResult<Vec<K>> = match par::split(flip.nrows()) {
+                false => groups.iter().map(|g| f(g)).collect(),
+                true => groups.par_iter().map(|g| f(g)).collect(),
+            };
+            let items = items.ok()?;
             Some(K::Vector(ColVec::from_atoms(items)))
         };
         // the other verbs apply to each group's atom in turn, as they would group by group (`not` takes a vector of dates
@@ -691,14 +700,29 @@ impl<'a> Engine<'a> {
         Ok(K::Vector(ColVec::from_atoms(out)))
     }
 
+    /// Add rows to the table named `name` (`upsert`: setting those whose keys it has). The rows it had and how many came.
+    fn add_rows(&mut self, name: SymId, rows: &K, upsert: bool) -> KResult<(usize, usize)> {
+        let current = self.get_var(name)?;
+        // a global is changed where it is: only the rows touched are logged and copied
+        if let Some(global) = self.global_to_change(name) {
+            let (incoming, start) = incoming_rows(&current, rows)?;
+            if let Some(change) = row_changes(&current, &incoming, !upsert)? {
+                drop(current);
+                self.write_globals(vec![(global, Write::Change(change.changes))])?;
+                return Ok((start, incoming.nrows()));
+            }
+        }
+        let (table, start, added) = append_to_table(&self.get_var(name)?, rows, upsert)?;
+        self.set_global(name, table)?;
+        Ok((start, added))
+    }
+
     /// `` `t insert rows ``
     pub fn eval_insert(&mut self, lhs: &K, rhs: &K) -> KResult<K> {
         let K::Sym(tname) = lhs else {
             return Err(KError::ty("insert LHS must be a table symbol (`table)"));
         };
-        let cur = self.get_var(*tname)?;
-        let (updated, start_idx, added) = append_to_table(&cur, rhs, false)?;
-        self.set_global(*tname, updated)?;
+        let (start_idx, added) = self.add_rows(*tname, rhs, false)?;
         let indices: Vec<i64> = (start_idx as i64..(start_idx + added) as i64).collect();
         Ok(K::Vector(ColVec::Long(Attr::None, Arc::new(indices))))
     }
@@ -706,9 +730,7 @@ impl<'a> Engine<'a> {
     /// `` `t upsert rows `` or `t upsert rows`
     pub fn eval_upsert(&mut self, lhs: &K, rhs: &K) -> KResult<K> {
         if let K::Sym(tname) = lhs {
-            let cur = self.get_var(*tname)?;
-            let (updated, _, _) = append_to_table(&cur, rhs, true)?;
-            self.set_global(*tname, updated)?;
+            self.add_rows(*tname, rhs, true)?;
             Ok(K::Sym(*tname))
         } else {
             let (updated, _, _) = append_to_table(lhs, rhs, true)?;
@@ -717,48 +739,38 @@ impl<'a> Engine<'a> {
     }
 }
 
+/// The columns of a table as one flip (keys first), and the incoming rows as one of the same columns.
+fn incoming_rows(target: &K, rows: &K) -> KResult<(Flip, usize)> {
+    let full = match target {
+        K::Table(t) => (**t).clone(),
+        K::KeyedTable(kt) => kt.unkey(),
+        _ => return Err(KError::ty("insert/upsert target must be a table")),
+    };
+    let before = full.nrows();
+    Ok((coerce_rows_to_flip(&full.cols, &full.vals, rows)?, before))
+}
+
+/// The table `rows` make of `target`, the rows it had and how many came: by changes where they can be made to a copy,
+/// otherwise rebuilt.
 fn append_to_table(target: &K, rows: &K, allow_key_overwrite: bool) -> KResult<(K, usize, usize)> {
-    match target {
-        K::Table(t) => {
-            let rhs_flip = coerce_rows_to_flip(&t.cols, &t.vals, rows)?;
-            let start = t.nrows();
-            let added = rhs_flip.nrows();
-            let merged = t.concat(&rhs_flip)?;
-            Ok((K::Table(Arc::new(merged)), start, added))
+    let (incoming, start) = incoming_rows(target, rows)?;
+    let added = incoming.nrows();
+    if let Some(change) = row_changes(target, &incoming, !allow_key_overwrite)? {
+        let mut table = target.clone();
+        if !crate::delta::patch(&mut table, &change.changes) {
+            return Err(KError::new("stale", "the table could not be changed"));
         }
+        return Ok((table, start, added));
+    }
+    match target {
+        K::Table(t) => Ok((K::Table(Arc::new(t.concat(&incoming)?)), start, added)),
         K::KeyedTable(kt) => {
-            let full = kt.unkey();
-            let rhs_flip = coerce_rows_to_flip(&full.cols, &full.vals, rows)?;
-            let added = rhs_flip.nrows();
-            let start = kt.nrows();
-            let rhs_kt = KeyedTable::from_flip_nkeys(&rhs_flip, kt.keys.ncols())?;
-            if allow_key_overwrite {
-                let merged = crate::engine::joins::union_join(target, &rhs_kt)?;
-                Ok((merged, start, added))
-            } else {
-                // `insert` on keyed table fails if key already exists (`'insert`)
-                let K::KeyedTable(rkt) = &rhs_kt else { unreachable!() };
-                let existing_keys: std::collections::HashSet<Vec<u8>> = (0..kt.nrows())
-                    .map(|r| {
-                        let mut h = Vec::new();
-                        for c in &kt.keys.vals {
-                            h.extend_from_slice(&c.get_atom(r).hash_key());
-                        }
-                        h
-                    })
-                    .collect();
-                for r in 0..rkt.nrows() {
-                    let mut h = Vec::new();
-                    for c in &rkt.keys.vals {
-                        h.extend_from_slice(&c.get_atom(r).hash_key());
-                    }
-                    if existing_keys.contains(&h) {
-                        return Err(KError::new("insert", "duplicate key in keyed table insert"));
-                    }
-                }
-                let merged = crate::engine::joins::union_join(target, &rhs_kt)?;
-                Ok((merged, start, added))
+            let rows = KeyedTable::from_flip_nkeys(&incoming, kt.keys.ncols())?;
+            let K::KeyedTable(new) = &rows else { return Err(KError::ty("rows do not form a keyed table")) };
+            if !allow_key_overwrite && match_keys(kt, &new.keys.vals.iter().collect::<Vec<_>>(), added).iter().any(Option::is_some) {
+                return Err(KError::new("insert", "duplicate key in keyed table insert"));
             }
+            Ok((crate::engine::joins::union_join(target, &rows)?, start, added))
         }
         _ => Err(KError::ty("insert/upsert target must be a table")),
     }
@@ -850,19 +862,6 @@ pub fn resolve_col_names(specs: &[ColSpec]) -> Vec<SymId> {
 /// The numbers in the whole table of the rows at `positions` among the rows numbered `rows`.
 fn numbers_of(rows: &RowNumbers, positions: &[usize]) -> RowNumbers {
     Some(Arc::new(positions.iter().map(|&p| rows.as_ref().map_or(p, |rows| rows[p])).collect()))
-}
-
-/// The positions of the `true`s. Every position is written and then kept or not: there is no branch to mispredict.
-fn true_rows(bs: &[bool]) -> Vec<usize> {
-    let count = bs.iter().map(|&b| usize::from(b)).sum();
-    let mut rows = vec![0; count + 1];
-    let mut next = 0;
-    for (i, &b) in bs.iter().enumerate() {
-        rows[next] = i;
-        next += usize::from(b);
-    }
-    rows.truncate(count);
-    rows
 }
 
 fn extract_where_indices(pred: &K, nrows: usize) -> KResult<Vec<usize>> {

@@ -8,6 +8,7 @@
 //! assert_eq!(v.to_string(), "55");
 //! ```
 pub mod ast;
+pub mod bytes;
 pub mod delta;
 pub mod engine;
 pub mod error;
@@ -280,9 +281,25 @@ impl Connection {
                 return res;
             }
         }
+        if let Some(statements) = parser::parse_script(q_code).ok().filter(|_| !q_code.trim_start().starts_with("EXPLAIN ")) {
+            if let Some(result) = self.read(&statements, |eng| eng.eval_str(q_code)) {
+                return result;
+            }
+        }
         let mut ws = self.server.shared.ws.write().unwrap_or_else(|e| e.into_inner());
         let mut eng = Engine::new(&mut ws, &mut self.session);
         eng.eval_str(q_code)
+    }
+
+    /// Evaluate with `eval` on a copy of the workspace, holding no lock while it runs, if `statements` only read.
+    /// `None`: they must run on the workspace itself.
+    fn read(&mut self, statements: &[ast::Expr], eval: impl FnOnce(&mut Engine) -> KResult<K>) -> Option<KResult<K>> {
+        let mut copy = {
+            let ws = self.server.shared.ws.read().unwrap_or_else(|e| e.into_inner());
+            engine::pure::reads_only(&ws, &self.session.current_ns, statements).then(|| ws.snapshot())?
+        };
+        let result = eval(&mut Engine::new(&mut copy, &mut self.session));
+        (!matches!(&result, Err(e) if e.signal == "snapshot")).then_some(result)
     }
 
     /// Evaluate an incoming IPC `K` message (string query OR functional list `("fn"; arg1; arg2)`).
@@ -330,6 +347,19 @@ impl Connection {
                 };
             }
         }
+        // (a script that only reads runs beside others, as `eval` does)
+        if let Ok(statements) = parser::parse_script(q_code) {
+            let copy = {
+                let ws = self.server.shared.ws.read().unwrap_or_else(|e| e.into_inner());
+                engine::pure::reads_only(&ws, &self.session.current_ns, &statements).then(|| ws.snapshot())
+            };
+            if let Some(mut copy) = copy {
+                let events = Engine::new(&mut copy, &mut self.session).run_batch(q_code);
+                if !events.iter().any(|e| matches!(e, Event::Error(e) if e.signal == "snapshot")) {
+                    return BatchResult { events };
+                }
+            }
+        }
         let mut ws = self.server.shared.ws.write().unwrap_or_else(|e| e.into_inner());
         let mut eng = Engine::new(&mut ws, &mut self.session);
         BatchResult { events: eng.run_batch(q_code) }
@@ -347,8 +377,17 @@ impl Connection {
 
     /// Evaluate an already parsed expression (the cluster sends shards expressions, not source text).
     pub fn eval_expr(&mut self, expr: &ast::Expr) -> KResult<K> {
+        if let Some(result) = self.read(std::slice::from_ref(expr), |eng| eng.eval_expr(expr)) {
+            return result;
+        }
         let mut ws = self.server.shared.ws.write().unwrap_or_else(|e| e.into_inner());
         Engine::new(&mut ws, &mut self.session).eval_expr(expr)
+    }
+
+    /// Write fully qualified globals atomically (one log record), as new values or as changes to those held.
+    pub fn write_vars(&mut self, writes: Vec<(sym::SymId, engine::Write)>) -> KResult<()> {
+        let mut ws = self.server.shared.ws.write().unwrap_or_else(|e| e.into_inner());
+        Engine::new(&mut ws, &mut self.session).write_globals(writes)
     }
 
     /// Set (`Some`) or drop (`None`) fully qualified globals atomically: one log record.

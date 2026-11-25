@@ -276,7 +276,7 @@ fn kind_from_sym(s: &str) -> ObjectKind {
 
 pub(crate) fn collect_objects(ws: &Workspace) -> Vec<ObjectEntry> {
     let mut out = Vec::new();
-    for (&sym, val) in &ws.vars {
+    for (&sym, val) in ws.vars.iter() {
         let full = resolve(sym);
         if full.starts_with(".kix.") {
             continue;

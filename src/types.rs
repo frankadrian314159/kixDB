@@ -275,13 +275,13 @@ pub enum ColVec {
     General(Attr, Arc<Vec<K>>),
     Bool(Attr, Arc<Vec<bool>>),
     Guid(Attr, Arc<Vec<[u8; 16]>>),
-    Byte(Attr, Arc<Vec<u8>>),
+    Byte(Attr, #[serde(with = "crate::bytes")] Arc<Vec<u8>>),
     Short(Attr, Arc<Vec<i16>>),
     Int(Attr, Arc<Vec<i32>>),
     Long(Attr, Arc<Vec<i64>>),
     Real(Attr, Arc<Vec<f32>>),
     Float(Attr, Arc<Vec<f64>>),
-    Char(Attr, Arc<Vec<u8>>),
+    Char(Attr, #[serde(with = "crate::bytes")] Arc<Vec<u8>>),
     Sym(Attr, Arc<Vec<SymId>>),
     Timestamp(Attr, Arc<Vec<i64>>),
     Month(Attr, Arc<Vec<i32>>),
@@ -610,10 +610,7 @@ impl ColVec {
     pub fn gather(&self, indices: &[usize]) -> ColVec {
         macro_rules! pick {
             ($variant:ident, $v:expr, $null:expr) => {{
-                let mut out = Vec::with_capacity(indices.len());
-                for &i in indices {
-                    out.push(if i < $v.len() { $v[i].clone() } else { $null });
-                }
+                let out = crate::engine::par::map(indices, |&i| if i < $v.len() { $v[i].clone() } else { $null });
                 ColVec::$variant(Attr::None, Arc::new(out))
             }};
         }
@@ -895,20 +892,21 @@ impl ColVec {
         fn float(v: f64) -> u64 {
             if v.is_nan() { f64::NAN.to_bits() } else if v == 0.0 { 0 } else { v.to_bits() }
         }
+        use crate::engine::par::map as par;
         Some(match self {
-            ColVec::Bool(_, v) => v.iter().map(|&x| u64::from(x)).collect(),
-            ColVec::Byte(_, v) | ColVec::Char(_, v) => v.iter().map(|&x| u64::from(x)).collect(),
-            ColVec::Short(_, v) => v.iter().map(|&x| x as u64).collect(),
+            ColVec::Bool(_, v) => par(v, |&x| u64::from(x)),
+            ColVec::Byte(_, v) | ColVec::Char(_, v) => par(v, |&x| u64::from(x)),
+            ColVec::Short(_, v) => par(v, |&x| x as u64),
             ColVec::Int(_, v)
             | ColVec::Month(_, v)
             | ColVec::Date(_, v)
             | ColVec::Minute(_, v)
             | ColVec::Second(_, v)
-            | ColVec::Time(_, v) => v.iter().map(|&x| x as u64).collect(),
-            ColVec::Long(_, v) | ColVec::Timestamp(_, v) | ColVec::Timespan(_, v) => v.iter().map(|&x| x as u64).collect(),
-            ColVec::Real(_, v) => v.iter().map(|&x| float(f64::from(x))).collect(),
-            ColVec::Float(_, v) | ColVec::Datetime(_, v) => v.iter().map(|&x| float(x)).collect(),
-            ColVec::Sym(_, v) => v.iter().map(|&x| u64::from(x.0)).collect(),
+            | ColVec::Time(_, v) => par(v, |&x| x as u64),
+            ColVec::Long(_, v) | ColVec::Timestamp(_, v) | ColVec::Timespan(_, v) => par(v, |&x| x as u64),
+            ColVec::Real(_, v) => par(v, |&x| float(f64::from(x))),
+            ColVec::Float(_, v) | ColVec::Datetime(_, v) => par(v, |&x| float(x)),
+            ColVec::Sym(_, v) => par(v, |&x| u64::from(x.0)),
             ColVec::General(..) | ColVec::Guid(..) => return None,
         })
     }

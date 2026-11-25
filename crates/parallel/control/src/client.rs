@@ -13,7 +13,7 @@ use kixdb::ipc::decode_k_payload;
 use kixdb::{KError, KResult, K};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tonic::transport::Channel;
 use tonic::{Code, Status};
@@ -28,6 +28,8 @@ const FAILOVER: Duration = Duration::from_secs(8);
 pub const REQUEST_LIMIT: Duration = Duration::from_secs(300);
 /// What a change that was not answered in time says of itself.
 pub(crate) const UNKNOWN: &str = "; the change may or may not have been made";
+/// A replicated shard that answered this recently is sent a change without being asked first who leads.
+const LEADER_KNOWN: Duration = Duration::from_millis(500);
 /// The longest a request for a shard's status or metrics may take: they are answered at once by a healthy shard.
 const PROBE_LIMIT: Duration = Duration::from_secs(10);
 
@@ -42,6 +44,8 @@ pub struct ShardClient {
     tls: Option<NodeTls>,
     /// How long a request may take, in milliseconds (0: for ever).
     limit: AtomicU64,
+    /// When the replica now `current` last served a request, since which nothing failed.
+    served: Mutex<Option<Instant>>,
 }
 
 fn channel(addr: &str, tls: Option<&NodeTls>) -> KResult<(String, Channel)> {
@@ -87,7 +91,7 @@ impl ShardClient {
             return Err(KError::new("cluster", "a shard needs an address"));
         }
         let limit = AtomicU64::new(REQUEST_LIMIT.as_millis() as u64);
-        Ok(ShardClient { id, channels: RwLock::new(channels), current: AtomicUsize::new(0), tls, limit })
+        Ok(ShardClient { id, channels: RwLock::new(channels), current: AtomicUsize::new(0), tls, limit, served: Mutex::default() })
     }
 
     /// Give up on requests the shard has not answered after `limit` (zero: never).
@@ -141,9 +145,13 @@ impl ShardClient {
                 Status::deadline_exceeded(format!("no answer within {limit:?}{unknown}"))
             };
             let s = match tokio::time::timeout(limit, call(replicas[i].1.clone())).await.unwrap_or_else(|_| Err(late())) {
-                Ok(v) => return Ok(v),
+                Ok(v) => {
+                    *self.served.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+                    return Ok(v);
+                }
                 Err(s) => s,
             };
+            *self.served.lock().unwrap_or_else(|e| e.into_inner()) = None;
             let hint = s.message().strip_prefix(wire::NOT_LEADER_PREFIX).unwrap_or("");
             let retry = refused(&s) || (idempotent && s.code() == Code::Unavailable);
             let replicated = n > 1 || !hint.is_empty();
@@ -195,8 +203,10 @@ impl ShardClient {
     }
 
     /// A change to the shard: the leader is found first (safe to repeat), so that the change itself is sent to it once.
+    /// (One that served moments ago is taken to lead still: if it has stopped since, this change may fail.)
     async fn change(&self, kind: &'static str, payload: Vec<u8>) -> KResult<Vec<u8>> {
-        if self.replicas().len() > 1 {
+        let known = self.served.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|at| at.elapsed() < LEADER_KNOWN);
+        if self.replicas().len() > 1 && !known {
             self.query(Work::Q("::".into())).await?;
         }
         self.send(false, kind, payload).await

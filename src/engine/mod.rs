@@ -2,7 +2,10 @@
 //! protected evaluation (`@[f;x;h]` / `.[f;args;h]`), views (`::`), and system commands (`\...`).
 pub mod joins;
 pub mod ops;
+pub mod par;
+pub mod pure;
 pub mod qsql;
+pub mod writes;
 pub mod tree;
 
 use crate::ast::Expr;
@@ -15,6 +18,7 @@ use crate::types::*;
 use chrono::{Datelike, Local, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -99,16 +103,35 @@ pub enum DistMode {
 
 // ----- Server / Workspace State ---------------------------------------------
 
+/// A part of the workspace that copies of it share: copying it is free, and writing to a shared one copies it first.
+#[derive(Clone, Debug, Default)]
+pub struct Shared<T>(Arc<T>);
+
+impl<T> Deref for Shared<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T: Clone> DerefMut for Shared<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
 pub struct Workspace {
-    pub vars: HashMap<SymId, K>,
-    pub views: HashMap<SymId, ViewDef>,
-    pub dist: HashMap<SymId, DistMode>,
-    pub partitioned: HashMap<SymId, PartitionedTable>,
+    pub vars: Shared<HashMap<SymId, K>>,
+    pub views: Shared<HashMap<SymId, ViewDef>>,
+    pub dist: Shared<HashMap<SymId, DistMode>>,
+    pub partitioned: Shared<HashMap<SymId, PartitionedTable>>,
     /// Variables whose value readers of the log may not have (read from files): their next change is logged whole.
     pub unlogged: HashSet<SymId>,
     pub data_dir: Option<PathBuf>,
     pub clock: u64,
     pub epoch: u64,
+    /// A copy made for readers (see `Workspace::snapshot`): it takes no writes.
+    pub read_only: bool,
     pub persist: Mutex<Option<Persist>>,
     pub replicator: Mutex<Option<Arc<dyn Replicator>>>,
 }
@@ -122,16 +145,40 @@ impl Default for Workspace {
 impl Workspace {
     pub fn new() -> Self {
         Self {
-            vars: HashMap::new(),
-            views: HashMap::new(),
-            dist: HashMap::new(),
-            partitioned: HashMap::new(),
+            vars: Shared::default(),
+            views: Shared::default(),
+            dist: Shared::default(),
+            partitioned: Shared::default(),
             unlogged: HashSet::new(),
             data_dir: None,
             clock: 0,
             epoch: 0,
+            read_only: false,
             persist: Mutex::new(None),
             replicator: Mutex::new(None),
+        }
+    }
+
+    /// A copy of the workspace as it is, for reading while this one goes on changing: the variables and their values are
+    /// shared until one side writes them.
+    pub fn snapshot(&self) -> Workspace {
+        Workspace {
+            vars: self.vars.clone(),
+            views: self.views.clone(),
+            dist: self.dist.clone(),
+            partitioned: self.partitioned.clone(),
+            data_dir: self.data_dir.clone(),
+            clock: self.clock,
+            epoch: self.epoch,
+            read_only: true,
+            ..Workspace::new()
+        }
+    }
+
+    fn writable(&self) -> KResult<()> {
+        match self.read_only {
+            true => Err(KError::new("snapshot", "this copy of the workspace takes no writes")),
+            false => Ok(()),
         }
     }
 
@@ -181,6 +228,15 @@ struct TableScope {
 }
 
 struct ReturnSignal(K);
+
+/// A write to a global variable.
+#[derive(Clone, Debug)]
+pub enum Write {
+    /// Its new value, or `None` to drop it.
+    Value(Option<K>),
+    /// Changes to the value it has (see `delta.rs`).
+    Change(crate::delta::Changes),
+}
 
 pub struct Engine<'a> {
     pub ws: &'a mut Workspace,
@@ -318,46 +374,80 @@ impl<'a> Engine<'a> {
         self.set_globals(vec![(qname, Some(val))])
     }
 
-    /// Set (`Some`) or drop (`None`) several fully qualified globals as one log record, so that a crash or a replica sees
-    /// all of the changes or none. Ephemeral `.kix.tmp.*` shuffle/broadcast tables stay in memory only.
+    /// Set (`Some`) or drop (`None`) several fully qualified globals as one log record.
     pub fn set_globals(&mut self, changes: Vec<(SymId, Option<K>)>) -> KResult<()> {
+        self.write_globals(changes.into_iter().map(|(name, val)| (name, Write::Value(val))).collect())
+    }
+
+    /// Write several fully qualified globals as one log record, so that a crash or a replica sees all of the writes or
+    /// none. Ephemeral `.kix.tmp.*` shuffle/broadcast tables stay in memory only.
+    pub fn write_globals(&mut self, writes: Vec<(SymId, Write)>) -> KResult<()> {
         let logged = !self.replaying && (self.ws.persist.get_mut().is_ok_and(|p| p.is_some()) || self.ws.replicator.get_mut().is_ok_and(|r| r.is_some()));
-        let ops: Vec<LogOp> = changes
+        self.ws.writable()?;
+        // every change must find the value it was made from before any of them is logged or made
+        for (name, write) in &writes {
+            if matches!(write, Write::Change(c) if !self.ws.vars.get(name).is_some_and(|v| crate::delta::fits(v, c))) {
+                return Err(KError::new("stale", format!("'{}' is not the value the change was made from", resolve(*name))));
+            }
+        }
+        let ops: Vec<LogOp> = writes
             .iter()
             .enumerate()
             .filter(|(_, (name, _))| !is_ephemeral_var(*name))
-            .map(|(i, (name, val))| match val {
-                Some(val) => {
-                    // only what changed, if every reader of the record has the old value and this record's first change
-                    // to the name is this one
-                    let known = logged && !self.ws.unlogged.contains(name) && !self.ws.views.contains_key(name) && !changes[..i].iter().any(|c| c.0 == *name);
-                    let old = self.ws.vars.get(name).filter(|_| known);
-                    let part = old.and_then(|old| match crate::delta::diff(old, val) {
-                        Some(changes) => Some(LogOp::ChangeVar { name: *name, changes }),
-                        None => crate::delta::removed(old, val).map(|removed| LogOp::RemoveRows { name: *name, removed }),
-                    });
-                    part.unwrap_or_else(|| LogOp::SetVar { name: *name, val: val.clone() })
+            .map(|(i, (name, write))| {
+                // only what changed, if every reader of the record has the old value and this record's first write to
+                // the name is this one
+                let known = logged && !self.ws.unlogged.contains(name) && !self.ws.views.contains_key(name) && !writes[..i].iter().any(|w| w.0 == *name);
+                let old = self.ws.vars.get(name).filter(|_| known);
+                match write {
+                    Write::Value(Some(val)) => {
+                        let part = old.and_then(|old| match crate::delta::diff(old, val) {
+                            Some(changes) => Some(LogOp::ChangeVar { name: *name, changes }),
+                            None => crate::delta::removed(old, val).map(|removed| LogOp::RemoveRows { name: *name, removed }),
+                        });
+                        part.unwrap_or_else(|| LogOp::SetVar { name: *name, val: val.clone() })
+                    }
+                    Write::Value(None) => LogOp::DropVar { name: *name },
+                    Write::Change(changes) if old.is_some() || !logged => LogOp::ChangeVar { name: *name, changes: changes.clone() },
+                    // (readers lack the value: they are given all of what it becomes)
+                    Write::Change(changes) => {
+                        let mut val = self.ws.vars[name].clone();
+                        crate::delta::patch(&mut val, changes);
+                        LogOp::SetVar { name: *name, val }
+                    }
                 }
-                None => LogOp::DropVar { name: *name },
             })
             .collect();
         if !ops.is_empty() {
             self.record_ops(ops)?;
             self.ws.invalidate_views();
         }
-        for (name, val) in changes {
+        for (name, write) in writes {
             self.ws.views.remove(&name);
             self.ws.unlogged.remove(&name);
-            match val {
-                Some(val) => self.ws.vars.insert(name, val),
-                None => self.ws.vars.remove(&name),
-            };
+            match write {
+                Write::Value(Some(val)) => drop(self.ws.vars.insert(name, val)),
+                Write::Value(None) => drop(self.ws.vars.remove(&name)),
+                Write::Change(changes) => {
+                    if let Some(value) = self.ws.vars.get_mut(&name) {
+                        crate::delta::patch(value, &changes);
+                    }
+                }
+            }
         }
         Ok(())
     }
 
+    /// The global that `name` stands for here, when it is the value that reading the name gives.
+    pub(crate) fn global_to_change(&self, name: SymId) -> Option<SymId> {
+        let shadowed = !self.table_scopes.is_empty() || self.locals.last().is_some_and(|f| f.contains_key(&name));
+        let qualified = self.qualify(name);
+        (!shadowed && self.ws.vars.contains_key(&qualified)).then_some(qualified)
+    }
+
     /// Log (and replicate) a change that the caller makes only if this succeeds.
     fn record_ops(&mut self, ops: Vec<LogOp>) -> KResult<()> {
+        self.ws.writable()?;
         if self.replaying {
             return Ok(());
         }

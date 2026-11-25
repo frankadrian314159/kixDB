@@ -26,9 +26,10 @@ use kix_shared_ces::route::even_slots;
 use kix_shared_ces::wire::{ord_var, MemberInfo, MemberReq, ShardStatus, Work};
 use kix_shared_ces::{ClusterConfig, ShardInfo};
 use kixdb::engine::DistMode;
-use kixdb::sym::resolve;
+use kixdb::sym::{resolve, SymId};
 use kixdb::{Interceptor, KError, KResult, Server, K};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
@@ -60,6 +61,8 @@ struct Inner {
     next_ord: AtomicI64,
     next_temp: AtomicU64,
     broadcast_limit: AtomicUsize,
+    /// How many rows tables had when last counted or written (only this node changes them).
+    rows: Mutex<HashMap<SymId, usize>>,
     state_path: Option<PathBuf>,
     /// Since when some shard may hold a change waiting to be resolved (and when to try).
     unsettled: Mutex<Option<Instant>>,
@@ -199,6 +202,7 @@ impl Cluster {
             next_ord: AtomicI64::new(0),
             next_temp: AtomicU64::new(0),
             broadcast_limit: AtomicUsize::new(BROADCAST_LIMIT),
+            rows: Mutex::default(),
             state_path,
             // (a control node before this one may have left changes half made)
             unsettled: Mutex::new(Some(Instant::now())),

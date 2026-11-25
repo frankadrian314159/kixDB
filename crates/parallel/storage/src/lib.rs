@@ -18,7 +18,10 @@ use kix_shared_ces::pieces::{Assembly, ACTION_PIECE};
 use kix_shared_ces::route::shard_for_keys;
 use kix_shared_ces::NodeTls;
 use kix_shared_ces::wire::{self, ord_var, Fragment, LoadMode, LoadReq, MemberReq, MutateReq, ShardStatus, ShuffleReq, TxnReq, Work};
-use kixdb::engine::joins::union_join;
+use kixdb::delta::{self, ColChange};
+use kixdb::engine::joins::{match_keys, union_join};
+use kixdb::engine::writes::row_changes;
+use kixdb::engine::Write;
 use kixdb::ipc::encode_k_payload;
 use kixdb::sym::{intern, SymId};
 use kixdb::{Attr, ColVec, Connection, Flip, KError, KResult, KeyedTable, Server, K};
@@ -47,6 +50,8 @@ struct Core {
     /// One change of a table slice at a time: each reads the slice, then writes it.
     writes: Mutex<()>,
     peers: transport::Peers,
+    /// The change prepared and not yet committed, worked out.
+    prepared: txn::Prepared,
     /// Actions arriving in pieces.
     pieces: Assembly,
     started: Instant,
@@ -120,53 +125,83 @@ fn row_keys(f: &Flip, nkeys: usize) -> Vec<Vec<u8>> {
     (0..f.nrows()).map(|r| f.vals[..nkeys].iter().flat_map(|c| c.get_atom(r).hash_key()).collect()).collect()
 }
 
-/// Variables to set (`Some`) or drop (`None`).
-type Changes = Vec<(SymId, Option<K>)>;
+/// Writes to the variables of the engine.
+type Changes = Vec<(SymId, Write)>;
+
+/// The value `name` has once `staged` is made.
+fn staged_value(conn: &mut Connection, staged: &Changes, name: &str) -> KResult<K> {
+    let mut value = None;
+    for (_, write) in staged.iter().filter(|s| s.0 == intern(name)) {
+        value = Some(match write {
+            Write::Value(v) => v.clone(),
+            Write::Change(changes) => {
+                let mut v = match value.take() {
+                    Some(v) => v,
+                    None => Some(conn.get_var_direct(name)?),
+                };
+                if !v.as_mut().is_some_and(|v| delta::patch(v, changes)) {
+                    return Err(KError::new("cluster", format!("`{name} is not the table the change was made from")));
+                }
+                v
+            }
+        });
+    }
+    match value {
+        Some(v) => v.ok_or_else(|| KError::value(name.to_string())),
+        None => conn.get_var_direct(name),
+    }
+}
 
 /// What a load would change on the engine behind `conn`, were `staged` made first.
 fn load_changes(conn: &mut Connection, staged: &Changes, req: &LoadReq) -> KResult<Changes> {
     let (table, ords) = (intern(&req.table), intern(&ord_var(&req.table)));
     if req.mode == LoadMode::Drop {
-        return Ok(vec![(table, None), (ords, None)]);
+        return Ok(vec![(table, Write::Value(None)), (ords, Write::Value(None))]);
     }
     let rows = req.rows()?;
     if req.mode == LoadMode::Replace {
         let ordinals = req.ords.clone().map(long_vec);
-        return Ok(vec![(table, Some(rows)), (ords, ordinals)]);
+        return Ok(vec![(table, Write::Value(Some(rows))), (ords, Write::Value(ordinals))]);
     }
     let incoming = unkeyed(&rows)?;
-    let mut value = |name: &str| match staged.iter().find(|c| c.0 == intern(name)) {
-        Some((_, Some(v))) => Ok(v.clone()),
-        Some((_, None)) => Err(KError::value(name.to_string())),
-        None => conn.get_var_direct(name),
-    };
-    let current = value(&req.table)?;
-    // the incoming rows that become new rows of the slice
-    let (merged, added): (K, Vec<usize>) = match (&current, req.mode) {
-        (K::Table(t), LoadMode::Append) => (K::Table(Arc::new(t.concat(&incoming)?)), (0..incoming.nrows()).collect()),
-        (K::KeyedTable(kt), LoadMode::Upsert | LoadMode::CheckInsert) => {
-            let nkeys = kt.keys.ncols();
-            let mut seen: HashSet<Vec<u8>> = row_keys(&kt.keys, nkeys).into_iter().collect();
-            let new = row_keys(&incoming, nkeys);
-            if req.mode == LoadMode::CheckInsert {
-                return match new.iter().any(|k| seen.contains(k)) {
-                    true => Err(KError::new("insert", "duplicate key in keyed table insert")),
-                    false => Ok(vec![]),
-                };
-            }
-            let added = new.into_iter().enumerate().filter_map(|(i, k)| seen.insert(k).then_some(i)).collect();
-            (union_join(&current, &KeyedTable::from_flip_nkeys(&incoming, nkeys)?)?, added)
-        }
+    let current = staged_value(conn, staged, &req.table)?;
+    let keyed = match (&current, req.mode) {
+        (K::Table(_), LoadMode::Append) => None,
+        (K::KeyedTable(kt), LoadMode::Upsert | LoadMode::CheckInsert) => Some(kt),
         _ => return Err(KError::ty(format!("table `{} does not accept this load", req.table))),
     };
-    let mut changes = vec![(table, Some(merged))];
+    let key_columns = |kt: &KeyedTable| incoming.vals[..kt.keys.ncols()].iter().collect::<Vec<_>>();
+    if req.mode == LoadMode::CheckInsert {
+        let found = keyed.map(|kt| match_keys(kt, &key_columns(kt), incoming.nrows()));
+        return match found.is_some_and(|f| f.iter().any(Option::is_some)) {
+            true => Err(KError::new("insert", "duplicate key in keyed table insert")),
+            false => Ok(vec![]),
+        };
+    }
+    // the table is changed where it can be, and otherwise rebuilt; `added`: the incoming rows that become new rows
+    let (write, added) = match row_changes(&current, &incoming, false)? {
+        Some(rows) => (Write::Change(rows.changes), rows.added),
+        None => match (&current, keyed) {
+            (K::Table(t), _) => (Write::Value(Some(K::Table(Arc::new(t.concat(&incoming)?)))), (0..incoming.nrows()).collect()),
+            (_, Some(kt)) => {
+                let nkeys = kt.keys.ncols();
+                let mut seen: HashSet<Vec<u8>> = row_keys(&kt.keys, nkeys).into_iter().collect();
+                let added = row_keys(&incoming, nkeys).into_iter().enumerate().filter_map(|(i, k)| seen.insert(k).then_some(i)).collect();
+                (Write::Value(Some(union_join(&current, &KeyedTable::from_flip_nkeys(&incoming, nkeys)?)?)), added)
+            }
+            _ => return Err(KError::ty(format!("table `{} does not accept this load", req.table))),
+        },
+    };
+    // (so that the table is not held twice while it changes)
+    drop(current);
+    let mut changes = vec![(table, write)];
     if let Some(new) = &req.ords {
-        let mut all = match value(&ord_var(&req.table))? {
-            K::Vector(ColVec::Long(_, v)) => (*v).clone(),
+        let held = match staged_value(conn, staged, &ord_var(&req.table))? {
+            K::Vector(ColVec::Long(_, v)) => v.len(),
             _ => return Err(KError::new("cluster", "row ordinals are missing")),
         };
-        all.extend(added.iter().map(|&i| new[i]));
-        changes.push((ords, Some(long_vec(all))));
+        let tail = ColVec::Long(Attr::None, Arc::new(added.iter().map(|&i| new[i]).collect()));
+        changes.push((ords, Write::Change(vec![(0, ColChange::Append { at: held as u64, tail })])));
     }
     Ok(changes)
 }
@@ -184,9 +219,9 @@ fn mutation_changes(conn: &mut Connection, req: &MutateReq) -> KResult<(K, Chang
         K::Vector(flip.vals.remove(i))
     });
     let schema = KeyedTable::from_flip_nkeys(&flip.take(0), nkeys)?;
-    let mut changes = vec![(intern(&req.table), Some(KeyedTable::from_flip_nkeys(&flip, nkeys)?))];
+    let mut changes = vec![(intern(&req.table), Write::Value(Some(KeyedTable::from_flip_nkeys(&flip, nkeys)?)))];
     if let Some(o) = ordinals {
-        changes.push((intern(&ord_var(&req.table)), Some(o)));
+        changes.push((intern(&ord_var(&req.table)), Write::Value(Some(o))));
     }
     Ok((schema, changes))
 }
@@ -261,7 +296,7 @@ impl Core {
             let _one = core.writes.lock().unwrap_or_else(|e| e.into_inner());
             txn::check_free(&core.server, &req.table)?;
             let changes = load_changes(conn, &vec![], &req)?;
-            conn.set_vars(changes)
+            conn.write_vars(changes)
         })
         .await
     }
@@ -402,6 +437,7 @@ impl ShardNode {
             replica,
             writes: Mutex::default(),
             peers: Default::default(),
+            prepared: Default::default(),
             pieces: Assembly::default(),
             started: Instant::now(),
             in_flight: AtomicU64::new(0),
@@ -474,7 +510,7 @@ impl FlightService for ShardNode {
                     let _one = core.writes.lock().unwrap_or_else(|e| e.into_inner());
                     txn::check_free(&core.server, &req.table)?;
                     let (schema, changes) = mutation_changes(conn, &req)?;
-                    conn.set_vars(changes)?;
+                    conn.write_vars(changes)?;
                     Ok(encode_k_payload(&schema))
                 })
                 .await?
@@ -486,7 +522,7 @@ impl FlightService for ShardNode {
                 let commits = matches!(req, TxnReq::Commit { .. });
                 let work = move |core: &Core, conn: &mut Connection| {
                     let _one = core.writes.lock().unwrap_or_else(|e| e.into_inner());
-                    txn::run(&core.server, conn, req)
+                    txn::run(&core.server, conn, &core.prepared, req)
                 };
                 let reply = match commits {
                     true => core.to_the_end(core.server.connect_internal(), work).await?,
