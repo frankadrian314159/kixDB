@@ -18,6 +18,7 @@ use crate::types::*;
 use chrono::{Datelike, Local, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -102,11 +103,28 @@ pub enum DistMode {
 
 // ----- Server / Workspace State ---------------------------------------------
 
+/// A part of the workspace that copies of it share: copying it is free, and writing to a shared one copies it first.
+#[derive(Clone, Debug, Default)]
+pub struct Shared<T>(Arc<T>);
+
+impl<T> Deref for Shared<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T: Clone> DerefMut for Shared<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
 pub struct Workspace {
-    pub vars: HashMap<SymId, K>,
-    pub views: HashMap<SymId, ViewDef>,
-    pub dist: HashMap<SymId, DistMode>,
-    pub partitioned: HashMap<SymId, PartitionedTable>,
+    pub vars: Shared<HashMap<SymId, K>>,
+    pub views: Shared<HashMap<SymId, ViewDef>>,
+    pub dist: Shared<HashMap<SymId, DistMode>>,
+    pub partitioned: Shared<HashMap<SymId, PartitionedTable>>,
     /// Variables whose value readers of the log may not have (read from files): their next change is logged whole.
     pub unlogged: HashSet<SymId>,
     pub data_dir: Option<PathBuf>,
@@ -127,10 +145,10 @@ impl Default for Workspace {
 impl Workspace {
     pub fn new() -> Self {
         Self {
-            vars: HashMap::new(),
-            views: HashMap::new(),
-            dist: HashMap::new(),
-            partitioned: HashMap::new(),
+            vars: Shared::default(),
+            views: Shared::default(),
+            dist: Shared::default(),
+            partitioned: Shared::default(),
             unlogged: HashSet::new(),
             data_dir: None,
             clock: 0,
@@ -141,8 +159,8 @@ impl Workspace {
         }
     }
 
-    /// A copy of the workspace as it is, for reading while this one goes on changing: the values are shared until one
-    /// side writes them.
+    /// A copy of the workspace as it is, for reading while this one goes on changing: the variables and their values are
+    /// shared until one side writes them.
     pub fn snapshot(&self) -> Workspace {
         Workspace {
             vars: self.vars.clone(),

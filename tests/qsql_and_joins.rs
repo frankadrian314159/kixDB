@@ -281,3 +281,19 @@ fn statements_that_only_read_run_while_others_hold_the_workspace() {
         assert_eq!(c.eval(check).unwrap().to_string(), expected, "{code}");
     }
 }
+
+#[test]
+fn a_snapshot_shares_the_variables_until_one_is_written() {
+    let server = Server::new();
+    let mut c = server.connect();
+    c.eval("a: 1").unwrap();
+    let copy = server.read_workspace(|ws| ws.snapshot());
+    let shared = || server.read_workspace(|ws| std::ptr::eq(&*ws.vars, &*copy.vars));
+    // reading copies nothing
+    c.eval("a + 1").unwrap();
+    assert!(shared());
+    c.eval("a: 2").unwrap();
+    assert!(!shared());
+    assert_eq!(copy.vars[&kixdb::sym::intern("a")].to_string(), "1");
+    assert_eq!(c.eval("a").unwrap().to_string(), "2");
+}
