@@ -14,7 +14,8 @@
 //! `ADD REPLICA shard id host:port` and `REMOVE REPLICA shard id`.
 //!
 //! `--wait-shards SECS` (30) waits for every shard to answer before starting; `--broadcast-limit ROWS` (100000) is the
-//! largest table a join copies to every shard rather than shuffling.
+//! largest table a join copies to every shard rather than shuffling. `--request-timeout SECS` (300; 0: none) is how long
+//! a shard may take over a request before the statement fails; a change that fails so may still be made.
 use kix_control::Cluster;
 use kix_shared_ces::metrics::serve_http;
 use kix_shared_ces::tls::{make_certs, TlsFlags};
@@ -29,7 +30,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: kix-cluster --config cluster.json [--state FILE] --listen PORT [--bind ADDR] [-u USER:PASSWORD]\n                   \
          [--tls-cert FILE --tls-key FILE | --tls] [--force-tls] [--insecure-clients] [--metrics-listen HOST:PORT]\n                   \
-         [--wait-shards SECS] [--broadcast-limit ROWS]\n       \
+         [--wait-shards SECS] [--broadcast-limit ROWS] [--request-timeout SECS]\n       \
          kix-cluster --config cluster.json [--state FILE] [--plan] < script.q\n       \
          kix-cluster --make-certs DIR NAME...\n\
          connections to the shards need --node-ca FILE --node-cert FILE --node-key FILE, or --insecure"
@@ -49,7 +50,7 @@ fn parsed<T: std::str::FromStr>(value: Option<String>) -> T {
 fn main() -> ExitCode {
     let (mut config, mut state, mut listen) = (None::<String>, None::<String>, None::<u16>);
     let (mut bind, mut auth) = ("127.0.0.1".to_string(), std::env::var("KIX_AUTH").ok());
-    let (mut metrics_listen, mut broadcast_limit) = (None::<String>, None::<usize>);
+    let (mut metrics_listen, mut broadcast_limit, mut request_timeout) = (None::<String>, None::<usize>, None::<u64>);
     let (mut show_plan, mut wait_shards, mut insecure_clients) = (false, 30u64, false);
     let (mut cert, mut key, mut self_signed, mut force_tls) = (None::<String>, None::<String>, false, false);
     let mut tls = TlsFlags::default();
@@ -78,6 +79,7 @@ fn main() -> ExitCode {
             "--insecure-clients" => insecure_clients = true,
             "--metrics-listen" => metrics_listen = args.next(),
             "--broadcast-limit" => broadcast_limit = Some(parsed(args.next())),
+            "--request-timeout" => request_timeout = Some(parsed(args.next())),
             "--wait-shards" => wait_shards = parsed(args.next()),
             "--plan" => show_plan = true,
             _ => usage(),
@@ -101,6 +103,9 @@ fn main() -> ExitCode {
     .unwrap_or_else(|e| fail(e.to_string()));
     if let Some(rows) = broadcast_limit {
         cluster.set_broadcast_limit(rows);
+    }
+    if let Some(secs) = request_timeout {
+        cluster.set_request_timeout(Duration::from_secs(secs));
     }
     if wait_shards > 0 {
         if let Err(down) = cluster.wait_for_shards(Duration::from_secs(wait_shards)) {

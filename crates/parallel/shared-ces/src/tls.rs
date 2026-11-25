@@ -51,6 +51,9 @@ impl NodeTls {
     }
 }
 
+/// How long a connection with a request open may answer nothing before it is given up.
+const SILENCE: Duration = Duration::from_secs(15);
+
 /// A connection to the node at `addr`, made on first use: mutual TLS with `tls`, otherwise unprotected.
 pub fn channel(addr: &str, tls: Option<&NodeTls>, connect_timeout: Duration) -> Result<Channel, String> {
     let scheme = if tls.is_some() { "https" } else { "http" };
@@ -59,6 +62,8 @@ pub fn channel(addr: &str, tls: Option<&NodeTls>, connect_timeout: Duration) -> 
     if let Some(tls) = tls {
         endpoint = endpoint.tls_config(tls.client()).map_err(bad)?;
     }
+    // while a request is open, ping: a node or a link that has gone silent is given up on within `SILENCE`
+    let endpoint = endpoint.http2_keep_alive_interval(SILENCE / 3).keep_alive_timeout(SILENCE * 2 / 3);
     Ok(endpoint.tcp_nodelay(true).connect_timeout(connect_timeout).connect_lazy())
 }
 

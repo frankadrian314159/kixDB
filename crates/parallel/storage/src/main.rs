@@ -78,6 +78,9 @@ async fn main() {
         }
     }
     let (Some(id), Some(listen)) = (id, listen) else { usage() };
+    if join && (replica.is_none() || peers.is_empty()) {
+        fail("--join needs --replica and --peers: without the others' addresses this replica cannot answer the leader".into());
+    }
     let tls = tls.load().unwrap_or_else(|e| fail(e));
     if tls.is_none() {
         eprintln!("kix-shard {id}: WARNING: connections are neither encrypted nor authenticated (--insecure)");

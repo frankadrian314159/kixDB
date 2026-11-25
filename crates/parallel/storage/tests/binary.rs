@@ -1,4 +1,4 @@
-//! The `kix-shard` binary does not serve unprotected connections unless told to.
+//! The `kix-shard` binary refuses to start unprotected unless told to, or to join a group it cannot answer.
 use std::process::Command;
 
 #[test]
@@ -10,6 +10,10 @@ fn kix_shard_insists_on_certificates() {
         assert!(!out.status.success() && said.contains(why), "{flags:?}: {said}");
     };
     refused(&[], "--insecure");
+    // a replica that joins must know the others
+    refused(&["--join", "--insecure"], "--join needs --replica and --peers");
+    refused(&["--join", "--insecure", "--data", "d", "--replica", "4"], "--join needs --replica and --peers");
+    refused(&["--join", "--insecure", "--peers", "1=127.0.0.1:1"], "--join needs --replica and --peers");
     refused(&["--node-ca", "ca.pem"], "go together");
     refused(&["--insecure", "--node-key", "node.key"], "cannot be combined");
     refused(&["--node-ca", "none.pem", "--node-cert", "none.pem", "--node-key", "none.key"], "cannot read none.pem");

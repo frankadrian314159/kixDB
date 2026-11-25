@@ -238,11 +238,21 @@ impl Cluster {
         self.inner.broadcast_limit.store(rows, Ordering::SeqCst);
     }
 
+    /// Fail a request that a shard has not answered after `limit` (300 s to begin with; zero: never). A change that times
+    /// out may still be made.
+    pub fn set_request_timeout(&self, limit: Duration) {
+        self.inner.shards.iter().for_each(|s| s.set_limit(limit));
+    }
+
     /// Wait until every shard answers; the ids of those that do not within `limit`.
     pub fn wait_for_shards(&self, limit: Duration) -> Result<(), Vec<u32>> {
         let deadline = Instant::now() + limit;
         loop {
-            let down: Vec<u32> = self.inner.shards.iter().filter(|s| self.inner.wait(s.query(Work::Q("::".into()))).is_err()).map(|s| s.id).collect();
+            let answers = |s: &ShardClient| {
+                let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_secs(1));
+                self.inner.wait(async { matches!(tokio::time::timeout(left, s.query(Work::Q("::".into()))).await, Ok(Ok(_))) })
+            };
+            let down: Vec<u32> = self.inner.shards.iter().filter(|s| !answers(s)).map(|s| s.id).collect();
             if down.is_empty() {
                 return Ok(());
             }

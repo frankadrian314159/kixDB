@@ -215,8 +215,8 @@ A replica keeps its Raft state in `raft.log`, to which records are added and whi
 state or the new log records: **stop all replicas of a shard, upgrade them, and start them again.** Do not run versions
 side by side in one shard.
 
-To add a replica, first make its certificate and start it, with `--join` and the addresses of the others (without
-`--peers` it cannot answer the leader, and adding it fails):
+To add a replica, first make its certificate and start it, with `--join` and the addresses of the others (`--join`
+without `--peers` is refused: the replica could not answer the leader):
 
 ```
 kix-cluster --make-certs certs s0r4
@@ -239,6 +239,19 @@ The control node follows membership changes made through it, and learns a new le
 to it; the state file records both. If a control node cannot reach a group at all (every address it knows is gone), start
 it with a `--config` that lists a current replica: its addresses are added to those in the state file. The number of
 shards must match.
+
+## When a shard does not answer
+
+* **A node or link gone silent:** while a request is open, nodes ping one another; a connection that answers nothing for
+  15 seconds is given up. A read of a replicated shard then tries its other replicas.
+* **A shard that takes too long:** `kix-cluster --request-timeout SECS` (300; 0: no limit; from Rust,
+  `Cluster::set_request_timeout`) fails a statement whose shard has not answered in that time, and statements waiting
+  behind it go on. Raise it if queries or loads legitimately take longer. Requests for status and metrics get at most 10
+  seconds.
+* **A change that fails this way may still be made:** the error says so. The shard goes on with what it was doing, and
+  other shards may already have applied their part. Check the data before running the statement again.
+* A replica whose engine is stuck can remain the leader, since replication goes on without the engine: its requests fail
+  until it is restarted.
 
 ## Operations
 

@@ -11,7 +11,7 @@ use kix_shared_ces::wire::{self, Fragment, LoadReq, MemberInfo, MemberReq, Mutat
 use kixdb::ipc::decode_k_payload;
 use kixdb::{KError, KResult, K};
 use std::future::Future;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 use tonic::transport::Channel;
@@ -23,6 +23,10 @@ const MAX_MESSAGE: usize = 256 * 1024 * 1024;
 const UNPACK_ELSEWHERE: usize = 16_384;
 /// How long to look for the leader of a replicated shard (an election takes a moment).
 const FAILOVER: Duration = Duration::from_secs(8);
+/// How long a shard may take over a request, unless told otherwise.
+pub const REQUEST_LIMIT: Duration = Duration::from_secs(300);
+/// The longest a request for a shard's status or metrics may take: they are answered at once by a healthy shard.
+const PROBE_LIMIT: Duration = Duration::from_secs(10);
 
 /// One shard: a single node, or the replicas of a replicated shard (whose leader serves the requests).
 pub struct ShardClient {
@@ -33,6 +37,8 @@ pub struct ShardClient {
     current: AtomicUsize,
     /// How the control node proves who it is to the replicas; `None`: unprotected connections.
     tls: Option<NodeTls>,
+    /// How long a request may take, in milliseconds (0: for ever).
+    limit: AtomicU64,
 }
 
 fn channel(addr: &str, tls: Option<&NodeTls>) -> KResult<(String, Channel)> {
@@ -77,7 +83,20 @@ impl ShardClient {
         if channels.is_empty() {
             return Err(KError::new("cluster", "a shard needs an address"));
         }
-        Ok(ShardClient { id, channels: RwLock::new(channels), current: AtomicUsize::new(0), tls })
+        let limit = AtomicU64::new(REQUEST_LIMIT.as_millis() as u64);
+        Ok(ShardClient { id, channels: RwLock::new(channels), current: AtomicUsize::new(0), tls, limit })
+    }
+
+    /// Give up on requests the shard has not answered after `limit` (zero: never).
+    pub fn set_limit(&self, limit: Duration) {
+        self.limit.store(limit.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    fn limit(&self) -> Duration {
+        match self.limit.load(Ordering::Relaxed) {
+            0 => Duration::MAX,
+            ms => Duration::from_millis(ms),
+        }
     }
 
     fn replicas(&self) -> Vec<(String, Channel)> {
@@ -100,26 +119,32 @@ impl ShardClient {
     }
 
     /// Try a call on the replica that served last, moving to the leader it names (or to the next one) while the request is
-    /// refused. A transport failure is retried only for a request that is safe to repeat (`idempotent`).
-    async fn on_leader<T, F, Fut>(&self, idempotent: bool, call: F) -> KResult<T>
+    /// refused. A transport failure is retried only for a request that is safe to repeat (`idempotent`); one that is not
+    /// answered within `limit` is not retried.
+    async fn on_leader<T, F, Fut>(&self, idempotent: bool, limit: Duration, call: F) -> KResult<T>
     where
         F: Fn(Channel) -> Fut,
         Fut: Future<Output = Result<T, Status>>,
     {
-        let started = Instant::now();
+        // when the first replica asked could not serve
+        let mut failing = None::<Instant>;
         let mut tries = 0usize;
         loop {
             let replicas = self.replicas();
             let n = replicas.len();
             let i = self.current.load(Ordering::Relaxed) % n;
-            let s = match call(replicas[i].1.clone()).await {
+            let late = || {
+                let unknown = if idempotent { "" } else { "; the change may or may not have been made" };
+                Status::deadline_exceeded(format!("no answer within {limit:?}{unknown}"))
+            };
+            let s = match tokio::time::timeout(limit, call(replicas[i].1.clone())).await.unwrap_or_else(|_| Err(late())) {
                 Ok(v) => return Ok(v),
                 Err(s) => s,
             };
             let hint = s.message().strip_prefix(wire::NOT_LEADER_PREFIX).unwrap_or("");
             let retry = refused(&s) || (idempotent && s.code() == Code::Unavailable);
             let replicated = n > 1 || !hint.is_empty();
-            if !replicated || !retry || started.elapsed() >= FAILOVER {
+            if !replicated || !retry || failing.get_or_insert_with(Instant::now).elapsed() >= FAILOVER {
                 let mut e = wire::error_of(&s);
                 if e.signal == "cluster" {
                     // what lies under a failed connection, such as a certificate that is refused
@@ -143,7 +168,11 @@ impl ShardClient {
     }
 
     async fn send(&self, idempotent: bool, kind: &'static str, payload: Vec<u8>) -> KResult<Vec<u8>> {
-        self.on_leader(idempotent, |ch| {
+        let limit = match kind {
+            wire::ACTION_STATUS | wire::ACTION_METRICS => self.limit().min(PROBE_LIMIT),
+            _ => self.limit(),
+        };
+        self.on_leader(idempotent, limit, |ch| {
             let payload = payload.clone();
             async move {
                 let mut results = client(ch).do_action(Action::new(kind, payload)).await.map_err(status_of)?;
@@ -172,7 +201,7 @@ impl ShardClient {
 
     /// Evaluate work that is already encoded.
     pub async fn run(&self, ticket: Ticket) -> KResult<K> {
-        self.on_leader(true, |ch| {
+        self.on_leader(true, self.limit(), |ch| {
             let ticket = ticket.clone();
             async move {
                 let mut stream = client(ch).do_get(ticket).await.map_err(status_of)?;
@@ -225,5 +254,24 @@ impl ShardClient {
 
     pub async fn metrics(&self) -> KResult<NodeMetrics> {
         reply(&self.send(true, wire::ACTION_METRICS, vec![]).await?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_change_that_gets_no_answer_may_have_been_made() {
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let shard = ShardClient::new(0, &silent.local_addr().unwrap().to_string(), None).unwrap();
+            shard.set_limit(Duration::from_millis(200));
+            let read = shard.query(Work::Q("::".into())).await.unwrap_err().detail;
+            let change = shard.load(&LoadReq::new("t", wire::LoadMode::Append, &K::Long(1), None)).await.unwrap_err().detail;
+            assert!(read.ends_with("no answer within 200ms"), "{read}");
+            assert!(change.ends_with("no answer within 200ms; the change may or may not have been made"), "{change}");
+        });
     }
 }
