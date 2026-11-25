@@ -848,6 +848,19 @@ pub fn resolve_col_names(specs: &[ColSpec]) -> Vec<SymId> {
     out
 }
 
+/// The positions of the `true`s. Every position is written and then kept or not: there is no branch to mispredict.
+fn true_rows(bs: &[bool]) -> Vec<usize> {
+    let count = bs.iter().map(|&b| usize::from(b)).sum();
+    let mut rows = vec![0; count + 1];
+    let mut next = 0;
+    for (i, &b) in bs.iter().enumerate() {
+        rows[next] = i;
+        next += usize::from(b);
+    }
+    rows.truncate(count);
+    rows
+}
+
 fn extract_where_indices(pred: &K, nrows: usize) -> KResult<Vec<usize>> {
     match pred {
         K::Bool(true) => Ok((0..nrows).collect()),
@@ -856,7 +869,7 @@ fn extract_where_indices(pred: &K, nrows: usize) -> KResult<Vec<usize>> {
             if bs.len() != nrows {
                 return Err(KError::length("where predicate boolean vector length mismatch"));
             }
-            Ok(bs.iter().enumerate().filter_map(|(i, &b)| if b { Some(i) } else { None }).collect())
+            Ok(true_rows(bs))
         }
         K::Vector(cv) => {
             // In kdb+, an integer vector in `where` (e.g. from `f` or `where`) directly selects row indices or repetition counts

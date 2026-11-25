@@ -155,6 +155,36 @@ fn aggregates_over_all_groups_at_once_match_the_group_by_group_results() {
 }
 
 #[test]
+fn patterns_and_filters_match_what_they_should() {
+    let mut c = Server::new().connect();
+    // a `*` does not cross lines, so the fourth text, of two lines, matches none of these
+    c.eval("s: (\"ab\"; \"abc\"; \"cab\"; \"a\nb\"; \"\"; \"ba\")").unwrap();
+    for (pattern, expected) in [
+        ("a*", "110000b"),
+        ("*b", "101000b"),
+        ("*b*", "111001b"),
+        ("a*c", "010000b"),
+        ("*", "111011b"),
+        ("**", "111011b"),
+        ("", "000010b"),
+        ("?b", "100000b"),
+        ("[bc]a*", "001001b"),
+    ] {
+        for text in ["s", "(`$s)"] {
+            assert_eq!(eval(&mut c, &format!("{text} like \"{pattern}\"")), expected, "{text} like {pattern}");
+        }
+    }
+    // characters that mean something to a regular expression stand for themselves
+    assert_eq!(eval(&mut c, "(\"a.b\"; \"axb\"; \"a+(b\"; \"a$\") like \"a.*\""), "1000b");
+    assert_eq!(eval(&mut c, "(\"a+(b\" like \"*+(*\"; \"a$\" like \"*$\"; `ab like \"*b\")"), "111b");
+    // clause by clause, keeping many rows, few, all or none, gives the rows that all the conditions together give
+    c.eval("t: ([] id: til 997; a: (til 997) mod 10; b: (til 997) mod 7)").unwrap();
+    for (a, b) in [(-1, 7), (4, 3), (8, 1), (9, 7), (-1, 0)] {
+        agree(&mut c, &format!("exec id from t where a > {a}, b < {b}"), &format!("where (t[`a] > {a}) & t[`b] < {b}"));
+    }
+}
+
+#[test]
 fn queries_see_the_columns_they_name_however_they_name_them() {
     let mut c = Server::new().connect();
     c.eval("t: ([] a: 1 2 3 4; b: 10 20 30 40; c: `w`x`y`z; s: (\"p\"; \"qq\"; \"r\"; \"ss\"))").unwrap();

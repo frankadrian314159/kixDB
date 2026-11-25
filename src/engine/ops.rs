@@ -1,6 +1,6 @@
 //! Vectorized unary and binary `q` primitives, casts, aggregations, moving windows, and temporal extractors.
 use crate::error::{KError, KResult};
-use crate::sym::{intern, resolve, SymId};
+use crate::sym::{intern, resolve, with_str, SymId};
 use crate::types::*;
 use chrono::Datelike;
 use regex::Regex;
@@ -2469,21 +2469,27 @@ pub fn compile_kdb_like(pat: &str) -> KResult<Regex> {
 fn like_op(lhs: &K, rhs: &K) -> KResult<K> {
     let pat = rhs.as_str().ok_or_else(|| KError::ty("like pattern must be string or symbol"))?;
     let rx = compile_kdb_like(&pat)?;
+    // On text of one line a `*` at either end says nothing, and without it the engine can search for the rest instead of
+    // running through the whole text. (Text of several lines needs the whole pattern: `*` does not cross lines.)
+    let inner = rx.as_str().trim_start_matches("^.*").trim_end_matches(".*$");
+    let inner = Regex::new(inner).map_err(|e| KError::domain(e.to_string()))?;
+    let found = |s: &str| if s.contains('\n') { rx.is_match(s) } else { inner.is_match(s) };
+    // match the text where it lies, without making a string of it for every item
+    let symbol = |s: SymId| with_str(s, found);
+    let text = |bs: &[u8]| found(&String::from_utf8_lossy(bs));
     match lhs {
-        K::Sym(s) => Ok(K::Bool(rx.is_match(&resolve(*s)))),
-        K::Char(c) => Ok(K::Bool(rx.is_match(&(*c as char).to_string()))),
-        K::Vector(ColVec::Char(_, bs)) => Ok(K::Bool(rx.is_match(&String::from_utf8_lossy(bs)))),
-        K::Vector(ColVec::Sym(_, xs)) => {
-            let out: Vec<bool> = xs.iter().map(|&s| rx.is_match(&resolve(s))).collect();
-            Ok(K::Vector(ColVec::Bool(Attr::None, Arc::new(out))))
-        }
-        K::Vector(ColVec::General(_, xs)) => {
-            let out: Vec<bool> = xs
-                .iter()
-                .map(|x| x.as_str().map(|s| rx.is_match(&s)).unwrap_or(false))
-                .collect();
-            Ok(K::Vector(ColVec::Bool(Attr::None, Arc::new(out))))
-        }
+        K::Sym(s) => Ok(K::Bool(symbol(*s))),
+        K::Char(c) => Ok(K::Bool(found(&(*c as char).to_string()))),
+        K::Vector(ColVec::Char(_, bs)) => Ok(K::Bool(text(bs))),
+        K::Vector(ColVec::Sym(_, xs)) => Ok(bool_vec(xs.iter().map(|&s| symbol(s)).collect())),
+        K::Vector(ColVec::General(_, xs)) => Ok(bool_vec(
+            xs.iter()
+                .map(|x| match x {
+                    K::Vector(ColVec::Char(_, bs)) => text(bs),
+                    other => other.as_str().is_some_and(|s| found(&s)),
+                })
+                .collect(),
+        )),
         _ => Err(KError::ty("like LHS must be string, symbol, or list of strings/symbols")),
     }
 }

@@ -1,8 +1,9 @@
 # Benchmark results: scale factor 0.3
 
-Measured 2026-11-25 with the programs described in [benchmarks.md](benchmarks.md). Four changes were measured, each
-against the build before it. **Before** below is commit `2d8e4ee`; **after** matches join keys as typed columns,
-encodes a query once for all shards, and unpacks large replies on other threads. Earlier: [slot tables and
+Measured 2026-11-25 with the programs described in [benchmarks.md](benchmarks.md). Five changes were measured, each
+against the build before it. **Before** below is commit `930628b`; **after** matches `like` patterns without copying
+the text and turns the result of a `where` clause into row numbers without branching. Earlier: [join keys and
+requests](#typed-join-keys-and-queries-encoded-once), [slot tables and
 merges](#slot-tables-for-narrow-ranges-and-merges-by-column), [aggregates for all groups at
 once](#aggregates-are-computed-for-all-groups-at-once) and [columns, operators and
 casts](#first-change-columns-operators-and-casts).
@@ -11,36 +12,34 @@ casts](#first-change-columns-operators-and-casts).
 
 | Configuration | TPC-H before | after | TPC-DS before | after | Both suites: gain | After, against single node |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Single node | 1.05 s | **0.96 s** | 0.35 s | **0.29 s** | 1.1x | 1.00x |
-| Cluster, 1 shard, in-process | 1.52 s | 1.41 s | 0.60 s | 0.58 s | 1.1x | 0.63x |
-| Cluster, 3 shards, in-process | 1.11 s | 1.01 s | 0.50 s | 0.45 s | 1.1x | 0.85x |
-| Cluster, 6 shards, in-process | 1.28 s | 1.13 s | 0.51 s | 0.45 s | 1.1x | 0.79x |
-| Cluster, 12 shards, in-process | 1.93 s | 1.69 s | 0.59 s | 0.49 s | 1.2x | 0.57x |
-| Cluster, 3 shard processes | 0.92 s | 0.79 s | 0.54 s | 0.48 s | 1.2x | 0.98x |
-| Cluster, 6 shard processes | 0.90 s | **0.78 s** | 0.53 s | **0.54 s** | 1.1x | 0.94x |
+| Single node | 0.96 s | **0.84 s** | 0.31 s | **0.28 s** | 1.1x | 1.00x |
+| Cluster, 1 shard, in-process | 1.41 s | 1.27 s | 0.52 s | 0.52 s | 1.1x | 0.63x |
+| Cluster, 3 shards, in-process | 1.03 s | 0.96 s | 0.44 s | 0.41 s | 1.1x | 0.82x |
+| Cluster, 6 shards, in-process | 1.17 s | 1.13 s | 0.46 s | 0.42 s | 1.0x | 0.72x |
+| Cluster, 12 shards, in-process | 1.67 s | 1.57 s | 0.50 s | 0.50 s | 1.0x | 0.54x |
+| Cluster, 3 shard processes | 0.79 s | 0.77 s | 0.45 s | 0.46 s | 1.0x | 0.91x |
+| Cluster, 6 shard processes | 0.79 s | **0.78 s** | 0.49 s | **0.46 s** | 1.0x | 0.90x |
 
 Each figure in this table is from a single run.
 
-* **The single node is 1.1x faster** (1.40 s to 1.25 s for both suites), and the cluster setups 1.07x to 1.16x. Since
-  `a06fb4b` (12.47 s on one node, 5.07 s on six shard processes) that is about 10x and 3.8x.
-* **Joins on their own are 1.7 to 16 times faster**, but were 14% (TPC-H) and 23% (TPC-DS) of single-node time.
-* **The cluster is still not ahead overall:** six shard processes take 1.32 s against 1.25 s on one node.
-* **Slower queries:** 13 of the 322 query and setup combinations were more than 5% (plus 1 ms) slower. Among the
-  largest were DS Q38 (95 to 137 ms), Q43 (11 to 17 ms) and Q15 (20 to 27 ms) with six shard processes, and H Q3 (51
-  to 65 ms) and DS Q22 (43 to 54 ms) with one shard. A separate run with six shards in one process showed no query
-  more than 8% (plus 3 ms) slower. The cause of these differences is not established.
+* **The single node is 1.13x faster** (1.27 s to 1.12 s for both suites), mostly on TPC-H (0.96 s to 0.84 s): Q13 went
+  from 97 to 59 ms, Q6 from 21 to 15, Q12 from 53 to 39, Q14 from 15 to 10 and Q20 from 30 to 21.
+* **The cluster setups gained 1.01x to 1.08x.**
+* **Slower queries:** 10 of the 322 query and setup combinations were more than 5% (plus 1 ms) slower, all on the
+  cluster. Short queries on shard processes vary this much between runs of one build: DS Q15 on six processes has taken
+  41 and 20 ms on `2d8e4ee`, and 27 and 15 ms on `930628b`.
 * **Correctness:** every cluster answer in the 28 runs matched the single node's. Before and after gave identical result
-  rows for all 46 queries on the single node, and identical output for 45,540 generated joins, 30,153 grouped queries
-  and (results or error kinds) 69,692 operator expressions.
+  rows for all 46 queries on the single node, and identical output for 30,116 generated `like` and `where` queries,
+  30,153 grouped queries and (results or error kinds) 69,692 operator expressions.
 
 ## Setup
 
 * AMD Ryzen 5 7430U (6 cores, 12 threads), 31 GB RAM, Windows 11, on mains power. Release build, rustc 1.95.
 * In memory: no write-ahead log, no replication, no TLS. Shards and control node on one machine over loopback TCP.
 * One client running one query at a time. This measures latency, not throughput under concurrency.
-* The last two changes were run once per build and setup, old and new within minutes of each other. Earlier changes
+* The last three changes were run once per build and setup, old and new within minutes of each other. Earlier changes
   report medians of five interleaved runs. Repetitions then mostly agreed within 5%, the worst by 12% (47% in the first
-  session), so treat differences under about 20% between single runs as inconclusive.
+  session). Treat differences under about 20% between single runs as inconclusive, and more on short cluster queries.
 * Data: TPC-H 2,598,816 rows (`lineitem` 1,800,786). TPC-DS 1,310,782 rows (`store_sales` 539,498, `inventory`
   360,000, `catalog_sales` 179,761, `web_sales` 119,410).
 
@@ -67,6 +66,31 @@ every 50 ms. The cluster programs also hold the single-node reference engine.
 
 ## What changed
 
+### Pattern matching and filter results
+
+* **`like`** ([ops.rs](../src/engine/ops.rs)) matched a fresh copy of every string or symbol name. It now matches the
+  text where it lies. On text of one line it also drops a leading or trailing `*` from the pattern, so that the regular
+  expression engine searches for the rest instead of running through the whole text.
+* **`where`** ([qsql.rs](../src/engine/qsql.rs)) counts the rows a clause keeps and then writes their numbers without
+  a branch per row.
+
+One timing each (nanoseconds per row, on 1,800,000 rows of numbers or 450,000 of text); the timer counts whole
+milliseconds, about 0.5 ns per row of numbers:
+
+| Operation | Before | After |
+| --- | ---: | ---: |
+| one comparison, half the rows kept | 7 | 4 |
+| one comparison, 1 row in 50 kept | 1 | 2 |
+| four clauses, the shape of TPC-H Q6 | 11 | 6 |
+| strings `like "*special*requests*"` | 200 | 127 |
+| strings `like "forest*"` | 142 | 89 |
+| strings `like "*green*"` | 216 | 107 |
+| symbols `like`, 150 distinct | 84 | 31 |
+| symbols `like`, all distinct | 71 | 22 |
+
+A hand-written substring search for patterns whose only wildcard is `*` was tried and dropped: it was slower than the
+regular expression engine on `"*green*"`.
+
 ### Typed join keys, and queries encoded once
 
 * **Joins** ([joins.rs](../src/engine/joins.rs)) number the keys of both sides together, with the same typed code as
@@ -74,6 +98,18 @@ every 50 ms. The cluster programs also hold the single-node reference engine.
   its index when there are fewer than a quarter as many rows to look up as it has keys, or when it is a general list.
 * **The control node** encodes a query once for all shards, and unpacks a reply of more than 16,384 cells on another
   thread ([client.rs](../crates/parallel/control/src/client.rs)).
+
+From `2d8e4ee` to `930628b`, one run each:
+
+| Configuration | TPC-H before | after | TPC-DS before | after | Both suites: gain | After, against single node |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Single node | 1.05 s | **0.96 s** | 0.35 s | **0.29 s** | 1.1x | 1.00x |
+| Cluster, 1 shard, in-process | 1.52 s | 1.41 s | 0.60 s | 0.58 s | 1.1x | 0.63x |
+| Cluster, 3 shards, in-process | 1.11 s | 1.01 s | 0.50 s | 0.45 s | 1.1x | 0.85x |
+| Cluster, 6 shards, in-process | 1.28 s | 1.13 s | 0.51 s | 0.45 s | 1.1x | 0.79x |
+| Cluster, 12 shards, in-process | 1.93 s | 1.69 s | 0.59 s | 0.49 s | 1.2x | 0.57x |
+| Cluster, 3 shard processes | 0.92 s | 0.79 s | 0.54 s | 0.48 s | 1.2x | 0.98x |
+| Cluster, 6 shard processes | 0.90 s | **0.78 s** | 0.53 s | **0.54 s** | 1.1x | 0.94x |
 
 One timing each, on 1,800,000 rows (nanoseconds per row):
 
@@ -228,77 +264,80 @@ after.
 
 | Query | Single before | Single after | Gain | 1 in-proc | 3 in-proc | 6 in-proc | 12 in-proc | 3 proc | 6 proc before | 6 proc after | Gain |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Q1 | 132 | 134 | 1.0x | 140 | 71 | 56 | 64 | 66 | 53 | 55 | 1.0x |
-| Q2 | 3 | 3 | 1.0x | 6 | 7 | 10 | 14 | 6 | 7 | 7 | 1.0x |
-| Q3 | 33 | 31 | 1.1x | 65 | 34 | 47 | 83 | 25 | 23 | 29 | 0.8x |
-| Q4 | 16 | 16 | 1.0x | 24 | 23 | 28 | 53 | 18 | 19 | 18 | 1.1x |
-| Q5 | 20 | 19 | 1.1x | 34 | 32 | 42 | 81 | 22 | 24 | 24 | 1.0x |
-| Q6 | 22 | 21 | 1.0x | 23 | 10 | 11 | 19 | 9 | 7 | 7 | 1.0x |
-| Q7 | 29 | 27 | 1.1x | 46 | 36 | 45 | 72 | 26 | 28 | 25 | 1.1x |
-| Q8 | 18 | 18 | 1.0x | 32 | 29 | 40 | 64 | 21 | 23 | 23 | 1.0x |
-| Q9 | 249 | 164 | 1.5x | 273 | 223 | 231 | 306 | 167 | 262 | 176 | 1.5x |
-| Q10 | 54 | 50 | 1.1x | 135 | 104 | 129 | 216 | 85 | 105 | 87 | 1.2x |
-| Q11 | 3 | 3 | 1.0x | 5 | 5 | 5 | 6 | 3 | 3 | 3 | 1.0x |
-| Q12 | 52 | 53 | 1.0x | 66 | 36 | 36 | 64 | 29 | 23 | 23 | 1.0x |
-| Q13 | 99 | 95 | 1.0x | 101 | 56 | 58 | 96 | 47 | 47 | 39 | 1.2x |
-| Q14 | 15 | 15 | 1.0x | 17 | 12 | 13 | 20 | 8 | 9 | 8 | 1.1x |
-| Q15 | 15 | 13 | 1.2x | 19 | 15 | 19 | 35 | 10 | 11 | 11 | 1.0x |
-| Q16 | 22 | 22 | 1.0x | 30 | 33 | 40 | 54 | 22 | 25 | 20 | 1.2x |
-| Q17 | 6 | 8 | 0.8x | 16 | 9 | 9 | 11 | 9 | 8 | 8 | 1.0x |
-| Q18 | 108 | 110 | 1.0x | 156 | 103 | 104 | 135 | 73 | 82 | 79 | 1.0x |
-| Q19 | 15 | 15 | 1.0x | 16 | 11 | 14 | 18 | 10 | 7 | 8 | 0.9x |
-| Q20 | 30 | 30 | 1.0x | 31 | 17 | 18 | 29 | 15 | 12 | 13 | 0.9x |
-| Q21 | 78 | 77 | 1.0x | 100 | 68 | 78 | 119 | 59 | 50 | 50 | 1.0x |
-| Q22 | 31 | 32 | 1.0x | 75 | 80 | 98 | 132 | 61 | 67 | 69 | 1.0x |
+| Q1 | 135 | 128 | 1.1x | 139 | 64 | 57 | 59 | 64 | 54 | 55 | 1.0x |
+| Q2 | 3 | 3 | 1.0x | 7 | 8 | 11 | 15 | 7 | 6 | 6 | 1.0x |
+| Q3 | 32 | 28 | 1.1x | 44 | 33 | 46 | 78 | 25 | 22 | 24 | 0.9x |
+| Q4 | 16 | 14 | 1.1x | 23 | 23 | 29 | 44 | 18 | 17 | 18 | 0.9x |
+| Q5 | 20 | 16 | 1.2x | 31 | 31 | 43 | 66 | 21 | 22 | 23 | 1.0x |
+| Q6 | 21 | 15 | 1.4x | 15 | 9 | 7 | 11 | 7 | 7 | 6 | 1.2x |
+| Q7 | 27 | 23 | 1.2x | 41 | 36 | 46 | 72 | 25 | 32 | 26 | 1.2x |
+| Q8 | 18 | 16 | 1.1x | 31 | 31 | 41 | 63 | 20 | 22 | 22 | 1.0x |
+| Q9 | 164 | 158 | 1.0x | 250 | 208 | 234 | 309 | 180 | 183 | 173 | 1.1x |
+| Q10 | 50 | 46 | 1.1x | 127 | 105 | 130 | 180 | 92 | 92 | 89 | 1.0x |
+| Q11 | 3 | 3 | 1.0x | 5 | 5 | 6 | 7 | 3 | 3 | 3 | 1.0x |
+| Q12 | 53 | 39 | 1.4x | 54 | 27 | 29 | 44 | 25 | 24 | 22 | 1.1x |
+| Q13 | 97 | 59 | 1.6x | 65 | 42 | 51 | 90 | 34 | 45 | 34 | 1.3x |
+| Q14 | 15 | 10 | 1.5x | 12 | 12 | 13 | 17 | 6 | 8 | 6 | 1.3x |
+| Q15 | 13 | 10 | 1.3x | 16 | 13 | 18 | 30 | 9 | 10 | 9 | 1.1x |
+| Q16 | 21 | 18 | 1.2x | 28 | 35 | 42 | 54 | 21 | 22 | 21 | 1.0x |
+| Q17 | 7 | 7 | 1.0x | 17 | 10 | 9 | 10 | 8 | 8 | 7 | 1.1x |
+| Q18 | 108 | 108 | 1.0x | 165 | 97 | 107 | 136 | 75 | 75 | 102 | 0.7x |
+| Q19 | 15 | 13 | 1.2x | 14 | 10 | 14 | 15 | 8 | 8 | 7 | 1.1x |
+| Q20 | 30 | 21 | 1.4x | 22 | 14 | 14 | 22 | 12 | 13 | 11 | 1.2x |
+| Q21 | 78 | 73 | 1.1x | 98 | 66 | 84 | 114 | 53 | 52 | 52 | 1.0x |
+| Q22 | 33 | 32 | 1.0x | 63 | 82 | 101 | 134 | 61 | 66 | 67 | 1.0x |
 
 ### TPC-DS subset
 
 | Query | Single before | Single after | Gain | 1 in-proc | 3 in-proc | 6 in-proc | 12 in-proc | 3 proc | 6 proc before | 6 proc after | Gain |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Q1 | 8 | 8 | 1.0x | 21 | 12 | 14 | 15 | 13 | 17 | 15 | 1.1x |
-| Q3 | 3 | 3 | 1.0x | 5 | 4 | 4 | 5 | 4 | 5 | 5 | 1.0x |
-| Q6 | 9 | 7 | 1.3x | 23 | 15 | 15 | 16 | 16 | 19 | 15 | 1.3x |
-| Q7 | 6 | 6 | 1.0x | 12 | 10 | 8 | 8 | 9 | 8 | 8 | 1.0x |
-| Q12 | 3 | 3 | 1.0x | 7 | 6 | 6 | 7 | 6 | 7 | 6 | 1.2x |
-| Q15 | 9 | 6 | 1.5x | 14 | 14 | 14 | 15 | 15 | 20 | 27 | 0.7x |
-| Q19 | 9 | 5 | 1.8x | 16 | 16 | 14 | 15 | 15 | 18 | 15 | 1.2x |
-| Q20 | 3 | 2 | 1.5x | 6 | 5 | 6 | 6 | 5 | 6 | 5 | 1.2x |
-| Q22 | 16 | 15 | 1.1x | 54 | 54 | 75 | 84 | 58 | 69 | 64 | 1.1x |
-| Q26 | 3 | 3 | 1.0x | 7 | 6 | 6 | 6 | 6 | 8 | 7 | 1.1x |
-| Q27 | 5 | 6 | 0.8x | 18 | 16 | 16 | 20 | 18 | 19 | 18 | 1.1x |
-| Q36 | 10 | 9 | 1.1x | 24 | 22 | 27 | 41 | 22 | 28 | 28 | 1.0x |
-| Q38 | 82 | 67 | 1.2x | 119 | 80 | 73 | 76 | 89 | 95 | 137 | 0.7x |
-| Q42 | 2 | 2 | 1.0x | 4 | 3 | 3 | 3 | 3 | 3 | 4 | 0.8x |
-| Q43 | 9 | 9 | 1.0x | 14 | 9 | 10 | 10 | 10 | 11 | 17 | 0.6x |
-| Q50 | 41 | 30 | 1.4x | 42 | 26 | 19 | 21 | 27 | 35 | 30 | 1.2x |
-| Q52 | 2 | 2 | 1.0x | 4 | 4 | 3 | 3 | 4 | 3 | 3 | 1.0x |
-| Q55 | 2 | 2 | 1.0x | 4 | 3 | 3 | 3 | 3 | 3 | 3 | 1.0x |
-| Q69 | 5 | 5 | 1.0x | 12 | 9 | 8 | 10 | 9 | 10 | 10 | 1.0x |
-| Q87 | 85 | 58 | 1.5x | 97 | 82 | 71 | 70 | 95 | 94 | 71 | 1.3x |
-| Q96 | 2 | 2 | 1.0x | 3 | 2 | 3 | 2 | 2 | 2 | 2 | 1.0x |
-| Q98 | 6 | 6 | 1.0x | 10 | 8 | 8 | 9 | 9 | 8 | 9 | 0.9x |
-| Q11 | 32 | 32 | 1.0x | 58 | 37 | 37 | 39 | 36 | 41 | 40 | 1.0x |
-| Q51 | 2 | 1 | 2.0x | 2 | 2 | 2 | 2 | 2 | 2 | 2 | 1.0x |
+| Q1 | 8 | 7 | 1.1x | 20 | 13 | 15 | 16 | 13 | 17 | 15 | 1.1x |
+| Q3 | 3 | 3 | 1.0x | 5 | 4 | 4 | 5 | 4 | 4 | 4 | 1.0x |
+| Q6 | 7 | 6 | 1.2x | 18 | 15 | 15 | 16 | 14 | 15 | 15 | 1.0x |
+| Q7 | 6 | 5 | 1.2x | 12 | 8 | 7 | 9 | 8 | 8 | 8 | 1.0x |
+| Q12 | 3 | 2 | 1.5x | 7 | 6 | 6 | 7 | 6 | 6 | 6 | 1.0x |
+| Q15 | 6 | 7 | 0.9x | 13 | 12 | 19 | 15 | 16 | 15 | 29 | 0.5x |
+| Q19 | 5 | 6 | 0.8x | 14 | 13 | 13 | 16 | 15 | 14 | 15 | 0.9x |
+| Q20 | 3 | 2 | 1.5x | 6 | 5 | 5 | 6 | 5 | 5 | 6 | 0.8x |
+| Q22 | 15 | 15 | 1.0x | 42 | 48 | 58 | 94 | 58 | 65 | 65 | 1.0x |
+| Q26 | 2 | 2 | 1.0x | 7 | 6 | 6 | 7 | 6 | 6 | 6 | 1.0x |
+| Q27 | 6 | 6 | 1.0x | 18 | 16 | 16 | 21 | 16 | 21 | 18 | 1.2x |
+| Q36 | 10 | 9 | 1.1x | 23 | 22 | 28 | 43 | 22 | 28 | 29 | 1.0x |
+| Q38 | 66 | 65 | 1.0x | 116 | 77 | 72 | 75 | 80 | 73 | 78 | 0.9x |
+| Q42 | 2 | 2 | 1.0x | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 1.0x |
+| Q43 | 9 | 9 | 1.0x | 12 | 8 | 8 | 10 | 9 | 10 | 9 | 1.1x |
+| Q50 | 44 | 30 | 1.5x | 39 | 24 | 20 | 22 | 26 | 29 | 24 | 1.2x |
+| Q52 | 2 | 2 | 1.0x | 4 | 3 | 3 | 3 | 3 | 4 | 3 | 1.3x |
+| Q55 | 2 | 2 | 1.0x | 3 | 3 | 3 | 3 | 3 | 4 | 3 | 1.3x |
+| Q69 | 8 | 4 | 2.0x | 12 | 8 | 8 | 10 | 8 | 10 | 9 | 1.1x |
+| Q87 | 61 | 57 | 1.1x | 85 | 71 | 66 | 69 | 92 | 96 | 67 | 1.4x |
+| Q96 | 2 | 2 | 1.0x | 3 | 2 | 2 | 2 | 2 | 2 | 2 | 1.0x |
+| Q98 | 6 | 6 | 1.0x | 10 | 8 | 8 | 9 | 10 | 9 | 8 | 1.1x |
+| Q11 | 30 | 30 | 1.0x | 48 | 36 | 34 | 37 | 36 | 40 | 36 | 1.1x |
+| Q51 | 2 | 1 | 2.0x | 3 | 2 | 2 | 2 | 3 | 2 | 2 | 1.0x |
 
 ## Where the time goes
 
-Profile after the latest change: temporary timers in a copy of the source, one run each, the cluster as six shards in
-one process. Figures in parentheses, and "before" columns, are from the same profile before the change.
+Temporary timers in a copy of the source, one run each.
 
 ### Single node
 
-| Work | TPC-H, 0.96 s (1.11 s) | TPC-DS, 0.29 s (0.36 s) |
+| Work | TPC-H, 0.84 s (0.94 s) | TPC-DS, 0.29 s (0.29 s) |
 | --- | ---: | ---: |
-| Other `where` work (comparisons, `like`, copying kept rows) | 31% (28%) | 9% (8%) |
-| Aggregating, group by group or all at once | 18% (20%) | 26% (21%) |
-| Finding groups | 14% (12%) | 15% (13%) |
-| `in` | 11% (9%) | 12% (10%) |
-| Joins | 5% (14%) | 7% (23%) |
-| Everything else | 20% (17%) | 31% (26%) |
+| Other `where` work (comparisons, `like`, copying kept rows) | 23% (32%) | 8% (9%) |
+| Aggregating, group by group or all at once | 21% (18%) | 26% (26%) |
+| Finding groups | 16% (14%) | 15% (15%) |
+| `in` | 12% (11%) | 12% (12%) |
+| Joins | 6% (5%) | 7% (7%) |
+| Everything else | 22% (20%) | 32% (31%) |
 
-Joins went from 142 to 43 ms in H Q9 and from 33 to 9 ms in DS Q87. `like` is most of H Q13's 88 ms of `where` work.
+Figures in parentheses are from before the filtering change. On TPC-H, `like` fell from 115 to 63 ms and turning
+results into row numbers from 99 to 50 ms. Copying the kept rows for the next clause takes 40 ms; a different copy loop
+made no measurable difference and was not kept.
 
 ### Cluster
+
+From the profile of the join change; the filtering change was not profiled on the cluster.
 
 | Time (ms) | TPC-H before | after | TPC-DS before | after |
 | --- | ---: | ---: | ---: | ---: |
@@ -323,9 +362,9 @@ Joins went from 142 to 43 ms in H Q9 and from 33 to 9 ms in DS Q87. `like` is mo
 
 None of the gains has been measured.
 
-1. Profile what remains of `where`, starting with `like`.
-2. Compute constant columns for all groups at once: `select ok: 1b by ...`, which several TPC-DS queries use, is still
+1. Compute constant columns for all groups at once: `select ok: 1b by ...`, which several TPC-DS queries use, is still
    evaluated group by group.
+2. Profile aggregation, now the largest part of TPC-DS and close to `where` on TPC-H.
 3. Profile the control node's merging by key and ordering of rows.
 4. Keep intermediate tables on the control node. This changes where assigned tables live, so it needs a design decision.
 
