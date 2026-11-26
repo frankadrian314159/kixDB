@@ -97,3 +97,22 @@ fn tables_as_lists_of_rows() {
         ("t, ([] n: 1#1; c: 1#`g)", "'mismatch"),
     ]);
 }
+
+#[test]
+fn all_and_any_give_booleans_even_of_nothing() {
+    check("t: ([] c: 1 2; n: 1 0); e: 0#t", &[
+        ("(all `boolean$(); any 0#0b)", "10b"),
+        ("(all (); any ())", "10b"),
+        ("(all `long$(); any `float$())", "10b"),
+        ("(all \"\"; any `date$())", "10b"),
+        ("(min `boolean$(); (|/) `boolean$())", "10b"),
+        ("type `boolean$`long$()", "1h"),
+        ("`$\"\"", "`"),
+        ("(all `a`b!11b; any `a`b!01b)", "11b"),
+        ("all (`symbol$())!()", "1b"),
+        ("(value all t; value any t)", "(10b;11b)"),
+        ("(value all e; value any e)", "(11b;00b)"),
+        ("value all ([k: 1 2] v: 1 1)", ",1b"),
+        ("value exec all n, any n from e", "10b"),
+    ]);
+}

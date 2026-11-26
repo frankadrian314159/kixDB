@@ -83,13 +83,24 @@ fn zone(x: &K, to_local: bool) -> KResult<K> {
     Ok(K::Timestamp(if to_local { ns + offset } else { ns - offset }))
 }
 
+/// `all` (the least) or `any` (the greatest) of the items as booleans, so `1b` or `0b` of none: of a dictionary, its
+/// values', and of a table, column by column.
+fn truth(x: &K, all: bool) -> KResult<K> {
+    match x {
+        K::Dict(d) => truth(&d.vals, all),
+        K::KeyedTable(t) => truth(&K::Table(Arc::new(t.vals.clone())), all),
+        K::Table(t) => {
+            let vals = t.vals.iter().map(|c| truth(&K::Vector(c.clone()), all)).collect::<KResult<_>>()?;
+            let keys = Box::new(K::Vector(ColVec::Sym(Attr::None, Arc::new(t.cols.clone()))));
+            Ok(K::Dict(Arc::new(Dict { keys, vals: Box::new(K::Vector(ColVec::from_atoms(vals))) })))
+        }
+        _ => ops::cast_op(&K::Sym(intern("boolean")), x).and_then(|b| ops::minmax_op(&b, all)),
+    }
+}
+
 pub fn unary(op: &str, x: &K) -> Option<KResult<K>> {
     Some(match op {
-        // (of a table, column by column)
-        "all" | "any" => match x {
-            K::Table(_) => ops::minmax_op(x, op == "all"),
-            _ => ops::cast_op(&K::Sym(intern("boolean")), x).and_then(|b| ops::minmax_op(&b, op == "all")),
-        },
+        "all" | "any" => truth(x, op == "all"),
         "rank" => rank(x),
         "attr" => Ok(K::Sym(match x {
             K::Vector(v) => intern(v.attr().prefix().trim_matches(|c| c == '`' || c == '#')),

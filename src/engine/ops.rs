@@ -1109,6 +1109,7 @@ pub fn minmax_op(x: &K, is_min: bool) -> KResult<K> {
         }),
     };
     Ok(best.unwrap_or_else(|| match cv {
+        ColVec::Bool(_, _) => K::Bool(is_min),
         ColVec::Long(_, _) => K::Long(if is_min { INF_LONG } else { NINF_LONG }),
         ColVec::Int(_, _) => K::Int(if is_min { INF_INT } else { NINF_INT }),
         ColVec::Float(_, _) => K::Float(if is_min { f64::INFINITY } else { f64::NEG_INFINITY }),
@@ -2408,9 +2409,10 @@ fn cast_by_name(tname: &str, rhs: &K) -> KResult<K> {
             return Ok(K::Vector(ColVec::from_atoms(items.iter().map(|i| cast_by_name(tname, i)).collect::<KResult<_>>()?)));
         }
     }
-    // Empty general list `()` cast to typed empty vector: `` `float$() ``, `` `symbol$() ``!
-    if let K::Vector(ColVec::General(_, xs)) = rhs {
-        if xs.is_empty() {
+    // An empty list casts to an empty list of the type: `` `float$() ``, `` `boolean$`long$() ``. (But `` `$"" `` is the
+    // null symbol.)
+    if let K::Vector(v) = rhs {
+        if v.is_empty() && (matches!(v, ColVec::General(..)) || !matches!(tname, "" | "symbol")) {
             let ch = match tname {
                 "" | "symbol" => 's',
                 "boolean" | "bool" => 'b',
