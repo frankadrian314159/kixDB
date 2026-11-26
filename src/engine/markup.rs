@@ -175,7 +175,7 @@ impl Engine<'_> {
             simple => simple.clone(),
         });
         let flip = Flip { cols: flip.cols.clone(), vals: vals.collect() };
-        let made = crate::storage::zero_colon(&K::Char(delimiter), &K::Table(Arc::new(flip)))?;
+        let made = crate::storage::delimited_lines(char::from(delimiter), &flip);
         Ok(match made {
             K::Vector(v) if !header => K::Vector(v.drop_n(1)),
             all => all,

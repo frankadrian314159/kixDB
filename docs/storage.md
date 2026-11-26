@@ -34,20 +34,63 @@ the snapshot: an earlier version discards the log from the first record it canno
 ## Files and tables on disk
 
 ```q
-`:prices.bin set 1 2 3            / a flat file; get `:prices.bin
+`:prices.bin set 1 2 3            / a flat file; get `:prices.bin, or \l prices.bin for the variable prices.bin
 `:ref/ set t                      / a splayed table: .d and one file per column
 .Q.en[`:hdb; t]                   / record the table's symbols in hdb/sym
 .Q.dpft[`:hdb; 2026.11.24; `sym; `trade]   / write a partition, sorted and parted by sym
 \l hdb                            / mount it
-("SFJ"; enlist ",") 0: `:file.csv / read CSV with a header row
-`:file.csv 0: "," 0: t            / write CSV (fields with commas, quotes or line breaks are quoted)
 ```
+
+### A file by its name
+
+A file symbol can stand where the name of a global does. The whole file is read, and written again when it changes.
+
+```q
+select from `:ref where v > 1     / also exec, cols, meta
+`:ref/ upsert rows                / also insert; the file is made if it is not there
+`v xdesc `:ref                    / sort what the file holds
+@[`:ref; `v; neg]                 / amend it; a splayed table stays splayed
+.[`:log; (); ,; 42]               / add to a list; `:log is made if it is not there
+.[`:log; (); :; 1 2 3]            / replace it
+save `:out/trade                  / the global trade, to a file named after it; load `:out/trade reads it back
+save `:out/trade.csv              / as text: also .txt (tabs), .xml and .xls
+rsave `:db/trade/                 / splayed; rload `:db/trade
+```
+
+### Reading, writing and deleting
+
+```q
+read0 `:notes.txt                 / the lines; read0 (`:notes.txt; offset; length): those characters
+read1 `:notes.txt                 / the bytes, also of a part
+`:notes.txt 0: ("one"; "two")     / write lines; `:raw 1: 0x0102 writes bytes
+.Q.fs[f; `:big.csv]               / f applied to the lines, about 131000 bytes at a time; .Q.fsn sets the size
+hsym `$path                       / a file symbol; hcount its size, hdel removes it (or an empty directory)
+key `:dir                         / the names in a directory; the symbol of a file; () if nothing is there
+h: hopen `:app.log                / a handle to a file, made if it is not there
+neg[h] "a line"                   / add lines (a string or a list of strings)
+h 100 200; hclose h               / add items to a file that holds a list, otherwise the values' bytes
+```
+
+Adding to a file that holds a list rewrites it, so each addition costs as much as the file is long.
+
+### Delimited, fixed-width and key-value text
+
+```q
+("SFJ"; enlist csv) 0: `:file.csv / read CSV with a header row; csv is ","
+("SFJ"; ",") 0: lines             / without one: a list of columns
+("SFJ"; 6 8 4) 0: `:fixed.txt     / fields of fixed widths, a record to a line; also (file; offset; length)
+"S=;" 0: "a=1;b=2"                / keys of the first type and string values
+`:file.csv 0: csv 0: t            / write CSV (fields with commas, quotes or line breaks are quoted)
+```
+
+`1:` writes bytes but does not read binary records.
 
 Enumerated values are saved with their domain's name, not the domain: save that too to check or follow them after
 loading. Earlier versions cannot read files, logs or snapshots that hold enumerations.
 
-Relative paths given to `set`, `get` and `.Q.dpft` are resolved against the workspace directory; `0:` and `.Q.en` use
-the process's current directory. The file format is kixDB's own and is not readable by kdb+.
+Relative paths are resolved against the workspace directory of a durable workspace, and otherwise against the process's
+current directory. (Earlier versions resolved those given to `0:`, `1:`, `hcount` and `.Q.en` against the current
+directory.) The file format is kixDB's own and is not readable by kdb+.
 
 ## Partitioned databases and column attributes
 

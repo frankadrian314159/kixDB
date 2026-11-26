@@ -9,7 +9,7 @@ use crate::sym::{intern, resolve, SymId};
 use crate::types::{Func, K};
 
 /// Verbs that write, reach outside the engine, or run code that is only known when they run.
-const EFFECTS: [&str; 18] = ["setenv", "insert", "upsert", "set", " set", "system", "value", "get", "eval", "reval", "parse", "hopen", "hclose", "show", "exit", "0:", "1:", "2:"];
+const EFFECTS: [&str; 22] = ["setenv", "insert", "upsert", "set", " set", "system", "value", "get", "eval", "reval", "parse", "hopen", "hclose", "show", "exit", "0:", "1:", "2:", "hdel", "save", "load", "rsave"];
 
 struct Reader<'a> {
     ws: &'a Workspace,
@@ -46,6 +46,8 @@ impl<'a> Reader<'a> {
         match target {
             Expr::Lit(v) => number(v),
             Expr::Var(s) => self.global(*s).flatten().is_some_and(number),
+            // (`neg h` sends or appends)
+            Expr::Unary { op, arg } => resolve(*op) == "neg" && self.handle(arg),
             _ => false,
         }
     }

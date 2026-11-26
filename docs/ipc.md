@@ -71,7 +71,10 @@ h (`upsert; `trade; (09:30:00; `AAPL; 180.0; 100))     / a functional message
 hclose h
 ```
 
-`hopen` sends the current user name with an empty password. From Rust, `kixdb::ipc::IpcClient::connect_addr(addr, user,
+`hopen` takes `` `:host:port ``, `` `:host:port:user:password ``, `` `::port `` or a port number on this machine
+(`tcps://` before the host for TLS). Without a user and password it sends the current user name with an empty password. A
+name without a port is a file's ([storage.md](storage.md#files-and-tables-on-disk)); earlier versions took
+`` `:host `` to be port 5000. From Rust, `kixdb::ipc::IpcClient::connect_addr(addr, user,
 password)` connects with one.
 
 ## TLS

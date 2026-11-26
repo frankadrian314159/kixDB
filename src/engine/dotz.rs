@@ -1,4 +1,5 @@
 //! The values of the `.z` namespace about the process, the command line and the connections.
+use crate::engine::files::Handle;
 use crate::engine::{namespaces, Engine};
 use crate::sym::intern;
 use crate::types::*;
@@ -44,7 +45,7 @@ impl Engine<'_> {
         // the handles of the clients that are connected, and of the connections this session made
         let handles = || {
             let mut all: Vec<i32> = self.ws.host.clients.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect();
-            all.extend(self.session.handles.keys());
+            all.extend(self.session.handles.iter().filter(|h| matches!(h.1, Handle::Server(_))).map(|h| *h.0));
             all.sort_unstable();
             all
         };

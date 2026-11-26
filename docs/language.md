@@ -79,7 +79,8 @@ Unlike kdb+, which holds positions in the domain:
 | running, moving | `sums prds avgs mins maxs deltas ratios differ prev next fills mavg msum mcount mmin mmax mdev ema xbar` |
 | tables | `cols keys meta fkeys xasc xdesc xkey xcol xcols xgroup ungroup insert upsert fby tables views` |
 | strings, casts | `string upper lower trim ltrim rtrim ss ssr vs sv $ md5` |
-| system | `get set value parse eval attr system show getenv setenv ltime gtime hopen hclose hcount 0: 1: -8! -9!` |
+| system | `get set value parse eval attr system show getenv setenv ltime gtime -8! -9!` |
+| files, handles | `hopen hclose hcount hsym hdel key read0 read1 save load rsave rload csv 0: 1:` ([storage.md](storage.md#files-and-tables-on-disk)) |
 | iterators | `each peach over scan prior` (`peach` runs as `each`) |
 
 `.z.p .z.P .z.d .z.D .z.t .z.T .z.n .z.N .z.z .z.Z` give the time and date; `.z.u .z.i .z.o .z.K .z.h .z.c .z.l .z.q
@@ -148,6 +149,7 @@ digit, unlike kdb+.
 | text and dates | `.Q.f .Q.fmt .Q.id .Q.dd .Q.s .Q.s1 .Q.addmonths` |
 | encoding | `.Q.btoa .Q.atob .Q.sha1 .Q.gz .Q.j10 .Q.x10 .Q.j12 .Q.x12 .Q.addr` |
 | tables | `.Q.en .Q.dpft .Q.ff .Q.fk .Q.ft .Q.V` |
+| files | `.Q.fs .Q.fsn` |
 | functions | `.Q.fc .Q.fu .Q.ts .Q.trp .Q.trpd .Q.sbt .Q.bt .Q.v` |
 | command line, memory | `.Q.opt .Q.def .Q.x .Q.gc .Q.w` |
 | JSON | `.j.j .j.jd .j.k` |
@@ -168,8 +170,9 @@ A variable assigned one of these names takes its place. Where they differ from k
 * Sending to a client that connected (`neg[.z.w] msg`, so no publishing from `.z.ts`), and the callbacks of web and
   socket servers (`.z.ph .z.pp .z.pm .z.ac .z.ws .z.wo .z.wc`), `.z.pq` and `.z.pd`: kixdb has none of these.
 * `.z.e .z.ex .z.ey .z.k .z.m .z.M .z.zd`.
+* Reading binary records with `1:`, and compressed files.
 * Log replay (`-11!`), and the rest of the `.Q` namespace: functions for
-  partitioned databases and files, `.Q.hg` and `.Q.hp` (HTTP), `.Q.host`, `.Q.K`, and kdb+ internals (`.Q.ipc`,
+  partitioned databases, `.Q.hg` and `.Q.hp` (HTTP), `.Q.host`, `.Q.K`, and kdb+ internals (`.Q.ipc`,
   `.Q.prf0`, `.Q.rp`, `.Q.m`).
 * The parts of `.h` that serve web pages (`.h.he .h.hn .h.hp .h.hy .h.ka .h.jx .h.val .h.HOME .h.ht .h.fram .h.logo`):
   kixdb has no web server.

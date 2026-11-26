@@ -14,10 +14,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 /// Each function and the number of its arguments.
-const FUNCTIONS: [(&str, usize); 42] = [
+const FUNCTIONS: [(&str, usize); 44] = [
     (".Q.addmonths", 2), (".Q.addr", 1), (".Q.atob", 1), (".Q.bt", 1), (".Q.btoa", 1), (".Q.dd", 2), (".Q.def", 2),
-    (".Q.dpft", 4), (".Q.en", 2), (".Q.f", 2), (".Q.fc", 2), (".Q.ff", 2), (".Q.fk", 1), (".Q.fmt", 3), (".Q.ft", 2),
-    (".Q.fu", 2), (".Q.gc", 1), (".Q.gz", 1), (".Q.id", 1), (".Q.j10", 1), (".Q.j12", 1), (".Q.opt", 1), (".Q.qt", 1),
+    (".Q.dpft", 4), (".Q.en", 2), (".Q.f", 2), (".Q.fc", 2), (".Q.ff", 2), (".Q.fk", 1), (".Q.fmt", 3), (".Q.fs", 2),
+    (".Q.fsn", 3), (".Q.ft", 2), (".Q.fu", 2), (".Q.gc", 1), (".Q.gz", 1), (".Q.id", 1), (".Q.j10", 1), (".Q.j12", 1), (".Q.opt", 1), (".Q.qt", 1),
     (".Q.s", 1), (".Q.s1", 1), (".Q.sbt", 1), (".Q.sha1", 1), (".Q.trp", 3), (".Q.trpd", 3), (".Q.ts", 2),
     (".Q.ty", 1), (".Q.v", 1), (".Q.V", 1), (".Q.w", 1), (".Q.x10", 1), (".Q.x12", 1), (".j.j", 1), (".j.jd", 1),
     (".j.k", 1), (".kix.def", 1), (".kix.dist", 2), (".kix.objects", 1),
@@ -272,6 +272,8 @@ impl Engine<'_> {
         let y = args.get(1).unwrap_or(&K::Null);
         let list_args = |y: &K| items(y).into_iter().map(Some).collect::<Vec<_>>();
         Ok(match name {
+            ".Q.fs" => self.in_chunks(x, y, 131_000)?,
+            ".Q.fsn" => self.in_chunks(x, y, usize::try_from(args[2].as_i64()?).map_err(|_| KError::domain(".Q.fsn takes a positive size"))?)?,
             ".Q.addmonths" => ops::broadcast_atoms(x, y, |date, months| {
                 let (K::Date(d), months) = (date, months.as_i64()?) else { return Err(KError::ty(".Q.addmonths takes a date")) };
                 let Some((year, month, day)) = ymd_from_date(*d).filter(|_| *d != NULL_INT) else { return Ok(date.clone()) };
@@ -382,7 +384,7 @@ impl Engine<'_> {
                 let values = vec![used, NULL_LONG, NULL_LONG, 0, 0, NULL_LONG, sym_count() as i64, NULL_LONG];
                 dict(syms(names), K::Vector(ColVec::Long(Attr::None, Arc::new(values))))
             }
-            ".Q.en" => crate::storage::q_en(x, y)?,
+            ".Q.en" => crate::storage::q_en(self.ws, x, y)?,
             ".Q.dpft" => crate::storage::q_dpft(self.ws, x, y, &args[2], &args[3])?,
             ".j.j" => K::string(&json::write(x, false)),
             ".j.jd" => {

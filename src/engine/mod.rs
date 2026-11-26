@@ -4,6 +4,7 @@ pub mod joins;
 pub mod builtins;
 mod dotz;
 mod enums;
+pub mod files;
 mod json;
 mod markup;
 pub mod namespaces;
@@ -221,8 +222,7 @@ pub struct SessionState {
     pub id: u64,
     pub login: String,
     pub current_ns: String,
-    pub handles: HashMap<i32, crate::ipc::IpcClient>,
-    pub next_handle: i32,
+    pub handles: HashMap<i32, files::Handle>,
     /// `\P` and `\c`.
     pub display: crate::display::Settings,
     /// For a client's connection, its handle (`.z.w`) and IPv4 address (`.z.a`).
@@ -238,7 +238,6 @@ impl SessionState {
             login: login.into(),
             current_ns: String::new(),
             handles: HashMap::new(),
-            next_handle: 3,
             display: Default::default(),
             client: None,
             cancel: Arc::default(),
@@ -418,6 +417,10 @@ impl<'a> Engine<'a> {
     }
 
     pub fn set_global(&mut self, name: SymId, val: K) -> KResult<()> {
+        if let Some(file) = resolve(name).strip_prefix(':') {
+            self.ws.writable()?;
+            return storage::save_path(self.ws, file, &val);
+        }
         let qname = self.qualify(name);
         self.set_globals(vec![(qname, Some(val))])
     }
@@ -574,6 +577,10 @@ impl<'a> Engine<'a> {
         if let Some(sys_val) = self.eval_builtin_ns(&s)? {
             return Ok(sys_val);
         }
+        // (a file, named by `insert`, an amend or a query, holds a value as a global does)
+        if let Some(file) = s.strip_prefix(':') {
+            return storage::load_path(self.ws, file);
+        }
 
         // 4. Current namespace or root global variable / view / partitioned table
         let qname = self.qualify(name);
@@ -602,6 +609,9 @@ impl<'a> Engine<'a> {
 
         if let Some(namespace) = self.namespace(&s) {
             return Ok(namespace);
+        }
+        if s == "csv" {
+            return Ok(K::Char(b','));
         }
         Err(KError::value(s))
     }
@@ -1055,10 +1065,11 @@ impl<'a> Engine<'a> {
                 let K::Sym(name) = x else { unreachable!() };
                 self.key_of_name(*name)
             }
-            "fkeys" if matches!(x, K::Sym(_)) => {
-                let K::Sym(name) = x else { unreachable!() };
-                let table = self.get_var(*name)?;
-                ops::eval_unary_prim("fkeys", &table)
+            "key" if matches!(x, K::Sym(_)) => self.key_of_path(x),
+            "fkeys" | "meta" | "cols" if matches!(x, K::Sym(_)) => {
+                let K::Sym(table) = x else { unreachable!() };
+                let table = self.get_var(*table)?;
+                ops::eval_unary_prim(name.as_str(), &table)
             }
             "show" => {
                 self.messages.push(crate::display::console(x));
@@ -1069,7 +1080,14 @@ impl<'a> Engine<'a> {
             "eval" => self.eval_tree(x),
             "hopen" => self.eval_hopen(x),
             "hclose" => self.eval_hclose(x),
-            "hcount" => storage::hcount(x),
+            "hcount" => storage::hcount(self.ws, x),
+            "hsym" => files::hsym(x),
+            "hdel" => self.hdel(x),
+            "read0" => self.read_file(x, true),
+            "read1" => self.read_file(x, false),
+            "save" => self.save(x),
+            "rsave" => self.rsave(x),
+            "load" | "rload" => self.load(x),
             "system" => {
                 let s = x.as_str().ok_or_else(|| KError::ty("system expects string"))?;
                 let (cmd, arg) = match s.find(char::is_whitespace) {
@@ -1104,11 +1122,7 @@ impl<'a> Engine<'a> {
                     let code = String::from_utf8_lossy(bs).into_owned();
                     self.eval_str(&code)
                 } else if let K::Sym(s) = x {
-                    if resolve(*s).starts_with(':') {
-                        self.eval_get(x)
-                    } else {
-                        self.get_var(*s)
-                    }
+                    self.get_var(*s)
                 } else {
                     ops::eval_unary_prim("value", x)
                 }
@@ -1152,8 +1166,8 @@ impl<'a> Engine<'a> {
             "insert" => self.eval_insert(lhs, rhs),
             "upsert" => self.eval_upsert(lhs, rhs),
             "fby" => self.eval_fby(lhs, rhs),
-            "0:" => storage::zero_colon(lhs, rhs),
-            "1:" => storage::one_colon(lhs, rhs),
+            "0:" => storage::zero_colon(self.ws, lhs, rhs),
+            "1:" => storage::one_colon(self.ws, lhs, rhs),
             "!" => {
                 // `-8!x` (IPC serialize to byte vector), `-9!bytes` (IPC deserialize), `-11!logfile`!
                 if matches!(lhs, K::Long(_) | K::Int(_)) {
@@ -1188,19 +1202,11 @@ impl<'a> Engine<'a> {
                 self.apply_value(&held, &args[1..])
             }
             // IPC handle call: `h "select from trade"` (sync) or `(neg h) "upd..."` (async)!
-            K::Int(h) if self.session.handles.contains_key(&h.abs()) => {
+            K::Int(h) if self.session.handles.contains_key(&h.saturating_abs()) => {
                 let arg = args.first().and_then(|a| a.clone()).unwrap_or(K::Null);
-                let hid = h.abs();
-                let sync = *h > 0;
-                let client = self.session.handles.get_mut(&hid).ok_or_else(|| KError::ipc("closed handle"))?;
-                if sync {
-                    client.query_k(&arg)
-                } else {
-                    client.send_async_k(&arg)?;
-                    Ok(K::Null)
-                }
+                self.apply_handle(*h, arg)
             }
-            K::Long(h) if (*h as i32 != 0) && self.session.handles.contains_key(&((*h as i32).abs())) => {
+            K::Long(h) if (*h as i32 != 0) && self.session.handles.contains_key(&((*h as i32).saturating_abs())) => {
                 let hi = *h as i32;
                 self.apply_value(&K::Int(hi), args)
             }
@@ -1208,10 +1214,8 @@ impl<'a> Engine<'a> {
                 Err(KError::nyi("sending to a client that connected"))
             }
             // Symbol handle one-shot IPC `` `:localhost:5000 "1+1" ``
-            K::Sym(s) if resolve(*s).starts_with("::") || (resolve(*s).starts_with(':') && resolve(*s)[1..].contains(':')) => {
-                let spec = resolve(*s);
-                let addr = spec.trim_start_matches(':');
-                let mut client = crate::ipc::IpcClient::connect_addr(addr, &self.session.login, "")?;
+            K::Sym(s) if resolve(*s).starts_with(':') && files::server_address(&resolve(*s)).is_some() => {
+                let mut client = self.connect_to(&resolve(*s)).unwrap_or_else(|| Err(KError::ipc("not a server")))?;
                 let arg = args.first().and_then(|a| a.clone()).unwrap_or(K::Null);
                 client.query_k(&arg)
             }
@@ -1694,8 +1698,9 @@ impl<'a> Engine<'a> {
                 None => K::Null,
             });
         }
-        // If 3 arguments and `v[0]` is a `Func`, this is protected evaluation `@[f; x; handler]` or `.[f; args_list; handler]`!
-        if v.len() == 3 && matches!(v[0], K::Func(_)) {
+        // If 3 arguments and `v[0]` is a `Func` or an open handle, this is protected evaluation `@[f; x; handler]` or `.[f; args_list; handler]`!
+        let handle = matches!(&v[0], K::Int(h) if self.session.handles.contains_key(&h.saturating_abs()));
+        if v.len() == 3 && (handle || matches!(v[0], K::Func(_))) {
             let call_res = if op == "@" {
                 self.apply_value(&v[0], &[Some(v[1].clone())])
             } else if let K::Vector(cv) = &v[1] {
@@ -1719,10 +1724,17 @@ impl<'a> Engine<'a> {
 
         // Functional amend `@[d; i; f]` / `@[d; i; f; y]`!
         if v.len() >= 3 {
+            // `.[name; (); :; y]` sets the name, whatever it holds
+            if let (".", K::Sym(s), 0, K::Func(Func::Prim(assign)), Some(y)) = (op, &v[0], v[1].count(), &v[2], v.get(3)) {
+                if resolve(*assign) == ":" {
+                    self.set_global(*s, y.clone())?;
+                    return Ok(v[0].clone());
+                }
+            }
             let mut inplace_sym = None;
             let base = if let K::Sym(s) = &v[0] {
                 inplace_sym = Some(*s);
-                self.get_var(*s)?
+                self.held(*s)?
             } else {
                 v[0].clone()
             };
@@ -1740,14 +1752,22 @@ impl<'a> Engine<'a> {
                     return Ok(updated);
                 }
             }
-            let idx_list = vec![Some(v[1].clone())];
-            let cur_sub = ops::index_k(&base, &idx_list)?;
-            let new_sub = if v.len() >= 4 {
-                self.apply_func(f, &[cur_sub, v[3].clone()])?
-            } else {
-                self.apply_func(f, &[cur_sub])?
+            // each column of a table that is named is changed by itself, with its part of `y`
+            let named: Vec<K> = match (&base, &v[1]) {
+                (K::Table(_), K::Vector(ColVec::Sym(_, columns))) => columns.iter().map(|&c| K::Sym(c)).collect(),
+                _ => vec![v[1].clone()],
             };
-            let updated = self.amend_in_place(base, &idx_list, None, &new_sub)?;
+            let mut updated = base;
+            for (n, index) in named.iter().enumerate() {
+                let idx_list = [Some(index.clone())];
+                let mut given = vec![ops::index_k(&updated, &idx_list)?];
+                given.extend(v.get(3).map(|y| match y {
+                    K::Vector(parts) if matches!(v[1], K::Vector(_)) && matches!(updated, K::Table(_)) && parts.len() == named.len() => parts.get_atom(n),
+                    all => all.clone(),
+                }));
+                let new_sub = self.apply_func(f, &given)?;
+                updated = self.amend_in_place(updated, &idx_list, None, &new_sub)?;
+            }
             if let Some(s) = inplace_sym {
                 self.set_global(s, updated)?;
                 return Ok(K::Sym(s));
@@ -1995,48 +2015,21 @@ impl<'a> Engine<'a> {
         self.eval_expr(&e)
     }
 
-    // ----- Persistence (`set` / `get`) & IPC handles (`hopen` / `hclose`) ---
+    // ----- Persistence (`set` / `get`) ----------------------------------
 
     fn eval_set(&mut self, lhs: &K, rhs: &K) -> KResult<K> {
         let K::Sym(s) = lhs else {
             return Err(KError::ty("set LHS must be a symbol (`var or `:path)"));
         };
-        let target = resolve(*s);
-        if let Some(rel_path) = target.strip_prefix(':') {
-            storage::save_path(self.ws, rel_path, rhs)?;
-            Ok(lhs.clone())
-        } else {
-            self.set_global(*s, rhs.clone())?;
-            Ok(lhs.clone())
-        }
+        self.set_global(*s, rhs.clone())?;
+        Ok(lhs.clone())
     }
 
     fn eval_get(&mut self, x: &K) -> KResult<K> {
         let K::Sym(s) = x else {
             return Err(KError::ty("get expects file symbol (`:path) or variable symbol"));
         };
-        let target = resolve(*s);
-        if let Some(rel_path) = target.strip_prefix(':') {
-            storage::load_path(self.ws, rel_path)
-        } else {
-            self.get_var(*s)
-        }
-    }
-
-    fn eval_hopen(&mut self, x: &K) -> KResult<K> {
-        let spec = x.as_str().ok_or_else(|| KError::ty("hopen expects `:host:port symbol or string"))?;
-        let addr = spec.trim_start_matches(':');
-        let client = crate::ipc::IpcClient::connect_addr(addr, &self.session.login, "")?;
-        let h = self.session.next_handle;
-        self.session.next_handle += 1;
-        self.session.handles.insert(h, client);
-        Ok(K::Int(h))
-    }
-
-    fn eval_hclose(&mut self, x: &K) -> KResult<K> {
-        let h = x.as_i64()? as i32;
-        self.session.handles.remove(&h.abs());
-        Ok(K::Null)
+        self.get_var(*s)
     }
 
     // ----- System Commands (`\a`, `\b`, `\v`, `\f`, `\d`, `\l`, `\t`, `\ts`, `\w`)
@@ -2153,6 +2146,8 @@ impl<'a> Engine<'a> {
                 if p.is_dir() {
                     storage::mount_hdb_dir(self.ws, p)?;
                     Ok(K::Null)
+                } else if storage::holds_value(&storage::path_of(self.ws, &K::sym(arg))?) {
+                    self.load(&K::sym(arg))
                 } else {
                     let src = std::fs::read_to_string(p)?;
                     self.eval_str(&src)
