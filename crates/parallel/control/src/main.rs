@@ -178,7 +178,7 @@ fn run_input(cluster: &Cluster, show_plan: bool) -> ExitCode {
             match event {
                 Event::Rows(rs) => println!("{}", kixdb::display::grid(&rs)),
                 Event::Value(v) => println!("{}", kixdb::display::console(&v)),
-                Event::Message(m) => println!("{m}"),
+                printed @ (Event::Message(_) | Event::Console { .. }) => printed.print(),
                 Event::Error(e) => {
                     eprintln!("{e}");
                     failed = true;

@@ -2,7 +2,7 @@
 //! connections (`.z.pw`, `.z.po`, `.z.pc`), messages (`.z.pg`, `.z.ps`, `.z.bm`), the timer (`.z.ts`), console input
 //! (`.z.pi`) and leaving (`.z.exit`). (`.z.vs`, on setting a global, is the engine's.) Also what a process does between
 //! statements: its timer, and running what the servers it is connected to send.
-use crate::engine::Engine;
+use crate::engine::{Engine, Event};
 use crate::error::KResult;
 use crate::ipc::Outbox;
 use crate::sym::intern;
@@ -34,7 +34,7 @@ impl Connection {
             let mut ws = self.server.shared.ws.write().unwrap_or_else(|e| e.into_inner());
             let mut engine = Engine::new(&mut ws, &mut self.session);
             let result = f(&mut engine);
-            engine.take_messages().iter().for_each(|m| println!("{m}"));
+            engine.take_messages().iter().for_each(Event::print);
             result
         };
         self.session.current_ns = namespace;

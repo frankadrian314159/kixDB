@@ -49,7 +49,23 @@ pub enum Event {
     Rows(ResultSet),
     Value(K),
     Message(String),
+    /// What `-1`, `-2`, `1` and `2` write: the text as it is, line ends included, to the output or (`error`) as errors.
+    Console { text: String, error: bool },
     Error(KError),
+}
+
+impl Event {
+    /// Write what was printed (as by `show` or `-1`) to the process's console.
+    pub fn print(&self) {
+        use std::io::Write;
+        // (output that cannot be written, as to a closed pipe, is dropped)
+        let _ = match self {
+            Event::Message(line) => writeln!(std::io::stdout(), "{line}"),
+            Event::Console { text, error: false } => write!(std::io::stdout(), "{text}").and_then(|_| std::io::stdout().flush()),
+            Event::Console { text, error: true } => write!(std::io::stderr(), "{text}"),
+            _ => Ok(()),
+        };
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -286,7 +302,8 @@ pub struct Engine<'a> {
     backtrace: Vec<K>,
     /// The views being computed.
     viewing: Vec<SymId>,
-    pub messages: Vec<String>,
+    /// What the statements have printed.
+    pub messages: Vec<Event>,
     /// Suppress WAL/replication recording while replaying a log or installing a snapshot.
     pub replaying: bool,
 }
@@ -319,9 +336,17 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// What `show` and `0N!` have printed since the last call.
-    pub(crate) fn take_messages(&mut self) -> Vec<String> {
+    /// What has been printed since the last call.
+    pub(crate) fn take_messages(&mut self) -> Vec<Event> {
         std::mem::take(&mut self.messages)
+    }
+
+    /// Print: for a client's or a server's message, straight to the process's console; else with the results.
+    pub(crate) fn print(&mut self, printed: Event) {
+        match self.session.client {
+            Some(_) => printed.print(),
+            None => self.messages.push(printed),
+        }
     }
 
     /// The value of a message as a connection sends them: code, or a function (or its name) and its arguments.
@@ -372,14 +397,15 @@ impl<'a> Engine<'a> {
                 return events;
             }
         };
-        for s in &stmts {
-            match self.eval_expr(s) {
+        for (i, s) in stmts.iter().enumerate() {
+            let result = self.eval_expr(s);
+            events.append(&mut self.messages);
+            match result {
                 Ok(val) => {
-                    for m in self.messages.drain(..) {
-                        events.push(Event::Message(m));
-                    }
-                    // kdb+ prints nothing for a top-level assignment
-                    if !matches!(val, K::Null) && !matches!(s, Expr::Assign { .. }) {
+                    // kdb+ prints nothing for a top-level assignment, nor for a line that ends with a semicolon (which
+                    // the parser follows with `::`)
+                    let silent = matches!(s, Expr::Assign { .. }) || matches!(stmts.get(i + 1), Some(Expr::Lit(K::Null)));
+                    if !matches!(val, K::Null) && !silent {
                         if let Some(rs) = k_to_resultset(&val) {
                             events.push(Event::Rows(rs));
                         } else {
@@ -388,9 +414,6 @@ impl<'a> Engine<'a> {
                     }
                 }
                 Err(e) => {
-                    for m in self.messages.drain(..) {
-                        events.push(Event::Message(m));
-                    }
                     events.push(Event::Error(e));
                     break;
                 }
@@ -867,7 +890,7 @@ impl<'a> Engine<'a> {
                 let rval = self.eval_step(rhs)?;
                 // Special case: `0N ! x` prints `x` and returns `x`!
                 if op_name == "!" && matches!(&**lhs, Expr::Lit(K::Long(NULL_LONG))) {
-                    self.messages.push(rval.q_repr());
+                    self.print(Event::Message(rval.q_repr()));
                     return Ok(rval);
                 }
                 let lval = self.eval_step(lhs)?;
@@ -1109,7 +1132,7 @@ impl<'a> Engine<'a> {
                 ops::eval_unary_prim(name.as_str(), &table)
             }
             "show" => {
-                self.messages.push(crate::display::console(x));
+                self.print(Event::Message(crate::display::console(x)));
                 Ok(K::Null)
             }
             "get" => self.eval_get(x),
@@ -1181,6 +1204,14 @@ impl<'a> Engine<'a> {
         }
         match op {
             "@" => self.apply_value(lhs, &[Some(rhs.clone())]),
+            // `-1 each lines`, and the same with any handle
+            "each" | "peach" if self.open_handle(lhs).is_some() => {
+                let sent = (0..rhs.count() as i64).map(|i| {
+                    let item = ops::index_k(rhs, &[Some(K::Long(i))])?;
+                    self.apply_value(lhs, &[Some(item)])
+                });
+                Ok(K::Vector(ColVec::from_atoms(sent.collect::<KResult<_>>()?)))
+            }
             "each" | "peach" | "over" | "scan" | "prior" => {
                 let K::Func(f) = lhs else {
                     return Err(KError::ty(format!("{op} requires a function on its left")));

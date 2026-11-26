@@ -80,7 +80,7 @@ Unlike kdb+, which holds positions in the domain:
 | tables | `cols keys meta fkeys xasc xdesc xkey xcol xcols xgroup ungroup insert upsert fby tables views` |
 | strings, casts | `string upper lower trim ltrim rtrim ss ssr vs sv $ md5` |
 | system | `get set value parse eval attr system show getenv setenv ltime gtime -8! -9!` |
-| files, handles | `hopen hclose hcount hsym hdel key read0 read1 save load rsave rload csv 0: 1: -25!` ([storage.md](storage.md#files-and-tables-on-disk), [ipc.md](ipc.md#sending-to-clients)) |
+| files, handles | `hopen hclose hcount hsym hdel key read0 read1 save load rsave rload csv 0: 1: -25! -1 -2 1 2` ([storage.md](storage.md#files-and-tables-on-disk), [ipc.md](ipc.md#sending-to-clients)) |
 | iterators | `each peach over scan prior` (`peach` runs as `each`) |
 
 `.z.p .z.P .z.d .z.D .z.t .z.T .z.n .z.N .z.z .z.Z` give the time and date; `.z.u .z.i .z.o .z.K .z.h .z.c .z.l .z.q
@@ -137,6 +137,16 @@ of printed output, `\cd` the directory. Any other `\` command, and `system` of i
 where that is allowed ([shell commands](ipc.md#shell-commands)).
 
 ## Printing
+
+```q
+-1 "one line";                    / to the output; -2 to the errors. A list of strings gives a line each
+1 "no line end ";                 / 1 and 2 write the text as it is
+-1 each ("a"; "b");
+```
+
+The value of each is the handle, which the console shows unless the line ends with `;` (as with any statement). In `kix`
+and the desktop app, what a statement and the ones typed with it print (`show` too) appears when they have all run. A
+server prints what a client's request or a callback prints on its own console, as it happens.
 
 `.Q.s x` is what the console shows for `x`; `.Q.s1 x` and `-3!x` give its one-line q form (`` `a`b!1 2 ``,
 `` +`c!,1 2 ``). Both round floats to `\P` digits, as `string` does. Files written with `0:` and exported CSV keep every

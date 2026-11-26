@@ -1,7 +1,7 @@
 //! The functions and constants of the `.Q` (utilities), `.j` (JSON) and `.h` (text, in `markup`) namespaces, as KX
 //! documents them. A variable assigned the same name takes their place.
 use crate::engine::ops::{self, index_k};
-use crate::engine::{json, markup, Engine};
+use crate::engine::{json, markup, Engine, Event};
 use crate::error::{KError, KResult};
 use crate::parser::is_builtin_verb;
 use crate::sym::{intern, resolve, sym_count, SymId};
@@ -366,7 +366,7 @@ impl Engine<'_> {
             ".Q.sbt" => K::string(&show_backtrace(&items(x))),
             ".Q.bt" => {
                 let shown = show_backtrace(&self.frames());
-                self.messages.push(shown.trim_end().to_string());
+                self.print(Event::Message(shown.trim_end().to_string()));
                 K::Null
             }
             ".Q.opt" => {

@@ -360,9 +360,7 @@ impl Shell {
                 Event::Value(v) => {
                     let _ = writeln!(out, "{}", kixdb::display::console(v));
                 }
-                Event::Message(m) => {
-                    let _ = writeln!(out, "{m}");
-                }
+                Event::Message(_) | Event::Console { .. } => ev.print(),
                 Event::Error(e) => {
                     self.failed = true;
                     eprintln!("{e}");

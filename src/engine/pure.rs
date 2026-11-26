@@ -61,7 +61,12 @@ impl<'a> Reader<'a> {
             Expr::Var(s) => self.name(*s),
             Expr::Unary { op, .. } => self.name(*op),
             // (`-11!` replays a log)
-            Expr::Binary { op, lhs, .. } => self.name(*op) && !(resolve(*op) == "!" && matches!(&**lhs, Expr::Lit(K::Int(_) | K::Long(_)))),
+            Expr::Binary { op, lhs, .. } => match resolve(*op).as_str() {
+                "!" if matches!(&**lhs, Expr::Lit(K::Int(_) | K::Long(_))) => false,
+                // (`-1 each lines`)
+                "each" | "peach" if self.handle(lhs) => false,
+                _ => self.name(*op),
+            },
             Expr::Apply { target, args } => match &**target {
                 // protected evaluation and amends
                 Expr::Lit(K::Func(Func::Prim(s))) if args.len() >= 3 && matches!(resolve(*s).as_str(), "@" | ".") => false,

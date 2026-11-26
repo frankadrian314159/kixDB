@@ -409,6 +409,8 @@ fn callbacks_a_cluster_cannot_make_are_refused() {
     }
     // nor does a node run shell commands
     assert_eq!(client.query_str("system \"echo hi\"").err().map(|e| e.signal), Some("access".into()));
+    // the console's handles are accepted, though the node prints nothing for a client
+    assert_eq!(client.query_str("-1 \"to the console\"").unwrap(), K::Int(-1));
     // nor is anything sent to a client
     assert_eq!(client.query_str("(neg .z.w) 1").err().map(|e| e.signal), Some("nyi".into()));
     assert_eq!(client.query_str("count trade").unwrap(), K::Long(240));

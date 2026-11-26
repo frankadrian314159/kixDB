@@ -1,7 +1,7 @@
 //! Files and handles: `hsym`, `hdel`, `key`, `read0`, `read1`, `save`, `load`, `rsave`, `.Q.fs`, the handles of
 //! `hopen` (to a file as well as to a server), and sending through a handle, the clients' too. Relative paths are taken
 //! from the workspace's directory, if it has one.
-use crate::engine::{ops, Engine, Host};
+use crate::engine::{ops, Engine, Event, Host};
 use crate::error::{KError, KResult};
 use crate::ipc::{encode_k_payload, IpcClient, Outbox};
 use crate::storage;
@@ -112,22 +112,29 @@ fn raw_bytes(x: &K) -> KResult<Vec<u8>> {
     }
 }
 
+/// `x`, a string or a list of strings, as the bytes to write, each string followed by a line end if `ended`.
+fn text_bytes(x: &K, ended: bool) -> KResult<Vec<u8>> {
+    let given = match x {
+        K::Vector(ColVec::General(_, items)) => items.to_vec(),
+        line => vec![line.clone()],
+    };
+    let mut bytes = Vec::new();
+    for line in given {
+        if !matches!(line, K::Char(_) | K::Vector(ColVec::Char(..))) {
+            return Err(KError::ty("this handle takes a string or a list of strings"));
+        }
+        bytes.extend(raw_bytes(&line)?);
+        if ended {
+            bytes.push(b'\n');
+        }
+    }
+    Ok(bytes)
+}
+
 /// Add `x` to the end of the file: as lines of text, as items of the list the file holds, or as bytes.
 fn append(path: &Path, x: &K, text: bool) -> KResult<()> {
     let bytes = if text {
-        let given = match x {
-            K::Vector(ColVec::General(_, items)) => items.to_vec(),
-            line => vec![line.clone()],
-        };
-        let mut bytes = Vec::new();
-        for line in given {
-            if !matches!(line, K::Char(_) | K::Vector(ColVec::Char(..))) {
-                return Err(KError::ty("a negative file handle takes a string or a list of strings"));
-            }
-            bytes.extend(raw_bytes(&line)?);
-            bytes.push(b'\n');
-        }
-        bytes
+        text_bytes(x, true)?
     } else if storage::holds_value(path) {
         let joined = ops::eval_binary_prim(",", &storage::read_flat_k(path)?, x)?;
         return storage::write_flat_k(path, &joined);
@@ -188,7 +195,7 @@ impl Engine<'_> {
         locked(&self.ws.host.clients).get(&h).cloned()
     }
 
-    /// `x` as an open handle, negative for the asynchronous form.
+    /// `x` as an open handle (1 and 2 are the console's), negative for the asynchronous form.
     pub(crate) fn open_handle(&self, x: &K) -> Option<i32> {
         let h = match x {
             K::Int(h) => *h,
@@ -196,16 +203,23 @@ impl Engine<'_> {
             _ => return None,
         };
         let to = h.saturating_abs();
-        (self.ws.host.handles().contains_key(&to) || self.client(to).is_some()).then_some(h)
+        (matches!(to, 1 | 2) || self.ws.host.handles().contains_key(&to) || self.client(to).is_some()).then_some(h)
     }
 
     /// Apply an open handle to `x`: a server is asked (`h`) or told (`neg h`), a client can only be told, and a file is
-    /// added to. With nothing to send, `h[]` waits for the server's next message and `neg[h][]` does nothing, as
+    /// added to. The console (1, 2: output, errors) is written to, with a line end after each string if the handle is
+    /// negative. With nothing to send, `h[]` waits for the server's next message and `neg[h][]` does nothing, as
     /// nothing is held back.
     pub(crate) fn apply_handle(&mut self, h: i32, x: K) -> KResult<K> {
         // (a copy of the workspace sends nothing: the statement may be run again)
         self.ws.writable()?;
-        let held = self.ws.host.handles().get(&h.saturating_abs()).cloned();
+        let to = h.saturating_abs();
+        if matches!(to, 1 | 2) {
+            let text = String::from_utf8_lossy(&text_bytes(&x, h < 0)?).into_owned();
+            self.print(Event::Console { text, error: to == 2 });
+            return Ok(K::Int(h));
+        }
+        let held = self.ws.host.handles().get(&to).cloned();
         match held {
             Some(Handle::Server(server)) if x == K::Null && h > 0 => locked(&server).receive(),
             _ if h < 0 && x == K::Null => Ok(K::Null),

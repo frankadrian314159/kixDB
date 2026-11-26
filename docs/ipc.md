@@ -37,7 +37,7 @@ A function assigned to one of these names is called by `kix-serve`, `kix -p` and
 | `.z.exit` | the exit code | the shell ends (`kix-serve`, which is stopped by a signal, does not call it) |
 
 In a callback `.z.w` is the client's handle, `.z.a` its address and `.z.u` its user. `\x .z.pg` restores a default.
-What `show` and `0N!` print in a callback goes to the console of the process.
+What `show`, `0N!` and `-1` print in a callback, or while a client's request runs, goes to the console of the process.
 
 * **While any request has a callback to run, it runs alone:** with `.z.pg` defined, queries no longer run at the same
   time as each other (see [Concurrency](#concurrency)).
