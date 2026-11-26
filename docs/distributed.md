@@ -197,6 +197,51 @@ and records the new **layout** (which shards there are and what each owns) on sh
   1,024. The first start of this version moves their rows (through the control node, which needs room for the largest
   such table) before serving; every shard must be up. Earlier versions cannot read the state file afterwards.
 
+## Adding shards by itself
+
+```
+kix-cluster ... --listen 5000 --scale-command ./start-shard --scale-above-mb 48000 --max-shards 8
+```
+
+While some shard's variables hold more than `--scale-above-mb`, the control node runs your program to start another
+shard, waits for it to answer and adds it, as `ADD SHARD` does (statements wait while rows move). It never removes one.
+
+**The program** is run on the control node's machine with one argument, the `--id` of the shard wanted. It starts that
+shard, empty, wherever you like, and prints its address (`host:port`, or comma-separated replicas) as its last line,
+then ends with code 0. It must leave the shard running with its output sent elsewhere. A script for one machine:
+
+```sh
+#!/bin/sh
+# start-shard ID
+kix-shard --id "$1" --listen 127.0.0.1:$((50051 + $1)) --data "s$1" \
+    --node-ca certs/ca.pem --node-cert "certs/s$1.pem" --node-key "certs/s$1.key" >"s$1.log" 2>&1 &
+echo "127.0.0.1:$((50051 + $1))"
+```
+
+On Windows it is a `.cmd` file that starts the shard with `start "" /b kix-shard ... >s%1.log 2>&1` and then
+`echo`es the address. Make the certificates of the shards to come beforehand (`kix-cluster --make-certs certs s2 s3
+s4`): `ca.key` stays off the nodes.
+
+| Option | Default | |
+| --- | --- | --- |
+| `--scale-above-mb N` | required | the memory mark of one shard; set it well below what the machine has, as a change needs room |
+| `--max-shards N` | required | never more shards than this |
+| `--scale-interval SECS` | 30 | between checks |
+| `--scale-checks N` | 3 | checks in a row that must find a shard above the mark |
+| `--scale-cooldown SECS` | 300 | the least time between attempts |
+| `--scale-dry-run` | | say what would be done, and do nothing |
+
+* What it does and why is printed on the control node's console; `/metrics` has `kixdb_autoscale_shards_added_total`,
+  `kixdb_autoscale_failures_total` and `kixdb_autoscale_paused`.
+* **It acts only when every shard answers** and no change is waiting for one.
+* **A shard that was started but could not be added** is tried again after the cooldown; the program is not run for
+  that `--id` again until the shard is added or the control node restarts. The program has 5 minutes to end, and the
+  shard as long to answer.
+* **It pauses when adding does not help:** if the fullest shard hardly shrank (one value holds many of its rows, or its
+  memory is in replicated tables, which every shard holds), nothing more is added until no shard is above the mark.
+* Stopping the control node waits for a change of shards under way.
+* From Rust: `cluster.autoscale(Autoscale::new(program, bytes, most))`, which watches until what it returns is dropped.
+
 ## How a statement runs
 
 `EXPLAIN statement` shows the plan without running it.
@@ -364,8 +409,8 @@ shards must match.
 * **Every node is trusted fully.** A certificate of the cluster's authority gives full access to every shard, and
   certificates cannot be revoked one by one (see [Security](#security)).
 * **The control node is a single point of failure**, and gathering needs memory there for the whole table.
-* **Shards are added and removed by command,** and statements wait meanwhile
-  ([Changing the number of shards](#changing-the-number-of-shards)). Nothing does it by itself.
+* **Statements wait while shards are added or removed** ([Changing the number of shards](#changing-the-number-of-shards)).
+  Shards can be [added by themselves](#adding-shards-by-itself) when memory calls for it; none is removed so.
 * Slots move to even out their number, not the rows in them: one symbol or day with most of the rows stays whole.
 * **Floating point sums** added in two phases can differ from one server's in the last digits.
 * A shard makes one change at a time.

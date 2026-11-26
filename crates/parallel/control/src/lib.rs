@@ -9,7 +9,9 @@
 //! * **gathered** ([`session`]): anything else gets the tables it names copied into the mirror, runs there, and the
 //!   tables it changed are distributed again.
 //!
-//! The number of shards can be changed while the cluster runs ([`resize`]).
+//! The number of shards can be changed while the cluster runs ([`resize`]), by command or as memory calls for it
+//! ([`autoscale`]).
+mod autoscale;
 mod catalog;
 pub mod client;
 mod commit;
@@ -19,6 +21,7 @@ mod plan;
 mod resize;
 mod session;
 
+pub use autoscale::{Autoscale, Autoscaler};
 pub use session::ClusterSession;
 
 use client::ShardClient;
@@ -80,6 +83,7 @@ struct Inner {
     layout_unsure: AtomicBool,
     tls: Option<NodeTls>,
     move_batch: AtomicUsize,
+    scaling: autoscale::Counters,
     mirror: Server,
     /// Pushed-down reads share the cluster; every other statement has it to itself.
     gate: RwLock<()>,
@@ -271,6 +275,7 @@ impl Cluster {
             layout_unsure: AtomicBool::new(true),
             tls,
             move_batch: AtomicUsize::new(MOVE_BATCH),
+            scaling: Default::default(),
             mirror,
             gate: RwLock::new(()),
             next_ord: AtomicI64::new(0),
@@ -383,6 +388,14 @@ impl Cluster {
         let answers = self.inner.wait(join_all(shards.iter().map(|s| s.metrics())));
         let up: Vec<NodeMetrics> = answers.into_iter().filter_map(Result::ok).collect();
         let mut out = format!("# TYPE kixdb_shards_up gauge\nkixdb_shards_up {}\n", up.len());
+        let scaling = &self.inner.scaling;
+        for (name, kind, value) in [
+            ("shards_added_total", "counter", scaling.added.load(Ordering::SeqCst)),
+            ("failures_total", "counter", scaling.failed.load(Ordering::SeqCst)),
+            ("paused", "gauge", u64::from(scaling.paused.load(Ordering::SeqCst))),
+        ] {
+            out.push_str(&format!("# TYPE kixdb_autoscale_{name} {kind}\nkixdb_autoscale_{name} {value}\n"));
+        }
         out.push_str(&render_prometheus(&up));
         out
     }

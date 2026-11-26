@@ -124,7 +124,7 @@ impl Inner {
     }
 
     /// A connection to the shard at the comma-separated `addresses`.
-    fn new_shard(&self, id: u32, addresses: &str) -> KResult<Arc<ShardClient>> {
+    pub(crate) fn new_shard(&self, id: u32, addresses: &str) -> KResult<Arc<ShardClient>> {
         let known = self.shard(0)?;
         let _in_runtime = self.runtime.enter();
         let shard = ShardClient::new(id, addresses, self.tls.clone())?;
