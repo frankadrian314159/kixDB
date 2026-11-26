@@ -28,13 +28,18 @@ impl Inner {
         *self.unsettled.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
     }
 
+    /// Whether some change may be waiting for a shard.
+    pub(crate) fn in_doubt(&self) -> bool {
+        self.unsettled.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+
     /// Whether it is time to resolve changes that may be waiting.
     pub(crate) fn unsettled(&self) -> bool {
         self.unsettled.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|due| due <= Instant::now())
     }
 
     fn txn(&self, shard: usize, req: &TxnReq) -> KResult<TxnReply> {
-        self.wait(self.shards[shard].txn(req))
+        self.wait(self.shard(shard)?.txn(req))
     }
 
     /// Every shard of a change committed it: its primary is told with its next commit.
@@ -45,7 +50,8 @@ impl Inner {
     /// Finish or abandon every change the shards hold. The caller has the cluster to itself.
     pub(crate) fn resolve(&self) {
         self.forget_counts(None);
-        let held = self.wait(join_all(self.shards.iter().map(|s| s.txn(&TxnReq::Pending))));
+        let shards = self.shards();
+        let held = self.wait(join_all(shards.iter().map(|s| s.txn(&TxnReq::Pending))));
         let mut settled = held.iter().all(Result::is_ok);
         // the shards holding each change
         let mut changes: BTreeMap<(u64, u32), Vec<usize>> = BTreeMap::new();
@@ -102,8 +108,10 @@ impl Inner {
             for (shard, ops) in shards {
                 for (_, op) in ops {
                     let done = match &op {
-                        TxnOp::Load(req) => self.wait(self.shards[shard].load(req)),
-                        TxnOp::Mutate(req) => self.wait(self.shards[shard].mutate(req)).map(|k| answers.push(k)),
+                        TxnOp::Load(req) => self.wait(self.shard(shard)?.load(req)),
+                        TxnOp::Mutate(req) => self.wait(self.shard(shard)?.mutate(req)).map(|k| answers.push(k)),
+                        // (a change of the number of shards writes the layout too, so it is never one alone)
+                        TxnOp::Move(_) => Err(KError::new("cluster", "rows move only as part of a larger change")),
                     };
                     done.inspect_err(|_| self.doubt())?;
                 }
@@ -117,7 +125,8 @@ impl Inner {
             .iter()
             .map(|(&s, ops)| (s, TxnReq::Prepare { txid, primary: primary as u32, ops: ops.iter().map(|o| o.1.clone()).collect() }))
             .collect();
-        let replies = self.wait(join_all(prepares.iter().map(|(s, req)| self.shards[*s].txn(req))));
+        let held = self.shards();
+        let replies = self.wait(join_all(prepares.iter().map(|(s, req)| held[*s].txn(req))));
         // the mutations' answers, by the number of their operation
         let mut answers: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
         let mut failed = None;
@@ -160,7 +169,7 @@ impl Inner {
         }
         self.finished.lock().unwrap_or_else(|e| e.into_inner()).retain(|f| f.0 != primary || !forget.contains(&f.1));
         let commit = TxnReq::Commit { txid, primary: false, forget: vec![] };
-        let others = self.wait(join_all(shards.keys().skip(1).map(|&s| self.shards[s].txn(&commit))));
+        let others = self.wait(join_all(shards.keys().skip(1).map(|&s| held[s].txn(&commit))));
         if others.iter().all(Result::is_ok) {
             self.finished(primary, txid);
         } else {

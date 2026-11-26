@@ -15,9 +15,9 @@ use futures::{StreamExt, TryStreamExt};
 use kix_shared_ces::arrowconv;
 use kix_shared_ces::metrics::NodeMetrics;
 use kix_shared_ces::pieces::{Assembly, ACTION_PIECE};
-use kix_shared_ces::route::shard_for_keys;
+use kix_shared_ces::route::{shard_for_keys, shard_of};
 use kix_shared_ces::NodeTls;
-use kix_shared_ces::wire::{self, ord_var, Fragment, LoadMode, LoadReq, MemberReq, MutateReq, ShardStatus, ShuffleReq, TxnReq, Work};
+use kix_shared_ces::wire::{self, moving_var, ord_var, Fragment, LoadMode, LoadReq, MemberReq, MoveReq, MutateReq, ShardStatus, ShuffleReq, TxnReq, Work};
 use kixdb::delta::{self, ColChange};
 use kixdb::engine::joins::{match_keys, union_join};
 use kixdb::engine::writes::row_changes;
@@ -226,6 +226,51 @@ fn mutation_changes(conn: &mut Connection, req: &MutateReq) -> KResult<(K, Chang
         changes.push((intern(&ord_var(&req.table)), Write::Value(Some(o))));
     }
     Ok((schema, changes))
+}
+
+/// A table slice a shard holds: its columns (the key columns first), how many are keys, and the rows' ordinals.
+fn slice(conn: &mut Connection, staged: &Changes, table: &str) -> KResult<(Flip, usize, Vec<i64>)> {
+    let held = staged_value(conn, staged, table)?;
+    let nkeys = match &held {
+        K::KeyedTable(kt) => kt.keys.ncols(),
+        _ => 0,
+    };
+    let ords = match staged_value(conn, staged, &ord_var(table))? {
+        K::Vector(ColVec::Long(_, v)) => (*v).clone(),
+        _ => return Err(KError::new("cluster", "row ordinals are missing")),
+    };
+    Ok((unkeyed(&held)?, nkeys, ords))
+}
+
+/// Work out a shard's part in moving rows: what it keeps of a table, or the table with the copied rows merged in.
+fn move_changes(conn: &mut Connection, staged: &Changes, req: &MoveReq) -> KResult<Changes> {
+    let (table, rows, nkeys, ords, copies) = match req {
+        MoveReq::Keep { table, cols, partitioned, slots, me } => {
+            let (held, nkeys, ords) = slice(conn, staged, table)?;
+            let keys = cols.iter().map(|c| held.col(intern(c)).ok_or_else(|| KError::value(c.clone()))).collect::<KResult<Vec<_>>>()?;
+            let values = |r| keys.iter().map(|k| k.get_atom(r)).collect::<Vec<K>>();
+            let kept: Vec<usize> = (0..held.nrows()).filter(|&r| shard_of(&values(r), *partitioned, slots) == *me).collect();
+            (table, held.gather(&kept), nkeys, kept.iter().map(|&r| ords[r]).collect(), None)
+        }
+        MoveReq::Merge { table } => {
+            let copies = moving_var(table);
+            let (held, nkeys, mut ords) = slice(conn, staged, table)?;
+            let (copied, _, more) = slice(conn, staged, &copies)?;
+            ords.extend(more);
+            let mut order: Vec<usize> = (0..ords.len()).collect();
+            order.sort_by_key(|&r| ords[r]);
+            let rows = held.concat(&copied)?.gather(&order);
+            (table, rows, nkeys, order.iter().map(|&r| ords[r]).collect(), Some(copies))
+        }
+    };
+    let mut changes = vec![
+        (intern(table), Write::Value(Some(KeyedTable::from_flip_nkeys(&rows, nkeys)?))),
+        (intern(&ord_var(table)), Write::Value(Some(long_vec(ords)))),
+    ];
+    if let Some(copies) = copies {
+        changes.extend([(intern(&copies), Write::Value(None)), (intern(&ord_var(&copies)), Write::Value(None))]);
+    }
+    Ok(changes)
 }
 
 fn evaluate(conn: &mut Connection, work: &Work) -> KResult<K> {

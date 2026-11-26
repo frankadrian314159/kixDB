@@ -1,6 +1,7 @@
 //! Types shared across control and shard nodes in the distributed `kixdb` cluster:
 //! - [`config`]: static cluster topology (`cluster.json`)
-//! - [`route`]: deterministic 1024-slot entity/symbol hash & date/time partition routing
+//! - [`route`]: which of 1,024 slots a row is in (by the hash of its key, or by its partition value) and which shard
+//!   owns each
 //! - [`arrowconv`]: lossless columnar `Flip` <-> Apache Arrow `RecordBatch` conversion
 //! - [`wire`]: Flight action and ticket messages encoded with `postcard`
 //! - [`metrics`]: node resource & engine telemetry with Prometheus exposition

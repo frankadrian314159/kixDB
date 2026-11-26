@@ -189,7 +189,7 @@ impl ClusterSession {
 
     // ----- Cluster commands --------------------------------------------------
 
-    /// `EXPLAIN`, `DISTRIBUTE`, `SHARDS`, `REPLICAS`, `ADD REPLICA` and `REMOVE REPLICA`.
+    /// `EXPLAIN`, `DISTRIBUTE`, `SHARDS`, `ADD SHARD`, `REMOVE SHARD`, `REPLICAS`, `ADD REPLICA` and `REMOVE REPLICA`.
     fn command(&mut self, code: &str) -> Option<KResult<K>> {
         if let Some(query) = code.trim().strip_prefix("EXPLAIN ") {
             let lines = self.explain(query);
@@ -211,7 +211,13 @@ impl ClusterSession {
                 };
                 parse_script(&format!(".kix.dist[{args}]")).and_then(|s| self.statement(&s[0]))
             }
-            ["SHARDS"] => self.shards(),
+            // (also when a change cannot be finished: it shows which shard does not answer)
+            ["SHARDS"] => {
+                let _ = self.inner.settle();
+                self.shards()
+            }
+            ["ADD", "SHARD", addr] => self.inner.resize(Some(addr)).and_then(|_| self.shards()),
+            ["REMOVE", "SHARD"] => self.inner.resize(None).and_then(|_| self.shards()),
             ["REPLICAS", s] => number(s).and_then(|s| self.members(s, MemberReq::default())),
             ["ADD", "REPLICA", s, id, addr] => number(s).and_then(|s| {
                 let add = Some((number(id)?, addr.to_string()));
@@ -225,7 +231,8 @@ impl ClusterSession {
     }
 
     fn shards(&mut self) -> KResult<K> {
-        let answers = self.inner.wait(futures::future::join_all(self.inner.shards.iter().map(|s| s.status())));
+        let shards = self.inner.shards();
+        let answers = self.inner.wait(futures::future::join_all(shards.iter().map(|s| s.status())));
         let (mut roles, mut terms, mut applied, mut memory) = (vec![], vec![], vec![], vec![]);
         for a in &answers {
             let (role, term, ts, bytes) = match a {
@@ -239,7 +246,7 @@ impl ClusterSession {
         }
         table(vec![
             ("shard", longs((0..answers.len() as i64).collect())),
-            ("addr", strings(self.inner.shards.iter().map(|s| s.addresses()).collect())),
+            ("addr", strings(shards.iter().map(|s| s.addresses()).collect())),
             ("role", ColVec::Sym(Attr::None, Arc::new(roles))),
             ("term", longs(terms)),
             ("applied", longs(applied)),
@@ -260,10 +267,7 @@ impl ClusterSession {
 
     fn statement(&mut self, e: &Expr) -> KResult<K> {
         let inner = self.inner.clone();
-        if inner.unsettled() {
-            let _alone = inner.gate.write().unwrap_or_else(|e| e.into_inner());
-            inner.resolve();
-        }
+        inner.settle()?;
         {
             let _shared = inner.gate.read().unwrap_or_else(|e| e.into_inner());
             if let Some(v) = self.read(e)? {
@@ -390,11 +394,11 @@ impl ClusterSession {
         let ns = self.conn.current_namespace();
         let rows = |t: &Table| inner.rows_of(t).unwrap_or(usize::MAX);
         let next_temp = || inner.next_temp.fetch_add(1, Ordering::SeqCst);
+        let slots = inner.slots();
         f(&mut Planner {
             names: Names { mirror: &inner.mirror, ns },
             mirror: &mut self.conn,
-            shards: inner.shards.len(),
-            slots: &inner.slots,
+            slots: &slots,
             broadcast_limit: inner.broadcast_limit.load(Ordering::SeqCst),
             rows: &rows,
             next_temp: &next_temp,
@@ -498,7 +502,7 @@ impl ClusterSession {
                 }
                 (original, None) if original.is_some() || before.contains(&name) => {
                     let drop = LoadReq::new(resolve(name), LoadMode::Drop, &K::Null, None);
-                    self.changes.extend((0..self.inner.shards.len()).map(|s| (s, TxnOp::Load(drop.clone()))));
+                    self.changes.extend((0..self.inner.shards().len()).map(|s| (s, TxnOp::Load(drop.clone()))));
                     Ok(())
                 }
                 _ => Ok(()),
@@ -557,7 +561,7 @@ impl ClusterSession {
                 }
             }
         }
-        let leading = scan_filters(&pushed, &cols, &layout, &t.schema, self.inner.shards.len(), &self.inner.slots).leading;
+        let leading = scan_filters(&pushed, &cols, &layout, &t.schema, &self.inner.slots()).leading;
         pushed.truncate(leading);
         let mut needed: Vec<SymId> = vec![];
         if !q.cols.is_empty() {
@@ -662,9 +666,22 @@ impl ClusterSession {
             return self.undo_unless(Err(wrong), &undo).map(|_| K::Null);
         }
         self.note(format!("redistribute {}", t.name));
-        let done = self.distribute(t.name, &full, Some(mode)).and_then(|_| self.commit().map(|_| ()));
-        self.undo_unless(done, &undo)?;
+        self.place_rows(t.name, &full, mode, &undo)?;
         Ok(K::Sym(name))
+    }
+
+    /// Distribute a table's rows as `mode` says, on every shard or none; `undo` is the mirror as it was.
+    fn place_rows(&mut self, name: SymId, rows: &K, mode: DistMode, undo: &[u8]) -> KResult<()> {
+        let done = self.distribute(name, rows, Some(mode)).and_then(|_| self.commit().map(|_| ()));
+        self.undo_unless(done, undo)
+    }
+
+    /// Gather a distributed table and distribute it again as it is declared.
+    pub(crate) fn place_again(&mut self, name: SymId) -> KResult<()> {
+        let Some(t) = self.names().table(name) else { return Ok(()) };
+        let full = self.inner.gather(&t)?;
+        let undo = self.inner.mirror.export_state()?;
+        self.place_rows(name, &full, t.mode, &undo)
     }
 
     // ----- Writes -------------------------------------------------------------
@@ -752,7 +769,7 @@ impl ClusterSession {
                 None => return Ok(None),
             }
         }
-        let filtered = scan_filters(&query.where_clauses, &cols, &layout, &t.schema, self.inner.shards.len(), &self.inner.slots);
+        let filtered = scan_filters(&query.where_clauses, &cols, &layout, &t.schema, &self.inner.slots());
         if filtered.leading < query.where_clauses.len() {
             return Ok(None);
         }
@@ -809,7 +826,7 @@ impl ClusterSession {
         let (kind, assigned) = (query.kind, resolve_col_names(&query.cols));
         *query.from = augmented(t.name);
         let req = MutateReq { table: resolve(t.name), query: Expr::Query(Box::new(query)) };
-        self.changes.extend((0..self.inner.shards.len()).map(|s| (s, TxnOp::Mutate(req.clone()))));
+        self.changes.extend((0..self.inner.shards().len()).map(|s| (s, TxnOp::Mutate(req.clone()))));
         let results = self.commit()?;
         self.note("update / delete run on every shard");
         let mut schemas = results.iter().filter_map(unkey);
@@ -922,7 +939,7 @@ impl Inner {
     pub(crate) fn count(&self, t: &Table) -> KResult<usize> {
         let query = Work::Q(format!("count {}", resolve(t.name)));
         if t.mode == DistMode::Replicated {
-            return Ok(self.wait(self.shards[0].query(query))?.as_i64()? as usize);
+            return Ok(self.wait(self.shard(0)?.query(query))?.as_i64()? as usize);
         }
         let mut n = 0;
         for k in self.all(query)? {
@@ -934,7 +951,7 @@ impl Inner {
     /// The whole table, its rows in the order one engine would hold them.
     pub(crate) fn gather(&self, t: &Table) -> KResult<K> {
         let flip = if t.mode == DistMode::Replicated {
-            let k = self.wait(self.shards[0].query(Work::Eval(Box::new(Expr::Var(t.name)))))?;
+            let k = self.wait(self.shard(0)?.query(Work::Eval(Box::new(Expr::Var(t.name)))))?;
             unkey(&k).ok_or_else(|| cluster_error("a shard did not return a table"))?.0
         } else {
             let parts = self.all(Work::Eval(Box::new(augmented(t.name))))?;
@@ -945,7 +962,7 @@ impl Inner {
 
     /// Which rows go to which shard, with new ordinals for them.
     fn split(&self, t: &Table, rows: &Flip) -> KResult<Vec<Part>> {
-        let n = self.shards.len();
+        let (n, slots) = (self.shards().len(), self.slots());
         let Some(layout) = Layout::of(t) else { return Ok(vec![(rows.clone(), None); n]) };
         let keys = layout
             .cols()
@@ -956,7 +973,7 @@ impl Inner {
         let mut owned = vec![Vec::new(); n];
         for r in 0..rows.nrows() {
             let values: Vec<K> = keys.iter().map(|k| k.get_atom(r)).collect();
-            owned[layout.place(&values, n, &self.slots)].push(r);
+            owned[layout.place(&values, &slots)].push(r);
         }
         Ok(owned
             .into_iter()

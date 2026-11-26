@@ -99,7 +99,13 @@ impl ShardClient {
         self.limit.store(limit.as_millis() as u64, Ordering::Relaxed);
     }
 
-    fn limit(&self) -> Duration {
+    /// Whether any of the comma-separated `addresses` is one of this shard's.
+    pub(crate) fn shares(&self, addresses: &str) -> bool {
+        let known = self.replicas();
+        addresses.split(',').any(|a| known.iter().any(|r| r.0 == a.trim()))
+    }
+
+    pub(crate) fn limit(&self) -> Duration {
         match self.limit.load(Ordering::Relaxed) {
             0 => Duration::MAX,
             ms => Duration::from_millis(ms),
@@ -116,7 +122,7 @@ impl ShardClient {
     }
 
     /// Add a replica's address if it is not known, and return its position.
-    fn learn(&self, addr: &str) -> Option<usize> {
+    pub(crate) fn learn(&self, addr: &str) -> Option<usize> {
         let mut channels = self.channels.write().unwrap_or_else(|e| e.into_inner());
         if let Some(i) = channels.iter().position(|(a, _)| a == addr) {
             return Some(i);

@@ -10,8 +10,9 @@
 //!
 //! With `--listen` it serves kdb+ IPC clients (`kix --connect`, `kix-gui --connect`, `hopen`) as one database. Without
 //! it, it runs `q` from standard input against the cluster; `--plan` shows on standard error how each statement ran.
-//! Besides `q`, both accept `EXPLAIN query`, `DISTRIBUTE table BY col | PARTITIONED BY col | REPLICATED`, `SHARDS`, `REPLICAS shard`,
-//! `ADD REPLICA shard id host:port` and `REMOVE REPLICA shard id`.
+//! Besides `q`, both accept `EXPLAIN query`, `DISTRIBUTE table BY col | PARTITIONED BY col | REPLICATED`, `SHARDS`,
+//! `ADD SHARD host:port`, `REMOVE SHARD`, `REPLICAS shard`, `ADD REPLICA shard id host:port` and
+//! `REMOVE REPLICA shard id`.
 //!
 //! `--wait-shards SECS` (30) waits for every shard to answer before starting; `--broadcast-limit ROWS` (100000) is the
 //! largest table a join copies to every shard rather than shuffling. `--request-timeout SECS` (300; 0: none) is how long

@@ -57,7 +57,7 @@ From Rust: `Cluster::connect_with(&config, tls)` or `Cluster::open_with(state_fi
 `NodeTls::from_files(..)` (`connect` and `open` use unprotected connections), then `cluster.session()`,
 `session.eval(q)` and `session.last_plan()`. Do not call these from inside a tokio runtime.
 
-**Keep the state file.** It is checksummed (`KXCS` + CRC32), locked against concurrent processes (`cluster.state.lock`),
+**Keep the state file.** It is checksummed (`KXC2` + CRC32), locked against concurrent processes (`cluster.state.lock`),
 and records the shards, table schemas, distribution, and the variables, functions and views of the control node. A control
 node started without it does not know about data already on the shards.
 
@@ -110,7 +110,8 @@ Declare something else before creating the table, or move an existing one:
 ```
 
 * **Sharded:** the key's value is hashed into one of 1,024 slots, each owned by a shard. Symbols hash by their text.
-* **Partitioned:** an integer or temporal value modulo the number of shards.
+* **Partitioned:** the value of an integer or temporal column, modulo 1,024, picks the slot, so that consecutive days
+  go to different shards.
 * **Co-partitioned** (partitioned by several columns, such as `date` and `sym`): the values are hashed together, so one
   day is spread over the shards and so is one symbol, while the rows of one (day, symbol) pair share a shard. The order
   the columns are named in does not matter.
@@ -157,6 +158,44 @@ Enumerated columns keep their domains on the shards. A shard follows a key into 
 so that table must be **replicated**: a keyed table is sharded by default, so declare it first
 (`DISTRIBUTE kt REPLICATED`). Otherwise following its keys (`key.column`, `` `long$key ``) and adding rows to a table
 that refers to it signal `'nyi`. Values enumerated from a list are checked on the control node, which holds the list.
+
+## Changing the number of shards
+
+```
+ADD SHARD 10.0.0.9:50051          / the address of the new shard (its replicas separated by commas)
+REMOVE SHARD                      / the last one: shards are numbered by position
+```
+
+Both answer with the table that `SHARDS` gives. (From Rust: `cluster.add_shard(address)`, `cluster.remove_shard()`.)
+To add a shard, start it empty with the next `--id` (the number of shards there are) and its own certificate:
+
+```
+kix-cluster --make-certs certs s2
+kix-shard --id 2 --listen 10.0.0.9:50051 --data s2 --node-ca ca.pem --node-cert s2.pem --node-key s2.key
+```
+
+As few of the 1,024 slots move as will even the shards out, with the rows in them; a new shard also gets the replicated
+tables. The rows are first copied, 100,000 at a time, and then one commit across the shards removes them where they were
+and records the new **layout** (which shards there are and what each owns) on shard 0.
+
+* **Statements wait** until the change is done, reads too.
+* **All or nothing.** If a shard fails or the control node stops before the commit, the cluster stays as it was; run the
+  command again (what an attempt left on a new shard is thrown away). If it stops during the commit, nothing is read
+  until every shard has made the change: statements signal `'cluster` (`SHARDS` still answers).
+* **Shard 0 keeps the layout,** which counts for more than the state file or `--config` once the number of shards has
+  changed. After a change, list the new shards in `cluster.json`: while it names another number of shards, none of its
+  addresses are used for shards that the state file knows.
+* **A new shard must be empty,** or hold only what an earlier attempt to add it left. A removed shard is emptied and can
+  be added again.
+* **Memory.** A shard that gives up rows holds them until the commit, and while preparing it holds what it keeps twice.
+  The control node holds the distribution columns of
+  one shard's part of a table at a time. Add shards well before memory runs out.
+* **Removing** a shard rewrites each table that takes rows in, on each shard that stays, as one change: on a replicated
+  shard, keep tables well under 64 MB when removing ([Replication](#replication)). Adding a shard sends the new one its
+  rows in pieces; a shard that gives rows up records only their numbers, unless it gives up half of them or more.
+* A cluster made by an earlier version placed `PARTITIONED` tables differently when its number of shards did not divide
+  1,024. The first start of this version moves their rows (through the control node, which needs room for the largest
+  such table) before serving; every shard must be up. Earlier versions cannot read the state file afterwards.
 
 ## How a statement runs
 
@@ -325,7 +364,9 @@ shards must match.
 * **Every node is trusted fully.** A certificate of the cluster's authority gives full access to every shard, and
   certificates cannot be revoked one by one (see [Security](#security)).
 * **The control node is a single point of failure**, and gathering needs memory there for the whole table.
-* **The number of shards is fixed** when the cluster is created. There is no rebalancing.
+* **Shards are added and removed by command,** and statements wait meanwhile
+  ([Changing the number of shards](#changing-the-number-of-shards)). Nothing does it by itself.
+* Slots move to even out their number, not the rows in them: one symbol or day with most of the rows stays whole.
 * **Floating point sums** added in two phases can differ from one server's in the last digits.
 * A shard makes one change at a time.
 * A change that is not an append, an assignment to some rows or columns or a removal of rows (a re-sort, for one) is logged and

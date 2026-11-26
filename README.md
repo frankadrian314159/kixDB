@@ -47,7 +47,8 @@ kix-cluster --config cluster.json --state cluster.state --listen 5000 \
 kix --connect 127.0.0.1:5000
 ```
 
-Tables are spread over the shards and queries give the answers one server would give. Shards can be replicated with
+Tables are spread over the shards and queries give the answers one server would give. Shards can be
+[added and removed](docs/distributed.md#changing-the-number-of-shards) while the cluster runs, replicated with
 Raft, and a write that spans shards is made [on all of them or none](docs/distributed.md#writes-that-span-shards). Read
 [what the cluster does not guarantee](docs/distributed.md#limits) before relying on it. Nodes talk over [mutual TLS](docs/distributed.md#security), unless started with
 `--insecure`.

@@ -26,6 +26,16 @@ const ERROR_PREFIX: &str = "KIX|";
 /// A column the control node adds to a table slice on its way through a join: the row's global ordinal.
 pub const ORD_COL: &str = "kix__ord";
 
+/// The shard variable of shard 0 that holds the cluster's layout, once the number of shards has changed.
+pub const LAYOUT_VAR: &str = ".kix.layout";
+/// The shard variable that marks a shard that is being added: what it holds may be thrown away.
+pub const JOINING_VAR: &str = ".kix.joining";
+
+/// Where a shard that stays holds the copies of rows that are moving to it, until they are merged into `table`.
+pub fn moving_var(table: &str) -> String {
+    format!(".kix.move.{table}")
+}
+
 /// The shard variable that holds the global row ordinals of a sharded table, parallel to its rows.
 pub fn ord_var(table: &str) -> String {
     format!(".kix.ord.{table}")
@@ -85,6 +95,16 @@ impl LoadReq {
 pub enum TxnOp {
     Load(LoadReq),
     Mutate(MutateReq),
+    Move(MoveReq),
+}
+
+/// A shard's part in moving rows as the number of shards changes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum MoveReq {
+    /// Keep only the rows of `table` that the shard, `me`, owns under `slots`, by the values of `cols`.
+    Keep { table: String, cols: Vec<String>, partitioned: bool, slots: Vec<u32>, me: usize },
+    /// Merge the rows copied beside `table` into it, in the order of their ordinals.
+    Merge { table: String },
 }
 
 impl TxnOp {
@@ -93,6 +113,7 @@ impl TxnOp {
         match self {
             TxnOp::Load(req) => &req.table,
             TxnOp::Mutate(req) => &req.table,
+            TxnOp::Move(MoveReq::Keep { table, .. } | MoveReq::Merge { table }) => table,
         }
     }
 

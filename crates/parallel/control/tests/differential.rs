@@ -140,6 +140,33 @@ fn write(rng: &mut Rng, step: usize) -> String {
 }
 
 #[test]
+fn generated_statements_agree_as_shards_come_and_go() {
+    let mut p = market(2);
+    p.cluster.set_move_batch(13);
+    let mut rng = Rng(77);
+    let added: Vec<String> = (2..5).map(|id| p.shards.add(id)).collect();
+    // up to five shards and down to one
+    let steps: [Option<usize>; 7] = [Some(0), Some(1), None, Some(1), Some(2), None, None];
+    for (turn, step) in steps.into_iter().chain([None, None]).enumerate() {
+        match step {
+            Some(address) => p.cluster.add_shard(&added[address]).unwrap(),
+            None => p.cluster.remove_shard().unwrap(),
+        }
+        for write_step in 0..25 {
+            p.check(&write(&mut rng, write_step));
+        }
+        for table in ["trade", "quote", "acct", "inst"] {
+            let (a, b) = (p.single.eval(table).unwrap(), p.session.eval(table).unwrap());
+            assert!(same(&a, &b), "after change {turn}, {table} differs
+{a}
+{b}");
+        }
+        queries(&mut p, 900 + turn as u64, 60);
+    }
+    assert_eq!(p.cluster.shard_count(), 1);
+}
+
+#[test]
 fn generated_writes_leave_the_same_tables() {
     for shards in [2, 4] {
         let mut p = market(shards);

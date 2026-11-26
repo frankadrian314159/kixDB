@@ -186,6 +186,37 @@ fn a_replicated_shard_survives_its_leader_and_changes_members() {
 }
 
 #[test]
+fn a_replicated_shard_gives_and_takes_rows_as_shards_come_and_go() {
+    let mut group = Group::start(20);
+    group.leader();
+    let cluster = Cluster::connect(&config(&[group.address()])).unwrap();
+    cluster.wait_for_shards(Duration::from_secs(10)).unwrap();
+    cluster.set_move_batch(50);
+    let mut s = cluster.session();
+    s.eval("trade: ([] sym: 600#`a`b`c`d`e`f`g; qty: til 600); pos: ([sym: `a`b`c`d`e`f`g] qty: til 7)").unwrap();
+    let all = s.eval("(trade; pos)").unwrap();
+    let other = group.runtime.block_on(spawn(ShardNode::new(1, Server::new()), "127.0.0.1:0".parse::<SocketAddr>().unwrap())).unwrap();
+    cluster.add_shard(&other.addr.to_string()).unwrap();
+    assert_eq!(s.eval("(trade; pos)").unwrap(), all);
+    let kept = group.leader_rows("trade");
+    assert!(kept > 0 && kept < 600, "{kept}");
+    group.all_hold("trade", kept);
+    cluster.remove_shard().unwrap();
+    assert_eq!(s.eval("(trade; pos)").unwrap(), all);
+    // every replica has the rows back, in order, a new leader too
+    group.all_hold("trade", 600);
+    let dead = group.leader();
+    group.kill(dead);
+    assert_eq!(s.eval("(trade; pos)").unwrap(), all);
+    for i in 0..group.replicas.len() {
+        if group.replicas[i].is_some() {
+            group.kill(i);
+        }
+    }
+    group.runtime.block_on(other.shutdown());
+}
+
+#[test]
 fn without_a_majority_nothing_is_written() {
     let mut group = Group::start(0);
     group.leader();
