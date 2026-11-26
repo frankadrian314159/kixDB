@@ -69,8 +69,6 @@ fn opening_messages_and_closing_are_heard() {
     let mut client = IpcClient::connect_addr(&address, "ann", "").unwrap();
     assert_eq!(text(client.query_str("6 * 7")), "42");
     assert_eq!(text(client.query_str("(.z.w; .z.a; .z.H; .z.W)")), "(1000i;2130706433i;`s#,1000i;(,1000i)!,0i)");
-    // sending to a client is not there yet, and says so
-    assert_eq!(client.query_str("(neg .z.w) 1").err().map(|e| e.signal), Some("nyi".into()));
 }
 
 #[test]

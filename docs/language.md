@@ -80,7 +80,7 @@ Unlike kdb+, which holds positions in the domain:
 | tables | `cols keys meta fkeys xasc xdesc xkey xcol xcols xgroup ungroup insert upsert fby tables views` |
 | strings, casts | `string upper lower trim ltrim rtrim ss ssr vs sv $ md5` |
 | system | `get set value parse eval attr system show getenv setenv ltime gtime -8! -9!` |
-| files, handles | `hopen hclose hcount hsym hdel key read0 read1 save load rsave rload csv 0: 1:` ([storage.md](storage.md#files-and-tables-on-disk)) |
+| files, handles | `hopen hclose hcount hsym hdel key read0 read1 save load rsave rload csv 0: 1: -25!` ([storage.md](storage.md#files-and-tables-on-disk), [ipc.md](ipc.md#sending-to-clients)) |
 | iterators | `each peach over scan prior` (`peach` runs as `each`) |
 
 `.z.p .z.P .z.d .z.D .z.t .z.T .z.n .z.N .z.z .z.Z` give the time and date; `.z.u .z.i .z.o .z.K .z.h .z.c .z.l .z.q
@@ -167,8 +167,10 @@ A variable assigned one of these names takes its place. Where they differ from k
 
 * `ej` only in bracket form.
 * `.Q.en` records a table's symbols but returns the table without enumerating them.
-* Sending to a client that connected (`neg[.z.w] msg`, so no publishing from `.z.ts`), and the callbacks of web and
-  socket servers (`.z.ph .z.pp .z.pm .z.ac .z.ws .z.wo .z.wc`), `.z.pq` and `.z.pd`: kixdb has none of these.
+* Deferred responses (`-30!`), a synchronous call to a client, and a process that runs the messages a server sends it
+  while it is idle (a subscriber's `upd`; it can take them with `h[]`, see [ipc.md](ipc.md#client)).
+* The callbacks of web and socket servers (`.z.ph .z.pp .z.pm .z.ac .z.ws .z.wo .z.wc`), `.z.pq` and `.z.pd`: kixdb has
+  none of these.
 * `.z.e .z.ex .z.ey .z.k .z.m .z.M .z.zd`.
 * Reading binary records with `1:`, and compressed files.
 * Log replay (`-11!`), and the rest of the `.Q` namespace: functions for

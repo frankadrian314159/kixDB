@@ -3,6 +3,7 @@
 //! (`.z.pi`) and leaving (`.z.exit`). (`.z.vs`, on setting a global, is the engine's.)
 use crate::engine::Engine;
 use crate::error::KResult;
+use crate::ipc::Outbox;
 use crate::sym::intern;
 use crate::types::*;
 use crate::{Connection, Server};
@@ -42,13 +43,22 @@ impl Connection {
         }
     }
 
-    /// Take this connection to be a client's, from the IPv4 `address`: it gets a handle (`.z.w`).
-    pub(crate) fn connected_from(&mut self, address: i32) {
+    /// Take this connection to be a client's, from the IPv4 `address`: it gets a handle (`.z.w`), under which `outbox`
+    /// sends to it.
+    pub(crate) fn connected_from(&mut self, address: i32, outbox: &Outbox) {
         let handle = self.server.read_workspace(|ws| {
             let mut clients = ws.host.clients.lock().unwrap_or_else(|e| e.into_inner());
-            let free = (FIRST_CLIENT..).find(|h| !clients.contains(h)).unwrap_or(FIRST_CLIENT);
-            clients.insert(free);
+            let free = (FIRST_CLIENT..).find(|h| !clients.contains_key(h)).unwrap_or(FIRST_CLIENT);
+            clients.insert(free, outbox.clone());
             free
+        });
+        // a client disconnected for falling behind is forgotten at once, not when its connection's thread notices
+        let server = Arc::downgrade(&self.server.shared);
+        outbox.when_dropped(move |outbox| {
+            if let Some(shared) = server.upgrade() {
+                let (server, outbox) = (Server { shared }, outbox.clone());
+                std::thread::spawn(move || server.connect_internal().forget(handle, &outbox, true));
+            }
         });
         self.session.client = Some((handle, address));
     }
@@ -65,11 +75,21 @@ impl Connection {
         }
     }
 
-    /// Forget the client's handle and, for a connection that was `opened`, call `.z.pc` with it.
-    pub(crate) fn closed(&mut self, opened: bool) {
-        let Some((handle, _)) = self.session.client.take() else { return };
-        self.server.read_workspace(|ws| ws.host.clients.lock().unwrap_or_else(|e| e.into_inner()).remove(&handle));
-        if opened {
+    /// Forget this connection's client, calling `.z.pc` for one that was `opened`.
+    pub(crate) fn closed(&mut self, opened: bool, outbox: &Outbox) {
+        if let Some((handle, _)) = self.session.client.take() {
+            self.forget(handle, outbox, opened);
+        }
+    }
+
+    /// Forget the client's handle and, if `tell`, call `.z.pc` with it. A handle that was forgotten already, as one
+    /// that the server closed (`hclose`) is, may be another client's by now: nothing is done.
+    fn forget(&mut self, handle: i32, outbox: &Outbox, tell: bool) {
+        let ours = self.server.read_workspace(|ws| {
+            let mut clients = ws.host.clients.lock().unwrap_or_else(|e| e.into_inner());
+            clients.get(&handle).is_some_and(|o| o.is(outbox)) && clients.remove(&handle).is_some()
+        });
+        if ours && tell {
             self.notify(".z.pc", &[K::Int(handle)]);
         }
     }

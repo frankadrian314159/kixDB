@@ -147,7 +147,7 @@ ordinal, so they come back in the order one server would hold them.
 
 The control node calls `.z.pw`, `.z.po`, `.z.pc` and `.z.bm` ([ipc.md](ipc.md#callbacks)). It does not call `.z.pg`,
 `.z.ps`, `.z.ts` or `.z.vs`, and refuses to let them be assigned (`'nyi`), so that no access rule is taken to be in
-force when it is not.
+force when it is not. Nor does it send to its clients (`neg[.z.w] msg` signals `'nyi`).
 
 ### Foreign keys, links and enumerations
 

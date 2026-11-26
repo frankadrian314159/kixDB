@@ -46,8 +46,9 @@ impl<'a> Reader<'a> {
         match target {
             Expr::Lit(v) => number(v),
             Expr::Var(s) => self.global(*s).flatten().is_some_and(number),
-            // (`neg h` sends or appends)
-            Expr::Unary { op, arg } => resolve(*op) == "neg" && self.handle(arg),
+            // (`neg h`, whatever `h` is, sends or appends)
+            Expr::Unary { op, .. } => resolve(*op) == "neg",
+            Expr::Apply { target, .. } => matches!(&**target, Expr::Lit(K::Func(Func::Prim(s))) | Expr::Var(s) if resolve(*s) == "neg"),
             _ => false,
         }
     }

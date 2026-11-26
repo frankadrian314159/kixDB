@@ -1,9 +1,9 @@
-//! Files and the handles to them: `hsym`, `hdel`, `key`, `read0`, `read1`, `save`, `load`, `rsave`, `.Q.fs`, and the
-//! handles of `hopen`, to a file as well as to a server. Relative paths are taken from the workspace's directory, if it
-//! has one.
+//! Files and handles: `hsym`, `hdel`, `key`, `read0`, `read1`, `save`, `load`, `rsave`, `.Q.fs`, the handles of
+//! `hopen` (to a file as well as to a server), and sending through a handle, the clients' too. Relative paths are taken
+//! from the workspace's directory, if it has one.
 use crate::engine::{ops, Engine};
 use crate::error::{KError, KResult};
-use crate::ipc::{encode_k_payload, IpcClient};
+use crate::ipc::{encode_k_payload, IpcClient, Outbox};
 use crate::storage;
 use crate::sym::{intern, resolve, SymId};
 use crate::types::*;
@@ -130,19 +130,81 @@ impl Engine<'_> {
         Ok(K::Int(h))
     }
 
+    /// `hclose` of a handle of `hopen`'s, or of a client's, which is sent what waits for it and then disconnected.
     pub(crate) fn eval_hclose(&mut self, x: &K) -> KResult<K> {
-        let h = x.as_i64()? as i32;
-        self.session.handles.remove(&h.saturating_abs());
+        let h = (x.as_i64()? as i32).saturating_abs();
+        if self.session.handles.remove(&h).is_none() {
+            if let Some(client) = self.ws.host.clients.lock().unwrap_or_else(|e| e.into_inner()).remove(&h) {
+                client.close();
+            }
+        }
         Ok(K::Null)
     }
 
-    /// Apply a handle that `hopen` gave to `x`: a server is asked (`h`) or told (`neg h`); a file is added to.
+    /// The connected client with the handle `h`.
+    fn client(&self, h: i32) -> Option<Outbox> {
+        self.ws.host.clients.lock().unwrap_or_else(|e| e.into_inner()).get(&h).cloned()
+    }
+
+    /// `x` as an open handle, negative for the asynchronous form.
+    pub(crate) fn open_handle(&self, x: &K) -> Option<i32> {
+        let h = match x {
+            K::Int(h) => *h,
+            K::Long(h) => i32::try_from(*h).ok()?,
+            _ => return None,
+        };
+        let to = h.saturating_abs();
+        (self.session.handles.contains_key(&to) || self.client(to).is_some()).then_some(h)
+    }
+
+    /// Apply an open handle to `x`: a server is asked (`h`) or told (`neg h`), a client can only be told, and a file is
+    /// added to. With nothing to send, `h[]` waits for the server's next message and `neg[h][]` does nothing, as
+    /// nothing is held back.
     pub(crate) fn apply_handle(&mut self, h: i32, x: K) -> KResult<K> {
-        match self.session.handles.get_mut(&h.saturating_abs()).ok_or_else(|| KError::ipc("closed handle"))? {
-            Handle::Server(client) if h > 0 => client.query_k(&x),
-            Handle::Server(client) => client.send_async_k(&x).map(|_| K::Null),
-            Handle::File(path) => append(path, &x, h < 0).map(|_| K::Int(h)),
+        match self.session.handles.get_mut(&h.saturating_abs()) {
+            Some(Handle::Server(client)) if x == K::Null && h > 0 => client.receive(),
+            _ if h < 0 && x == K::Null => Ok(K::Null),
+            Some(Handle::File(path)) => append(path, &x, h < 0).map(|_| K::Int(h)),
+            Some(Handle::Server(client)) if h > 0 => client.query_k(&x),
+            Some(Handle::Server(client)) => client.send_async_k(&x).map(|_| K::Null),
+            None if h > 0 => Err(KError::nyi("a synchronous call to a client (send to it with neg)")),
+            None => {
+                // (a copy of the workspace sends nothing: the statement may be run again)
+                self.ws.writable()?;
+                let client = self.client(-h).ok_or_else(|| KError::ipc("closed handle"))?;
+                client.push(Arc::new(encode_k_payload(&x.untagged())));
+                Ok(K::Null)
+            }
         }
+    }
+
+    /// `-25!(handles; message)`: send the message, encoded once, to each handle. Nothing is sent unless all are open.
+    pub(crate) fn broadcast(&mut self, x: &K) -> KResult<K> {
+        if x.count() != 2 {
+            return Err(KError::length("-25! takes (handles; message)"));
+        }
+        let part = |i| ops::index_k(x, &[Some(K::Long(i))]);
+        let (to, message) = (part(0)?, part(1)?);
+        let handles = match &to {
+            K::Vector(v) => v.as_i64_vec(),
+            one => one.as_i64().ok().map(|h| vec![h]),
+        };
+        let handles = handles.ok_or_else(|| KError::ty("-25! takes handles"))?;
+        let handles: Vec<i32> = handles.into_iter().map(|h| i32::try_from(h).unwrap_or(0)).collect();
+        let open = |h: &i32| matches!(self.session.handles.get(h), Some(Handle::Server(_))) || self.client(*h).is_some();
+        if !handles.iter().all(open) {
+            return Err(KError::ipc("-25!: not all of the handles are open connections"));
+        }
+        self.ws.writable()?;
+        let message = message.untagged();
+        let payload = Arc::new(encode_k_payload(&message));
+        for h in handles {
+            match self.session.handles.get_mut(&h) {
+                Some(Handle::Server(server)) => server.send_async_k(&message)?,
+                _ => self.client(h).into_iter().for_each(|c| c.push(payload.clone())),
+            }
+        }
+        Ok(K::Null)
     }
 
     /// The value a global name holds, to be changed: for a file not yet there, the empty list.

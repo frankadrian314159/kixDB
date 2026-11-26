@@ -25,7 +25,7 @@ use crate::sym::{intern, resolve, sym_count, SymId};
 use crate::types::*;
 use chrono::{Datelike, Local, Timelike, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -131,8 +131,8 @@ impl<T: Clone> DerefMut for Shared<T> {
 /// What a workspace shares with the processes that serve it, and with its copies.
 #[derive(Debug, Default)]
 pub struct Host {
-    /// The handles of the clients that are connected.
-    pub clients: Mutex<BTreeSet<i32>>,
+    /// The clients that are connected, by their handles.
+    pub clients: Mutex<BTreeMap<i32, crate::ipc::Outbox>>,
     /// The interval of the timer (`\t`), 0 for none.
     pub timer_ms: AtomicU64,
     /// Set on a cluster's control node, which does not make the callbacks in `NOT_ON_A_CLUSTER`.
@@ -1172,6 +1172,7 @@ impl<'a> Engine<'a> {
                 // `-8!x` (IPC serialize to byte vector), `-9!bytes` (IPC deserialize), `-11!logfile`!
                 if matches!(lhs, K::Long(_) | K::Int(_)) {
                     match lhs.as_i64()? {
+                        -25 => return self.broadcast(rhs),
                         -8 => {
                             let bytes = crate::ipc::encode_k_payload(&rhs.untagged());
                             return Ok(K::Vector(ColVec::Byte(Attr::None, Arc::new(bytes))));
@@ -1202,17 +1203,12 @@ impl<'a> Engine<'a> {
                 self.apply_value(&held, &args[1..])
             }
             // IPC handle call: `h "select from trade"` (sync) or `(neg h) "upd..."` (async)!
-            K::Int(h) if self.session.handles.contains_key(&h.saturating_abs()) => {
+            K::Int(_) | K::Long(_) if self.open_handle(target).is_some() => {
                 let arg = args.first().and_then(|a| a.clone()).unwrap_or(K::Null);
-                self.apply_handle(*h, arg)
+                self.apply_handle(self.open_handle(target).unwrap_or_default(), arg)
             }
-            K::Long(h) if (*h as i32 != 0) && self.session.handles.contains_key(&((*h as i32).saturating_abs())) => {
-                let hi = *h as i32;
-                self.apply_value(&K::Int(hi), args)
-            }
-            K::Int(h) if self.ws.host.clients.lock().unwrap_or_else(|e| e.into_inner()).contains(&h.saturating_abs()) => {
-                Err(KError::nyi("sending to a client that connected"))
-            }
+            // (a cluster's control node evaluates on a workspace that its clients are not connected to)
+            K::Int(0 | i32::MIN..=-1) if self.ws.host.cluster.load(Ordering::SeqCst) => Err(KError::nyi("sending to a client of a cluster")),
             // Symbol handle one-shot IPC `` `:localhost:5000 "1+1" ``
             K::Sym(s) if resolve(*s).starts_with(':') && files::server_address(&resolve(*s)).is_some() => {
                 let mut client = self.connect_to(&resolve(*s)).unwrap_or_else(|| Err(KError::ipc("not a server")))?;
@@ -1699,7 +1695,7 @@ impl<'a> Engine<'a> {
             });
         }
         // If 3 arguments and `v[0]` is a `Func` or an open handle, this is protected evaluation `@[f; x; handler]` or `.[f; args_list; handler]`!
-        let handle = matches!(&v[0], K::Int(h) if self.session.handles.contains_key(&h.saturating_abs()));
+        let handle = self.open_handle(&v[0]).is_some();
         if v.len() == 3 && (handle || matches!(v[0], K::Func(_))) {
             let call_res = if op == "@" {
                 self.apply_value(&v[0], &[Some(v[1].clone())])

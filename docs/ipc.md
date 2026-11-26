@@ -9,7 +9,7 @@ linked columns are sent as their plain values.
 
 ```
 kix-serve [DATA_DIR] [-p PORT] [--bind ADDR] [-u USER:PASSWORD] [--tls-cert FILE --tls-key FILE | --tls] [--force-tls]
-          [--insecure-clients] [--no-sync]
+          [--insecure-clients] [--no-sync] [--max-queue MB]
 ```
 
 It listens on `127.0.0.1:5000` by default. **Without `-u` (or `KIX_AUTH=user:password`) any client is accepted**, and a
@@ -45,13 +45,41 @@ What `show` and `0N!` print in a callback goes to the console of the process.
 * **They are not a sandbox.** `.z.pg` replaces evaluation only for synchronous requests; define `.z.ps` too to control
   asynchronous ones. Any client let in can otherwise run any q, including changing the callbacks.
 * `.z.pw` does not count as the password that listening beyond this machine requires.
-* Nothing can be sent to a client other than the answer to its request: `neg[.z.w] msg` signals `'nyi`.
+
+## Sending to clients
+
+A server can send to a connected client at any time: from a request, a callback or the timer.
+
+```q
+subs: `int$()
+sub: {subs:: distinct subs, .z.w}              / a client asks to hear
+.z.pc: {subs:: subs except x}
+.z.ts: {-25!(subs; (`upd; .z.p))}              / one message, encoded once, to each of them
+\t 1000
+neg[first subs] "hello"                         / to one
+hclose first subs                              / send what waits, then disconnect
+```
+
+* **Only asynchronously:** `neg[h] msg`. A positive client handle (`h msg`) signals `'nyi`. `neg[h][]` is accepted
+  and does nothing, as nothing is held back.
+* **Sending does not wait.** Each connection has a queue and a thread that writes it, so a client that reads slowly
+  holds up no one else. What a request sends to its own client arrives before the answer. `.z.W` gives the bytes that
+  wait for each handle.
+* **A client that falls behind is disconnected** when more than 256 MB of messages wait for it (`kix-serve --max-queue
+  MB`, 0 for no limit; from Rust, `IpcConfig::queue_limit`), and `.z.pc` is called. Answers to its requests do not
+  count. kdb+ has no such limit.
+* `hclose` of a client's handle does not call `.z.pc`. A client may be given 10 seconds to take what was queued.
+* On Windows the two threads of a connection that the server dropped end only when the client closes it or reads; the
+  handle and the queued messages are released at once.
+* Any client that is let in can send to any other, which may run what it receives. Define `.z.pg` and `.z.ps` to
+  restrict it.
+* A cluster's control node does not send to its clients (`'nyi`).
 
 ## Concurrency
 
 Statements that only read run side by side, each on the data as it was when it started, and a change does not wait for
 them. A statement that changes anything runs alone. So does one that may: it assigns a name, calls a function or a view,
-applies a number (a connection handle) to something, or uses a verb such as `insert`, `upsert`, `set`, `get`, `value`,
+applies a number (a connection handle) or `neg h` to something, or uses a verb such as `insert`, `upsert`, `set`, `get`, `value`,
 `eval`, `system`, `show` or `hopen`. A script runs beside others only if all its statements do. A change made
 while a read is running first copies the list of global variables, which takes time in proportion to their number (about
 0.01 ms with 1,000 and 3 ms with 100,000).
@@ -70,6 +98,17 @@ h (`upsert; `trade; (09:30:00; `AAPL; 180.0; 100))     / a functional message
 (neg h) "x: 1"                                          / asynchronous
 hclose h
 ```
+
+A kixDB client receives what the server sends: `h[]` waits for the next message, which allows a deferred synchronous
+call. Messages that arrive while an answer is awaited are kept for it, in order. It does not run a message by itself
+while it is idle.
+
+```q
+(neg h) "neg[.z.w] (`result; 6*7)"; h[]                / (`result;42)
+```
+
+`h[]` (or `h (::)`) waits as long as it takes, and in a server it holds the workspace meanwhile, as any synchronous
+call does. From Rust, `IpcClient::receive` does the same.
 
 `hopen` takes `` `:host:port ``, `` `:host:port:user:password ``, `` `::port `` or a port number on this machine
 (`tcps://` before the host for TLS). Without a user and password it sends the current user name with an empty password. A

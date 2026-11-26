@@ -44,7 +44,7 @@ impl Engine<'_> {
         let arguments = || command_line(std::env::args_os().map(|a| a.to_string_lossy().into_owned()).collect());
         // the handles of the clients that are connected, and of the connections this session made
         let handles = || {
-            let mut all: Vec<i32> = self.ws.host.clients.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect();
+            let mut all: Vec<i32> = self.ws.host.clients.lock().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
             all.extend(self.session.handles.iter().filter(|h| matches!(h.1, Handle::Server(_))).map(|h| *h.0));
             all.sort_unstable();
             all
@@ -56,7 +56,11 @@ impl Engine<'_> {
             ".z.w" => K::Int(self.session.client.map_or(0, |c| c.0)),
             ".z.H" => ints(Attr::Sorted, handles()),
             ".z.W" => {
-                let (keys, waiting) = (handles(), vec![0; handles().len()]);
+                // the bytes that wait to be sent on each (a server is sent to at once)
+                let keys = handles();
+                let clients = self.ws.host.clients.lock().unwrap_or_else(|e| e.into_inner());
+                let queued = |h| clients.get(h).map_or(0, |c| i32::try_from(c.waiting()).unwrap_or(i32::MAX));
+                let waiting = keys.iter().map(queued).collect();
                 K::Dict(Arc::new(Dict { keys: Box::new(ints(Attr::None, keys)), vals: Box::new(ints(Attr::None, waiting)) }))
             }
             ".z.c" => K::Int(std::thread::available_parallelism().map_or(1, |n| n.get() as i32)),
