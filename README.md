@@ -11,7 +11,7 @@ has not been tested against a kdb+ installation.
 ```
 cargo run --release --bin kix                      # q) prompt, in memory
 cargo run --release --bin kix -- mydata            # durable workspace in ./mydata
-cargo run --release --bin kix-serve -- mydata      # kdb+ IPC server on 127.0.0.1:5000
+cargo run --release --bin kix-serve -- mydata      # kdb+ IPC server on 127.0.0.1:5000 (--allow-shell: see below)
 cargo run --release --bin kix -- --connect :5000   # shell attached to a server
 cargo run --release --features gui --bin kix-gui   # desktop app
 ```
@@ -22,6 +22,9 @@ q)select vwap: size wavg price by sym from trade
 q)quote: ([] time: 09:29:00 09:30:30; sym: `AAPL`MSFT; bid: 179.5 399.5)
 q)aj[`sym`time; trade; quote]
 ```
+
+Shell commands (`\ls`, `system "ls"`) run in a shell that serves no clients; a server runs them only with
+`--allow-shell`, as [any client then can run programs](docs/ipc.md#shell-commands).
 
 As a library:
 
@@ -70,7 +73,7 @@ it out of `kix-serve` and `kix-gui`; the cluster's programs always use it.
 
 * [Language](docs/language.md)
 * [Storage](docs/storage.md)
-* [IPC and TLS](docs/ipc.md)
+* [IPC, TLS and shell commands](docs/ipc.md)
 * [Shell and desktop app](docs/shell-and-gui.md)
 * [Distributed edition](docs/distributed.md)
 * [Benchmarks (TPC-H and TPC-DS)](docs/benchmarks.md)

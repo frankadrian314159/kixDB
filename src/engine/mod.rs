@@ -14,6 +14,7 @@ pub mod par;
 pub mod pure;
 pub mod qsql;
 pub mod rows;
+mod shell;
 pub mod writes;
 pub mod tree;
 
@@ -134,6 +135,12 @@ impl<T: Clone> DerefMut for Shared<T> {
 pub struct Host {
     /// The clients that are connected, by their handles.
     pub clients: Mutex<BTreeMap<i32, crate::ipc::Outbox>>,
+    /// The handles that `hopen` gave, which every session may use.
+    pub handles: Mutex<BTreeMap<i32, files::Handle>>,
+    /// The thread that runs what servers send, woken when something arrives.
+    pub events: Arc<Mutex<Option<std::thread::Thread>>>,
+    /// Whether commands of the operating system may be run.
+    pub shell: AtomicBool,
     /// The interval of the timer (`\t`), 0 for none.
     pub timer_ms: AtomicU64,
     /// Set on a cluster's control node, which does not make the callbacks in `NOT_ON_A_CLUSTER`.
@@ -223,10 +230,9 @@ pub struct SessionState {
     pub id: u64,
     pub login: String,
     pub current_ns: String,
-    pub handles: HashMap<i32, files::Handle>,
     /// `\P` and `\c`.
     pub display: crate::display::Settings,
-    /// For a client's connection, its handle (`.z.w`) and IPv4 address (`.z.a`).
+    /// While a client's connection or a server's message is served, its handle (`.z.w`) and IPv4 address (`.z.a`).
     pub client: Option<(i32, i32)>,
     /// Set (from any thread) to stop what the session is evaluating before its next step, with `'stop`.
     pub cancel: Arc<AtomicBool>,
@@ -238,7 +244,6 @@ impl SessionState {
             id,
             login: login.into(),
             current_ns: String::new(),
-            handles: HashMap::new(),
             display: Default::default(),
             client: None,
             cancel: Arc::default(),
@@ -317,6 +322,24 @@ impl<'a> Engine<'a> {
     /// What `show` and `0N!` have printed since the last call.
     pub(crate) fn take_messages(&mut self) -> Vec<String> {
         std::mem::take(&mut self.messages)
+    }
+
+    /// The value of a message as a connection sends them: code, or a function (or its name) and its arguments.
+    pub fn eval_message(&mut self, msg: &K) -> KResult<K> {
+        match msg {
+            K::Char(c) => self.eval_str(&(*c as char).to_string()),
+            K::Vector(ColVec::Char(_, code)) => self.eval_str(&String::from_utf8_lossy(code)),
+            K::Vector(ColVec::General(_, items)) if !items.is_empty() => {
+                let function = match &items[0] {
+                    K::Sym(s) => self.get_var(*s)?,
+                    K::Vector(ColVec::Char(_, code)) => self.eval_str(&String::from_utf8_lossy(code))?,
+                    other => other.clone(),
+                };
+                let args: Vec<Option<K>> = items[1..].iter().cloned().map(Some).collect();
+                self.apply_value(&function, &args)
+            }
+            other => Ok(other.clone()),
+        }
     }
 
     pub fn eval_str(&mut self, src: &str) -> KResult<K> {
@@ -1104,9 +1127,10 @@ impl<'a> Engine<'a> {
             "load" | "rload" => self.load(x),
             "system" => {
                 let s = x.as_str().ok_or_else(|| KError::ty("system expects string"))?;
+                let s = s.trim();
                 let (cmd, arg) = match s.find(char::is_whitespace) {
                     Some(p) => (&s[..p], s[p..].trim()),
-                    None => (s.as_str(), ""),
+                    None => (s, ""),
                 };
                 self.eval_sys_cmd(cmd, arg)
             }
@@ -2185,6 +2209,10 @@ impl<'a> Engine<'a> {
                 Ok(K::Null)
             }
             "\\" => Ok(K::Null),
+            "cd" if arg.is_empty() => Ok(K::string(&self.directory()?.to_string_lossy())),
+            "cd" => Err(KError::nyi("changing the directory")),
+            // (q's own commands are `ts`, `cd` and single characters: any other is the operating system's)
+            _ if cmd.chars().count() > 1 => self.shell(format!("{cmd} {arg}").trim_end()),
             _ => Err(KError::nyi(format!("unknown system command \\{cmd}"))),
         }
     }

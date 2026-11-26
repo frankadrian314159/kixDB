@@ -75,7 +75,7 @@ fn opening_messages_and_closing_are_heard() {
 fn the_timer_and_value_set_are_called() {
     let server = Server::new();
     let mut c = server.connect();
-    let _timer = server.start_timer();
+    let _timer = server.start_background();
     for statement in ["ticks: 0", ".z.ts: {ticks:: 1 + ticks; at:: x}", "\\t 5"] {
         c.eval(statement).unwrap();
     }

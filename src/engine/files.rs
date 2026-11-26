@@ -1,7 +1,7 @@
 //! Files and handles: `hsym`, `hdel`, `key`, `read0`, `read1`, `save`, `load`, `rsave`, `.Q.fs`, the handles of
 //! `hopen` (to a file as well as to a server), and sending through a handle, the clients' too. Relative paths are taken
 //! from the workspace's directory, if it has one.
-use crate::engine::{ops, Engine};
+use crate::engine::{ops, Engine, Host};
 use crate::error::{KError, KResult};
 use crate::ipc::{encode_k_payload, IpcClient, Outbox};
 use crate::storage;
@@ -10,12 +10,47 @@ use crate::types::*;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// What a handle that `hopen` gave leads to.
+#[derive(Clone, Debug)]
 pub enum Handle {
-    Server(IpcClient),
+    Server(Arc<Mutex<IpcClient>>),
     File(PathBuf),
+}
+
+fn locked<T>(shared: &Mutex<T>) -> MutexGuard<'_, T> {
+    shared.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Host {
+    pub(crate) fn handles(&self) -> MutexGuard<'_, std::collections::BTreeMap<i32, Handle>> {
+        locked(&self.handles)
+    }
+
+    /// The handle of the connection to a server `h`, if it is one.
+    fn server(&self, h: i32) -> Option<Arc<Mutex<IpcClient>>> {
+        match self.handles().get(&h) {
+            Some(Handle::Server(server)) => Some(server.clone()),
+            _ => None,
+        }
+    }
+
+    /// A message that a server has sent and nothing has taken, looking at the handles after `after` first (so that each
+    /// gets its turn): the handle, and the message, or `None` if the connection has ended, which closes the handle.
+    pub(crate) fn next_sent(&self, after: i32) -> Option<(i32, Option<KResult<K>>)> {
+        let mut handles = self.handles();
+        let mut order: Vec<i32> = handles.keys().copied().collect();
+        order.sort_by_key(|&h| h <= after);
+        let (h, message) = order.into_iter().find_map(|h| match handles.get(&h) {
+            Some(Handle::Server(server)) => locked(server).pending().map(|message| (h, message)),
+            _ => None,
+        })?;
+        if message.is_none() {
+            handles.remove(&h);
+        }
+        Some((h, message))
+    }
 }
 
 /// The server a handle's name gives, as `(host:port, user, password)`: it is written `host:port[:user:password]` after
@@ -51,7 +86,7 @@ pub fn hsym(x: &K) -> KResult<K> {
 }
 
 /// The lines of `bytes`, without their ends.
-fn lines(bytes: &[u8]) -> Vec<K> {
+pub(crate) fn lines(bytes: &[u8]) -> Vec<K> {
     let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
     if bytes.is_empty() {
         return vec![];
@@ -115,8 +150,13 @@ impl Engine<'_> {
             K::Int(_) | K::Long(_) => format!("::{}", x.as_i64()?),
             _ => x.as_str().ok_or_else(|| KError::ty("hopen expects `:host:port, `:file or a port"))?,
         };
+        self.ws.writable()?;
         let handle = match self.connect_to(&name) {
-            Some(client) => Handle::Server(client?),
+            Some(client) => {
+                let events = self.ws.host.events.clone();
+                let arrived = move || locked(&events).iter().for_each(std::thread::Thread::unpark);
+                Handle::Server(Arc::new(Mutex::new(client?.listen(arrived)?)))
+            }
             None => {
                 let path = storage::path_of(self.ws, &K::sym(&name))?;
                 storage::create_parent(&path)?;
@@ -125,16 +165,18 @@ impl Engine<'_> {
             }
         };
         // (the lowest number that is free)
-        let h = (3..).find(|h| !self.session.handles.contains_key(h)).unwrap_or(i32::MAX);
-        self.session.handles.insert(h, handle);
+        let mut handles = self.ws.host.handles();
+        let h = (3..).find(|h| !handles.contains_key(h)).unwrap_or(i32::MAX);
+        handles.insert(h, handle);
         Ok(K::Int(h))
     }
 
     /// `hclose` of a handle of `hopen`'s, or of a client's, which is sent what waits for it and then disconnected.
     pub(crate) fn eval_hclose(&mut self, x: &K) -> KResult<K> {
         let h = (x.as_i64()? as i32).saturating_abs();
-        if self.session.handles.remove(&h).is_none() {
-            if let Some(client) = self.ws.host.clients.lock().unwrap_or_else(|e| e.into_inner()).remove(&h) {
+        self.ws.writable()?;
+        if self.ws.host.handles().remove(&h).is_none() {
+            if let Some(client) = locked(&self.ws.host.clients).remove(&h) {
                 client.close();
             }
         }
@@ -143,7 +185,7 @@ impl Engine<'_> {
 
     /// The connected client with the handle `h`.
     fn client(&self, h: i32) -> Option<Outbox> {
-        self.ws.host.clients.lock().unwrap_or_else(|e| e.into_inner()).get(&h).cloned()
+        locked(&self.ws.host.clients).get(&h).cloned()
     }
 
     /// `x` as an open handle, negative for the asynchronous form.
@@ -154,23 +196,24 @@ impl Engine<'_> {
             _ => return None,
         };
         let to = h.saturating_abs();
-        (self.session.handles.contains_key(&to) || self.client(to).is_some()).then_some(h)
+        (self.ws.host.handles().contains_key(&to) || self.client(to).is_some()).then_some(h)
     }
 
     /// Apply an open handle to `x`: a server is asked (`h`) or told (`neg h`), a client can only be told, and a file is
     /// added to. With nothing to send, `h[]` waits for the server's next message and `neg[h][]` does nothing, as
     /// nothing is held back.
     pub(crate) fn apply_handle(&mut self, h: i32, x: K) -> KResult<K> {
-        match self.session.handles.get_mut(&h.saturating_abs()) {
-            Some(Handle::Server(client)) if x == K::Null && h > 0 => client.receive(),
+        // (a copy of the workspace sends nothing: the statement may be run again)
+        self.ws.writable()?;
+        let held = self.ws.host.handles().get(&h.saturating_abs()).cloned();
+        match held {
+            Some(Handle::Server(server)) if x == K::Null && h > 0 => locked(&server).receive(),
             _ if h < 0 && x == K::Null => Ok(K::Null),
-            Some(Handle::File(path)) => append(path, &x, h < 0).map(|_| K::Int(h)),
-            Some(Handle::Server(client)) if h > 0 => client.query_k(&x),
-            Some(Handle::Server(client)) => client.send_async_k(&x).map(|_| K::Null),
+            Some(Handle::File(path)) => append(&path, &x, h < 0).map(|_| K::Int(h)),
+            Some(Handle::Server(server)) if h > 0 => locked(&server).query_k(&x),
+            Some(Handle::Server(server)) => locked(&server).send_async_k(&x).map(|_| K::Null),
             None if h > 0 => Err(KError::nyi("a synchronous call to a client (send to it with neg)")),
             None => {
-                // (a copy of the workspace sends nothing: the statement may be run again)
-                self.ws.writable()?;
                 let client = self.client(-h).ok_or_else(|| KError::ipc("closed handle"))?;
                 client.push(Arc::new(encode_k_payload(&x.untagged())));
                 Ok(K::Null)
@@ -191,7 +234,7 @@ impl Engine<'_> {
         };
         let handles = handles.ok_or_else(|| KError::ty("-25! takes handles"))?;
         let handles: Vec<i32> = handles.into_iter().map(|h| i32::try_from(h).unwrap_or(0)).collect();
-        let open = |h: &i32| matches!(self.session.handles.get(h), Some(Handle::Server(_))) || self.client(*h).is_some();
+        let open = |h: &i32| self.ws.host.server(*h).is_some() || self.client(*h).is_some();
         if !handles.iter().all(open) {
             return Err(KError::ipc("-25!: not all of the handles are open connections"));
         }
@@ -199,9 +242,9 @@ impl Engine<'_> {
         let message = message.untagged();
         let payload = Arc::new(encode_k_payload(&message));
         for h in handles {
-            match self.session.handles.get_mut(&h) {
-                Some(Handle::Server(server)) => server.send_async_k(&message)?,
-                _ => self.client(h).into_iter().for_each(|c| c.push(payload.clone())),
+            match self.ws.host.server(h) {
+                Some(server) => locked(&server).send_async_k(&message)?,
+                None => self.client(h).into_iter().for_each(|c| c.push(payload.clone())),
             }
         }
         Ok(K::Null)

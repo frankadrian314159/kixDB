@@ -42,10 +42,10 @@ impl Engine<'_> {
     pub(crate) fn system_value(&self, name: &str) -> Option<K> {
         let host = || gethostname::gethostname().to_string_lossy().into_owned();
         let arguments = || command_line(std::env::args_os().map(|a| a.to_string_lossy().into_owned()).collect());
-        // the handles of the clients that are connected, and of the connections this session made
+        // the handles of the clients that are connected, and of the connections that were made to servers
         let handles = || {
             let mut all: Vec<i32> = self.ws.host.clients.lock().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
-            all.extend(self.session.handles.iter().filter(|h| matches!(h.1, Handle::Server(_))).map(|h| *h.0));
+            all.extend(self.ws.host.handles().iter().filter(|h| matches!(h.1, Handle::Server(_))).map(|h| *h.0));
             all.sort_unstable();
             all
         };

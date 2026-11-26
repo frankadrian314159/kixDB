@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! kix [DATA_DIR | SCRIPT.q] [-D dir] [-p port] [--connect host[:port]] [-U user -P pass]
-//!     [-q|-Q expr]... [-f|-i script.q]...
+//!     [-q|-Q expr]... [-f|-i script.q]... [--allow-shell]
 //! ```
 use kixdb::inspect::ObjectKind;
 use kixdb::ipc::{IpcClient, IpcConfig, Listener};
@@ -42,17 +42,20 @@ Dot commands:
   .checkpoint                fold WAL into an atomic snapshot now
   .help                      show this help";
 
-const USAGE: &str = "usage: kix [DATA_DIR | SCRIPT.q] [-D dir] [-p port] [--connect host[:port]] [-U user -P pass] [-Q expr]... [-i script.q]... [-- ARGS]
+const USAGE: &str = "usage: kix [DATA_DIR | SCRIPT.q] [-D dir] [-p port] [--connect host[:port]] [-U user -P pass] [-Q expr]... [-i script.q]... [--allow-shell] [-- ARGS]
 
 Without a data directory the workspace lives in memory only. Passing a .q file loads it before entering the REPL
 (or exits if -Q/-q is also given). --connect attaches the shell to a remote kix-serve / kix-cluster over kdb+ IPC.
-Arguments after -- are the script's own, in .z.x.";
+Arguments after -- are the script's own, in .z.x.
+Shell commands (\\ls) run unless the shell listens for clients (-p, \\p), which then needs --allow-shell.";
 
 enum Target {
     Local {
         conn: Connection,
         server: Server,
         listener: Option<Listener>,
+        /// Keep shell commands on while listening (`--allow-shell`).
+        allow_shell: bool,
     },
     Remote {
         client: IpcClient,
@@ -75,6 +78,7 @@ fn main() -> ExitCode {
     let mut remote_addr: Option<String> = None;
     let mut user = String::from("admin");
     let mut pass = String::new();
+    let mut allow_shell = false;
     let opts = StorageOptions::default();
 
     let bad = |m: &str| {
@@ -85,6 +89,7 @@ fn main() -> ExitCode {
     while let Some(a) = args.next() {
         match a.as_str() {
             "--" => break,
+            "--allow-shell" => allow_shell = true,
             "-h" | "--help" | "-?" => {
                 println!("{USAGE}\n\n{HELP}");
                 return ExitCode::SUCCESS;
@@ -153,8 +158,9 @@ fn main() -> ExitCode {
             },
             None => Server::new(),
         };
+        server.allow_shell_commands(true);
         let listener = match listen_port {
-            Some(p) => match Listener::bind(server.clone(), ("127.0.0.1", p), IpcConfig::default()) {
+            Some(p) => match listen(&server, p, allow_shell) {
                 Ok(l) => Some(l),
                 Err(e) => {
                     eprintln!("cannot listen on port {p}: {e}");
@@ -164,13 +170,13 @@ fn main() -> ExitCode {
             None => None,
         };
         let conn = server.connect_as_trusted(&user);
-        Target::Local { conn, server, listener }
+        Target::Local { conn, server, listener, allow_shell }
     };
 
     let mut sh = Shell { target, timer: false, failed: false };
     // (stopped before the workspace closes)
-    let _timer = match &sh.target {
-        Target::Local { server, .. } => Some(server.start_timer()),
+    let _background = match &sh.target {
+        Target::Local { server, .. } => Some(server.start_background()),
         Target::Remote { .. } => None,
     };
     for s in &preload_scripts {
@@ -201,6 +207,11 @@ fn main() -> ExitCode {
     sh.repl(interactive);
     sh.leave(0);
     ExitCode::SUCCESS
+}
+
+/// Listen for clients on this machine's `port`.
+fn listen(server: &Server, port: u16, allow_shell: bool) -> kixdb::KResult<Listener> {
+    Listener::bind(server.clone(), ("127.0.0.1", port), IpcConfig { allow_shell, ..IpcConfig::default() })
 }
 
 impl Shell {
@@ -300,14 +311,14 @@ impl Shell {
     }
 
     fn handle_port_cmd(&mut self, arg: &str) {
-        if let Target::Local { server, listener, .. } = &mut self.target {
+        if let Target::Local { server, listener, allow_shell, .. } = &mut self.target {
             if arg.is_empty() {
                 let p = listener.as_ref().map(|l| l.local_addr().port() as i32).unwrap_or(0);
                 println!("{p}i");
             } else if arg == "0" {
                 *listener = None;
             } else if let Ok(p) = arg.parse::<u16>() {
-                match Listener::bind(server.clone(), ("127.0.0.1", p), IpcConfig::default()) {
+                match listen(server, p, *allow_shell) {
                     Ok(l) => *listener = Some(l),
                     Err(e) => eprintln!("{e}"),
                 }

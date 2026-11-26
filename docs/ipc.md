@@ -1,4 +1,4 @@
-# IPC and TLS
+# IPC, TLS and shell commands
 
 `kix-serve`, `kix -p`, `kix-gui` and `kix-cluster` speak the kdb+ binary IPC protocol (version 3): the
 `user:password` handshake, synchronous, asynchronous and response messages, error replies, and message compression.
@@ -9,14 +9,15 @@ linked columns are sent as their plain values.
 
 ```
 kix-serve [DATA_DIR] [-p PORT] [--bind ADDR] [-u USER:PASSWORD] [--tls-cert FILE --tls-key FILE | --tls] [--force-tls]
-          [--insecure-clients] [--no-sync] [--max-queue MB]
+          [--insecure-clients] [--no-sync] [--max-queue MB] [--allow-shell]
 ```
 
 It listens on `127.0.0.1:5000` by default. **Without `-u` (or `KIX_AUTH=user:password`) any client is accepted**, and a
 client can run any q, including reading and writing files. So `kix-serve` and `kix-cluster` listen on an address other
 machines can reach only with a password **and** `--force-tls` (with `--tls` or `--tls-cert` and `--tls-key`).
 `--insecure-clients` lifts this, with a warning; use it only where something else keeps strangers away from the port.
-The shell (`kix -p`) and `kix-gui` listen on this machine only.
+The shell (`kix -p`) and `kix-gui` listen on this machine only. A handshake with a line break in it is refused, so
+that a web page cannot have a browser send q to a server on its machine as the body of an HTTP request.
 
 Compressed messages are always accepted. Replies over 2,000 bytes are compressed for clients on other machines.
 
@@ -27,8 +28,8 @@ A function assigned to one of these names is called by `kix-serve`, `kix -p` and
 | Name | Called with | When |
 | --- | --- | --- |
 | `.z.pw` | user (symbol), password (string) | a client connects, after `-u`; only `1b` lets it in |
-| `.z.po`, `.z.pc` | the client's handle | after a client is let in, and after it leaves |
-| `.z.pg`, `.z.ps` | the message | a synchronous or asynchronous request, in place of evaluating it |
+| `.z.po`, `.z.pc` | the client's handle | after a client is let in, and after it leaves (`.z.pc` also when a server that was connected to closes) |
+| `.z.pg`, `.z.ps` | the message | a synchronous or asynchronous request, in place of evaluating it (`.z.ps` also what a server sends) |
 | `.z.bm` | `(handle; bytes)` | a message cannot be read; the connection is then closed |
 | `.z.ts` | the time (UTC timestamp) | every `\t` milliseconds, in `kix` and `kix-serve` |
 | `.z.vs` | name, `()` | a global in the root namespace is set (the indices of an amend are not given) |
@@ -75,6 +76,32 @@ hclose first subs                              / send what waits, then disconnec
   restrict it.
 * A cluster's control node does not send to its clients (`'nyi`).
 
+## Shell commands
+
+`\cmd` and `system "cmd"` run what is not one of q's own commands in the system's shell (`cmd /C` on Windows, else
+`sh -c`) and give the lines it prints. `\cd` gives the directory commands run in, which is where relative paths start:
+the workspace's directory, else the process's. (`\cd dir` is not implemented.)
+
+```q
+system "ls data"                    / or \ls data
+```
+
+* **A process that serves clients runs none** (`'access`) unless it was started with `--allow-shell` (`kix-serve`,
+  `kix`, `kix-gui`; from Rust, `IpcConfig::allow_shell`). This holds for the whole process, its console and timer
+  included, because a client can define what they run. A `kix` shell that does not listen, and the desktop app's
+  `--embedded` workspace, run them. A library `Server` runs none until `allow_shell_commands(true)`.
+* **With `--allow-shell`, every client that is let in can run any program** as the user running the server. Give `-u`,
+  and keep strangers off the port.
+* **Without it a client is still not confined:** q reads and writes any file that the server's user can, which can be
+  turned into running a program (a start-up script, say). Let in only clients you trust.
+* A durable workspace keeps functions and callbacks: what a client left there runs shell commands if the directory is
+  later opened by a process that allows them.
+* A command holds the workspace until it ends, and cannot be stopped from q. To leave a program running, start it in
+  the background with its output sent elsewhere (`system "prog >log 2>&1 &"`; on Windows, `start /b`).
+* A command that fails signals `'os`; what it prints as errors goes to the process's console. `system` does not pass
+  q's own commands to the shell: those are `\ts`, `\cd` and any single character.
+* A cluster's nodes run none.
+
 ## Concurrency
 
 Statements that only read run side by side, each on the data as it was when it started, and a change does not wait for
@@ -99,22 +126,44 @@ h (`upsert; `trade; (09:30:00; `AAPL; 180.0; 100))     / a functional message
 hclose h
 ```
 
-A kixDB client receives what the server sends: `h[]` waits for the next message, which allows a deferred synchronous
-call. Messages that arrive while an answer is awaited are kept for it, in order. It does not run a message by itself
-while it is idle.
-
-```q
-(neg h) "neg[.z.w] (`result; 6*7)"; h[]                / (`result;42)
-```
-
-`h[]` (or `h (::)`) waits as long as it takes, and in a server it holds the workspace meanwhile, as any synchronous
-call does. From Rust, `IpcClient::receive` does the same.
+Handles belong to the process, as in q: every session and client of it can use one, with the login that opened it, and
+it stays open until `hclose`.
 
 `hopen` takes `` `:host:port ``, `` `:host:port:user:password ``, `` `::port `` or a port number on this machine
 (`tcps://` before the host for TLS). Without a user and password it sends the current user name with an empty password. A
 name without a port is a file's ([storage.md](storage.md#files-and-tables-on-disk)); earlier versions took
 `` `:host `` to be port 5000. From Rust, `kixdb::ipc::IpcClient::connect_addr(addr, user,
 password)` connects with one.
+
+### Receiving
+
+`kix` and `kix-serve` run what a server sends while they do nothing else, so a subscriber only has to define what is
+called:
+
+```q
+trade: ([] sym:`symbol$(); price:`float$())
+upd: {[t; rows] t insert rows}
+h: hopen `:localhost:5000
+h "sub[]"                                             / the publisher then sends (`upd; `trade; rows)
+.z.pc: {if[x = h; show "the publisher has gone"]}
+```
+
+* A message is run as a client's asynchronous one is: by `.z.ps` if there is one, with `.z.w` the handle, so that
+  `neg[.z.w] msg` replies. An error is printed, and the connection stays.
+* Messages from one server are run in order, one at a time, between statements and timer calls. When the process falls
+  behind they wait at the server, which in kixDB disconnects a client that falls too far behind.
+* When the server closes the connection, `.z.pc` is called with the handle, which is then closed.
+* `h[]` waits for the next message instead, which allows a deferred synchronous call. **Ask for it in the same
+  statement or function**, or the message may be run before `h[]` is:
+
+```q
+(neg h) "neg[.z.w] (`result; 6*7)"; h[]                / (`result;42)
+```
+
+* `h[]` (or `h (::)`) waits as long as it takes, holding the workspace meanwhile, as any synchronous call does.
+* A synchronous request from the server is refused (`'nyi`).
+* The desktop app and library `Server`s run nothing by themselves: `h[]` takes the messages. From Rust,
+  `Server::start_background` runs them (and the timer), and `IpcClient::receive` takes one.
 
 ## TLS
 

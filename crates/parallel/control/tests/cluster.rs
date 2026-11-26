@@ -407,6 +407,8 @@ fn callbacks_a_cluster_cannot_make_are_refused() {
     for statement in [".z.pg: {'denied}", ".z.ps: {x}", "`.z.ts set {x}", ".z.vs: {[n; i] n}"] {
         assert_eq!(client.query_str(statement).err().map(|e| e.signal), Some("nyi".into()), "{statement}");
     }
+    // nor does a node run shell commands
+    assert_eq!(client.query_str("system \"echo hi\"").err().map(|e| e.signal), Some("access".into()));
     // nor is anything sent to a client
     assert_eq!(client.query_str("(neg .z.w) 1").err().map(|e| e.signal), Some("nyi".into()));
     assert_eq!(client.query_str("count trade").unwrap(), K::Long(240));

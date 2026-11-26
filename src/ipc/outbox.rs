@@ -4,10 +4,11 @@
 //! written by whichever thread holds it, the writer's or, for an answer that need not wait its turn, the connection's.
 use super::{write_ipc_frame, MSG_ASYNC, MSG_RESPONSE};
 use crate::error::{KError, KResult};
-use rustls::{ServerConnection, StreamOwned};
+use rustls::{ConnectionCommon, SideData, StreamOwned};
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
+use std::ops::DerefMut;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
@@ -213,67 +214,55 @@ impl Outbox {
 
 // ----- A connection's two halves --------------------------------------------
 
-/// A client's connection as it is while it logs in.
-pub(super) enum Incoming {
-    Plain(TcpStream),
-    Tls(Box<StreamOwned<ServerConnection, TcpStream>>),
-}
-
-impl Read for Incoming {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self {
-            Incoming::Plain(s) => s.read(buf),
-            Incoming::Tls(s) => s.read(buf),
-        }
-    }
-}
-
-impl Write for Incoming {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self {
-            Incoming::Plain(s) => s.write(buf),
-            Incoming::Tls(s) => s.write(buf),
-        }
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        match self {
-            Incoming::Plain(s) => s.flush(),
-            Incoming::Tls(s) => s.flush(),
-        }
-    }
-}
-
 /// The halves of a connection: what is read from and what is written to.
-type Halves = (Box<dyn Read>, Box<dyn Write + Send>);
+type Halves = (Box<dyn Read + Send>, Box<dyn Write + Send>);
 
-impl Incoming {
-    pub(super) fn split(self) -> io::Result<Halves> {
-        Ok(match self {
-            Incoming::Plain(socket) => (Box::new(socket.try_clone()?), Box::new(socket)),
-            Incoming::Tls(stream) => {
-                let StreamOwned { conn, sock } = *stream;
-                let tls = Arc::new(Mutex::new(conn));
-                let reader = TlsReader { tls: tls.clone(), socket: sock.try_clone()?, raw: vec![0; 16 << 10], unread: 0..0 };
-                (Box::new(reader), Box::new(TlsWriter { tls, socket: sock }))
-            }
-        })
+/// A connection's byte stream, plain TCP or TLS over it, which can be split once it has logged in, so that one thread
+/// reads it while another writes.
+pub(super) trait Wire: Read + Write + Send {
+    fn socket(&self) -> &TcpStream;
+    fn split(self: Box<Self>) -> io::Result<Halves>;
+}
+
+impl Wire for TcpStream {
+    fn socket(&self) -> &TcpStream {
+        self
+    }
+    fn split(self: Box<Self>) -> io::Result<Halves> {
+        Ok((Box::new(self.try_clone()?), self))
     }
 }
 
-fn locked(tls: &Mutex<ServerConnection>) -> MutexGuard<'_, ServerConnection> {
+impl<C, D> Wire for StreamOwned<C, TcpStream>
+where
+    C: DerefMut<Target = ConnectionCommon<D>> + Send + 'static,
+    D: SideData + 'static,
+{
+    fn socket(&self) -> &TcpStream {
+        &self.sock
+    }
+    fn split(self: Box<Self>) -> io::Result<Halves> {
+        let StreamOwned { conn, sock } = *self;
+        let tls = Arc::new(Mutex::new(conn));
+        let reader = TlsReader { tls: tls.clone(), socket: sock.try_clone()?, raw: vec![0; 16 << 10], unread: 0..0 };
+        Ok((Box::new(reader), Box::new(TlsWriter { tls, socket: sock })))
+    }
+}
+
+fn locked<C>(tls: &Mutex<C>) -> MutexGuard<'_, C> {
     tls.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The reading half of a TLS connection. It holds the connection's state only to decrypt, never while it waits.
-struct TlsReader {
-    tls: Arc<Mutex<ServerConnection>>,
+struct TlsReader<C> {
+    tls: Arc<Mutex<C>>,
     socket: TcpStream,
     /// Bytes from the socket, and those of them that have yet to be decrypted.
     raw: Vec<u8>,
     unread: std::ops::Range<usize>,
 }
 
-impl Read for TlsReader {
+impl<C: DerefMut<Target = ConnectionCommon<D>>, D: SideData> Read for TlsReader<C> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
             {
@@ -297,12 +286,12 @@ impl Read for TlsReader {
 }
 
 /// The writing half of a TLS connection, and the only one to write to its socket (so that records leave in order).
-struct TlsWriter {
-    tls: Arc<Mutex<ServerConnection>>,
+struct TlsWriter<C> {
+    tls: Arc<Mutex<C>>,
     socket: TcpStream,
 }
 
-impl TlsWriter {
+impl<C: DerefMut<Target = ConnectionCommon<D>>, D: SideData> TlsWriter<C> {
     /// Give the connection `plain` to encrypt, and send all that it has ready.
     fn send(&mut self, plain: &[u8]) -> io::Result<usize> {
         let mut ready = Vec::new();
@@ -319,7 +308,7 @@ impl TlsWriter {
     }
 }
 
-impl Write for TlsWriter {
+impl<C: DerefMut<Target = ConnectionCommon<D>>, D: SideData> Write for TlsWriter<C> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.send(buf)
     }

@@ -133,7 +133,8 @@ parses to a `.kix.table` form, and `'` applied to a named function appears as `e
 `\a` tables, `\b` views, `\v` variables, `\f` functions, `\d` namespace, `\l` load a script or directory, `\t` and `\ts`
 (with `:n` repetitions) timing, `\t 1000` the timer's interval in milliseconds (`\t 0` stops it), `\x name` removes a
 variable, `\w` workspace statistics, `\P` significant digits of floats, `\c` lines and characters
-of printed output.
+of printed output, `\cd` the directory. Any other `\` command, and `system` of it, runs in the operating system's shell
+where that is allowed ([shell commands](ipc.md#shell-commands)).
 
 ## Printing
 
@@ -167,8 +168,9 @@ A variable assigned one of these names takes its place. Where they differ from k
 ## Not implemented
 
 * `ej` only in bracket form.
-* Deferred responses (`-30!`), a synchronous call to a client, and a process that runs the messages a server sends it
-  while it is idle (a subscriber's `upd`; it can take them with `h[]`, see [ipc.md](ipc.md#client)).
+* Deferred responses (`-30!`) and a synchronous call from a server to a client.
+* `\cd dir`, and q's other commands of one character (`\B \C \e \g \o \p \r \s \S \T \u \W \z \_ \1 \2`; the
+  shell has its own `\p`).
 * The callbacks of web and socket servers (`.z.ph .z.pp .z.pm .z.ac .z.ws .z.wo .z.wc`), `.z.pq` and `.z.pd`: kixdb has
   none of these.
 * `.z.e .z.ex .z.ey .z.k .z.m .z.M .z.zd`.

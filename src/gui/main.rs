@@ -22,6 +22,7 @@ fn main() -> Result<(), eframe::Error> {
     let opts = kixdb::StorageOptions::default();
     let mut target: Option<remote::Target> = None;
     let mut embedded = false;
+    let mut allow_shell = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -68,13 +69,15 @@ fn main() -> Result<(), eframe::Error> {
                 }
             }
             "--embedded" => embedded = true,
+            "--allow-shell" => allow_shell = true,
             "-h" | "--help" => {
                 println!(
-                    "usage: kix-gui [DATA_DIR] [--embedded]\n       \
+                    "usage: kix-gui [DATA_DIR] [--embedded] [--allow-shell]\n       \
                             kix-gui --connect HOST[:PORT] [-U USER] [-P PASSWORD]\n\n\
                      Without --connect, kix-gui connects to 127.0.0.1:5000 if a kix-serve / kix-cluster\n\
                      server is listening there, or starts an in-process IPC server on port 5000.\n\
-                     Use --embedded to run strictly in-process with no TCP port."
+                     Use --embedded to run strictly in-process with no TCP port. Its own server runs shell\n\
+                     commands only with --allow-shell, as any client then can run programs on this machine."
                 );
                 return Ok(());
             }
@@ -98,7 +101,7 @@ fn main() -> Result<(), eframe::Error> {
         let addr: std::net::SocketAddr = ([127, 0, 0, 1], t.port).into();
         if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(300)).is_ok() {
             target = Some(t);
-        } else if let Ok((listener, pw)) = own_server(dir.as_deref(), opts, t.port) {
+        } else if let Ok((listener, pw)) = own_server(dir.as_deref(), opts, t.port, allow_shell) {
             t.password = pw;
             held = Some(listener);
             target = Some(t);
@@ -134,6 +137,7 @@ fn own_server(
     dir: Option<&std::path::Path>,
     opts: kixdb::StorageOptions,
     port: u16,
+    allow_shell: bool,
 ) -> Result<(kixdb::ipc::Listener, String), String> {
     use rand::Rng;
     let server = match dir {
@@ -145,7 +149,8 @@ fn own_server(
         .take(24)
         .map(char::from)
         .collect();
-    let cfg = kixdb::ipc::IpcConfig::with_single_user("admin", &password);
+    let mut cfg = kixdb::ipc::IpcConfig::with_single_user("admin", &password);
+    cfg.allow_shell = allow_shell;
     let listener = kixdb::ipc::Listener::bind(server, ("127.0.0.1", port), cfg).map_err(|e| e.to_string())?;
     Ok((listener, password))
 }
@@ -161,7 +166,7 @@ mod tests {
 
     #[test]
     fn own_ipc_server_accepts_generated_credentials_and_rejects_bad_password() {
-        let (listener, password) = own_server(None, kixdb::StorageOptions::default(), 0).expect("start own IPC server");
+        let (listener, password) = own_server(None, kixdb::StorageOptions::default(), 0, false).expect("start own IPC server");
         let mut t = remote::Target {
             port: listener.local_addr().port(),
             password,
@@ -176,7 +181,7 @@ mod tests {
 
     #[test]
     fn headless_gui_drives_sample_workspace_datasheet_and_remote_ipc() {
-        let (listener, password) = own_server(None, kixdb::StorageOptions::default(), 0).unwrap();
+        let (listener, password) = own_server(None, kixdb::StorageOptions::default(), 0, false).unwrap();
         let target = remote::Target {
             port: listener.local_addr().port(),
             password,

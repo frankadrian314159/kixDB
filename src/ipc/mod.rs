@@ -9,13 +9,14 @@ use crate::parser::parse_script;
 use crate::sym::{intern, resolve};
 use crate::types::*;
 use crate::{Connection, Server};
-use outbox::Incoming;
+use outbox::Wire;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, TryRecvError};
 use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 
@@ -660,10 +661,6 @@ fn uncompress_kdb(comp: &[u8], le: bool) -> KResult<Vec<u8>> {
 
 // ----- IPC Client (`IpcClient`) ---------------------------------------------
 
-/// A connection's byte stream: plain TCP, or TLS over TCP.
-trait Wire: Read + Write + Send {}
-impl<T: Read + Write + Send> Wire for T {}
-
 fn tls_error(e: impl std::fmt::Display) -> KError {
     KError::ipc(format!("TLS: {e}"))
 }
@@ -704,11 +701,40 @@ fn tls_client(tcp: TcpStream, host: &str, ca_file: &str) -> KResult<Box<dyn Wire
     Ok(Box::new(rustls::StreamOwned::new(conn, tcp)))
 }
 
+/// A frame as it is read: its message's type, whether it is little-endian, and the message.
+type Frame = (u8, bool, Vec<u8>);
+
+/// The frames that a listening client reads ahead of what takes them; any more wait with the server.
+const READ_AHEAD: usize = 64;
+
+/// How a client's frames go and come.
+enum Link {
+    /// Both in the caller's thread.
+    Direct(Box<dyn Wire>),
+    /// Written by the caller, and read by a thread that passes them on.
+    Listening(Box<dyn Write + Send>, Receiver<KResult<Frame>>, #[allow(dead_code)] Hangup),
+}
+
+/// Ends our side of a connection when dropped. The server then closes it, which ends the thread that reads it.
+struct Hangup(TcpStream);
+
+impl Drop for Hangup {
+    fn drop(&mut self) {
+        let _ = self.0.shutdown(Shutdown::Write);
+    }
+}
+
 pub struct IpcClient {
-    stream: Box<dyn Wire>,
+    link: Link,
     compress: bool,
     /// Asynchronous messages that arrived while an answer was waited for, in order.
     inbox: VecDeque<KResult<K>>,
+}
+
+impl std::fmt::Debug for IpcClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "IpcClient")
+    }
 }
 
 impl IpcClient {
@@ -760,7 +786,7 @@ impl IpcClient {
             Err(_) => return Err(KError::new("access", "authentication refused by server")),
         }
 
-        Ok(Self { stream, compress, inbox: VecDeque::new() })
+        Ok(Self { link: Link::Direct(stream), compress, inbox: VecDeque::new() })
     }
 
     pub fn query_str(&mut self, q_code: &str) -> KResult<K> {
@@ -768,8 +794,7 @@ impl IpcClient {
     }
 
     pub fn query_k(&mut self, msg: &K) -> KResult<K> {
-        let payload = encode_k_payload(&msg.untagged());
-        write_ipc_frame(&mut *self.stream, MSG_SYNC, &payload, self.compress)?;
+        self.write(MSG_SYNC, &encode_k_payload(&msg.untagged()))?;
         loop {
             match self.read_message()? {
                 (MSG_RESPONSE, answer) => return answer,
@@ -786,21 +811,75 @@ impl IpcClient {
         }
     }
 
-    /// The next message and its type. A request of the server's own is refused: this end only asks.
-    fn read_message(&mut self) -> KResult<(u8, KResult<K>)> {
-        loop {
-            let (kind, le, body) = read_ipc_frame(&mut *self.stream)?;
-            if kind != MSG_SYNC {
-                return Ok((kind, decode_k_endian(&body, 0, le).map(|v| v.0)));
+    pub fn send_async_k(&mut self, msg: &K) -> KResult<()> {
+        self.write(MSG_ASYNC, &encode_k_payload(&msg.untagged()))
+    }
+
+    /// Have a thread of the connection's own read what the server sends, calling `arrived` after each frame, so that
+    /// messages can be taken as they come (`pending`).
+    pub(crate) fn listen(mut self, arrived: impl Fn() + Send + 'static) -> KResult<Self> {
+        let Link::Direct(stream) = self.link else { return Ok(self) };
+        let hangup = Hangup(stream.socket().try_clone()?);
+        let (mut reader, writer) = stream.split()?;
+        let (frames, received) = sync_channel(READ_AHEAD);
+        std::thread::spawn(move || loop {
+            let frame = read_ipc_frame(&mut reader);
+            let ended = frame.is_err();
+            // (once nothing takes them, frames are read and dropped until the server closes)
+            let _ = frames.send(frame);
+            arrived();
+            if ended {
+                break;
             }
-            let refusal = encode_error_payload(&KError::nyi("a synchronous call to a client"));
-            write_ipc_frame(&mut *self.stream, MSG_RESPONSE, &refusal, self.compress)?;
+        });
+        self.link = Link::Listening(writer, received, hangup);
+        Ok(self)
+    }
+
+    /// A message of the server's that nothing has taken, without waiting: `None` if there is none now, `Some(None)` once
+    /// the connection has ended. (Only a listening client finds new ones.)
+    pub(crate) fn pending(&mut self) -> Option<Option<KResult<K>>> {
+        if let Some(message) = self.inbox.pop_front() {
+            return Some(Some(message));
+        }
+        let Link::Listening(_, frames, _) = &self.link else { return None };
+        match frames.try_recv() {
+            Err(TryRecvError::Empty) => None,
+            Ok(Ok(frame)) => match self.open(frame) {
+                Ok(message) => message.map(|m| Some(m.1)),
+                Err(_) => Some(None),
+            },
+            _ => Some(None),
         }
     }
 
-    pub fn send_async_k(&mut self, msg: &K) -> KResult<()> {
-        let payload = encode_k_payload(&msg.untagged());
-        write_ipc_frame(&mut *self.stream, MSG_ASYNC, &payload, self.compress)
+    fn write(&mut self, kind: u8, payload: &[u8]) -> KResult<()> {
+        match &mut self.link {
+            Link::Direct(stream) => write_ipc_frame(&mut **stream, kind, payload, self.compress),
+            Link::Listening(writer, ..) => write_ipc_frame(&mut **writer, kind, payload, self.compress),
+        }
+    }
+
+    /// The message in `frame` and its type. A request of the server's own is refused (`None`): this end only asks.
+    fn open(&mut self, (kind, le, body): Frame) -> KResult<Option<(u8, KResult<K>)>> {
+        if kind != MSG_SYNC {
+            return Ok(Some((kind, decode_k_endian(&body, 0, le).map(|v| v.0))));
+        }
+        self.write(MSG_RESPONSE, &encode_error_payload(&KError::nyi("a synchronous call to a client")))?;
+        Ok(None)
+    }
+
+    /// The next message and its type, waiting for one.
+    fn read_message(&mut self) -> KResult<(u8, KResult<K>)> {
+        loop {
+            let frame = match &mut self.link {
+                Link::Direct(stream) => read_ipc_frame(&mut **stream),
+                Link::Listening(_, frames, _) => frames.recv().unwrap_or_else(|_| Err(KError::ipc("the connection is closed"))),
+            }?;
+            if let Some(message) = self.open(frame)? {
+                return Ok(message);
+            }
+        }
     }
 }
 
@@ -816,6 +895,8 @@ pub struct IpcConfig {
     pub force_tls: bool,
     /// The bytes of asynchronous messages that may wait for a client before it is disconnected (`None`: `QUEUE_LIMIT`).
     pub queue_limit: Option<usize>,
+    /// Let the workspace run shell commands while it serves clients, which then can run programs on this machine.
+    pub allow_shell: bool,
 }
 
 impl IpcConfig {
@@ -853,6 +934,8 @@ impl Listener {
     pub fn bind(server: Server, bind_addr: impl ToSocketAddrs, cfg: IpcConfig) -> KResult<Self> {
         let tcp = TcpListener::bind(bind_addr)?;
         let addr = tcp.local_addr()?;
+        // (whatever a client sets, a callback or the timer included, runs in this process)
+        server.allow_shell_commands(cfg.allow_shell);
         let stop = Arc::new(AtomicBool::new(false));
         let stop_bg = stop.clone();
         let cfg = Arc::new(RwLock::new(cfg));
@@ -920,11 +1003,9 @@ fn handle_client(
         return Err(KError::ipc("plaintext connection rejected (--force-tls)"));
     }
     let socket = tcp.try_clone()?;
-    let mut stream = match tls {
-        Some(t) if is_tls => {
-            Incoming::Tls(Box::new(rustls::StreamOwned::new(rustls::ServerConnection::new(t).map_err(tls_error)?, tcp)))
-        }
-        _ => Incoming::Plain(tcp),
+    let mut stream: Box<dyn Wire> = match tls {
+        Some(t) if is_tls => Box::new(rustls::StreamOwned::new(rustls::ServerConnection::new(t).map_err(tls_error)?, tcp)),
+        _ => Box::new(tcp),
     };
 
     // Read NUL-terminated handshake `"user[:pass][cap]\x00"`
@@ -936,6 +1017,11 @@ fn handle_client(
         }
         if b[0] == 0 {
             break;
+        }
+        // an HTTP request, which a web page can have a browser send to this machine, has line ends, and no user name
+        // does: nothing of it is taken for a message
+        if matches!(b[0], b'\r' | b'\n') {
+            return Err(KError::ipc("not an IPC handshake"));
         }
         hs.push(b[0]);
         if hs.len() > 1024 {
@@ -981,7 +1067,7 @@ fn handle_client(
 
 /// Accept a client that has been let in, and answer its messages until it leaves.
 fn serve_client(
-    mut stream: Incoming,
+    mut stream: Box<dyn Wire>,
     conn: &mut Connection,
     outbox: &Outbox,
     cap: u8,

@@ -31,7 +31,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-pub use callbacks::Timer;
+pub use callbacks::Background;
 pub use engine::{flip_to_resultset, k_to_resultset, BatchResult, DistMode, Event, ResultSet};
 pub use error::{KError, KResult};
 pub use inspect::StoreStats;
@@ -89,6 +89,12 @@ impl Default for Server {
 }
 
 impl Server {
+    /// Let (or stop letting) the workspace run commands of the operating system (`\ls`, `system "ls"`), which it does
+    /// not at first. Binding a `Listener` sets this to what its configuration says.
+    pub fn allow_shell_commands(&self, allow: bool) {
+        self.read_workspace(|ws| ws.host.shell.store(allow, Ordering::SeqCst));
+    }
+
     /// Create a transient in-memory workspace (nothing written to disk).
     pub fn new() -> Self {
         Self {
@@ -324,16 +330,7 @@ impl Connection {
                     return res;
                 }
                 let mut ws = self.server.shared.ws.write().unwrap_or_else(|e| e.into_inner());
-                let mut eng = Engine::new(&mut ws, &mut self.session);
-                let head = &items[0];
-                let func_k = match head {
-                    K::Func(_) => head.clone(),
-                    K::Sym(s) => eng.get_var(*s)?,
-                    K::Vector(ColVec::Char(_, bs)) => eng.eval_str(&String::from_utf8_lossy(bs))?,
-                    other => other.clone(),
-                };
-                let args: Vec<Option<K>> = items[1..].iter().cloned().map(Some).collect();
-                eng.apply_value(&func_k, &args)
+                Engine::new(&mut ws, &mut self.session).eval_message(msg)
             }
             other => Ok(other.clone()),
         }

@@ -67,7 +67,7 @@ fn publishing_to_subscribers() {
     // nothing is sent if any handle is not open
     assert_eq!(text(local.eval("-25!(subs, 4000i; `no)")), "'ipc");
     // from the timer
-    let timer = server.start_timer();
+    let timer = server.start_background();
     local.eval(".z.ts: {n:: n + 1; {neg[x] (`tick; n)} each subs; if[n = 3; system \"t 0\"]}").unwrap();
     local.eval("\\t 5").unwrap();
     for client in &mut clients {
