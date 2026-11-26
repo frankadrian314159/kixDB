@@ -40,7 +40,7 @@ the snapshot: an earlier version discards the log from the first record it canno
 .Q.dpft[`:hdb; 2026.11.24; `sym; `trade]   / write a partition, sorted and parted by sym
 \l hdb                            / mount it
 ("SFJ"; enlist ",") 0: `:file.csv / read CSV with a header row
-`:file.csv 0: "," 0: t            / write CSV
+`:file.csv 0: "," 0: t            / write CSV (fields with commas, quotes or line breaks are quoted)
 ```
 
 Enumerated values are saved with their domain's name, not the domain: save that too to check or follow them after

@@ -532,6 +532,12 @@ fn lex_symbols(src: &str, start: usize) -> (K, usize) {
             while i < len && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'.')) {
                 i += 1;
             }
+            // a web address such as `http://host/page
+            if bytes[i..].starts_with(b"://") {
+                while i < len && !bytes[i].is_ascii_whitespace() && !matches!(bytes[i], b';' | b')' | b']' | b'}' | b',' | b'`' | b'"') {
+                    i += 1;
+                }
+            }
         }
         syms.push(intern(&src[s_start..i]));
     }

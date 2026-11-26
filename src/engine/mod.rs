@@ -4,6 +4,7 @@ pub mod joins;
 pub mod builtins;
 mod enums;
 mod json;
+mod markup;
 pub mod namespaces;
 pub mod ops;
 pub mod par;
@@ -679,7 +680,7 @@ impl<'a> Engine<'a> {
             ".z.u" => Ok(Some(K::Sym(intern(&self.session.login)))),
             ".z.o" => Ok(Some(K::Sym(intern(if cfg!(windows) { "w64" } else if cfg!(target_os = "macos") { "m64" } else { "l64" })))),
             // a variable of the same name takes the place of a built-in of these namespaces
-            _ if [".Q.", ".j.", ".kix."].iter().any(|ns| s.starts_with(ns)) && !self.ws.vars.contains_key(&intern(s)) => {
+            _ if [".Q.", ".h.", ".j.", ".kix."].iter().any(|ns| s.starts_with(ns)) && !self.ws.vars.contains_key(&intern(s)) => {
                 Ok(namespaces::arity(s).map(|_| K::Func(Func::Prim(intern(s)))).or_else(|| namespaces::constant(s)))
             }
             _ => Ok(None),

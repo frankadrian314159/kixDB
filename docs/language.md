@@ -137,7 +137,7 @@ of printed output.
 `` +`c!,1 2 ``). Both round floats to `\P` digits, as `string` does. Files written with `0:` and exported CSV keep every
 digit, unlike kdb+.
 
-## `.Q` and `.j`
+## `.Q`, `.j` and `.h`
 
 | Group | Names |
 | --- | --- |
@@ -148,6 +148,8 @@ digit, unlike kdb+.
 | functions | `.Q.fc .Q.fu .Q.ts .Q.trp .Q.trpd .Q.sbt .Q.bt .Q.v` |
 | command line, memory | `.Q.opt .Q.def .Q.x .Q.gc .Q.w` |
 | JSON | `.j.j .j.jd .j.k` |
+| delimited text, XML, spreadsheets | `.h.cd .h.td .h.d .h.xd .h.ed .h.edsn .h.tx .h.xt` |
+| HTML and escapes | `.h.br .h.code .h.ha .h.hb .h.hc .h.hr .h.hta .h.htac .h.htc .h.html .h.http .h.hu .h.uh .h.hug .h.sc .h.nbr .h.pre .h.text .h.xmp .h.xs .h.iso8601 .h.sa .h.sb .h.c0 .h.c1 .h.ty` |
 
 A variable assigned one of these names takes its place. Where they differ from kdb+:
 
@@ -163,3 +165,5 @@ A variable assigned one of these names takes its place. Where they differ from k
 * `.z` callbacks (`.z.pg`, `.z.ps`, timers), log replay (`-11!`), and the rest of the `.Q` namespace: functions for
   partitioned databases and files, `.Q.hg` and `.Q.hp` (HTTP), `.Q.host`, `.Q.K`, and kdb+ internals (`.Q.ipc`,
   `.Q.prf0`, `.Q.rp`, `.Q.m`).
+* The parts of `.h` that serve web pages (`.h.he .h.hn .h.hp .h.hy .h.ka .h.jx .h.val .h.HOME .h.ht .h.fram .h.logo`):
+  kixdb has no web server.

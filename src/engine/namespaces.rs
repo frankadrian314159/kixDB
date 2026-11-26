@@ -1,7 +1,7 @@
-//! The functions and constants of the `.Q` (utilities) and `.j` (JSON) namespaces, as KX documents them. A variable
-//! assigned the same name takes their place.
+//! The functions and constants of the `.Q` (utilities), `.j` (JSON) and `.h` (text, in `markup`) namespaces, as KX
+//! documents them. A variable assigned the same name takes their place.
 use crate::engine::ops::{self, index_k};
-use crate::engine::{json, Engine};
+use crate::engine::{json, markup, Engine};
 use crate::error::{KError, KResult};
 use crate::parser::is_builtin_verb;
 use crate::sym::{intern, resolve, sym_count, SymId};
@@ -37,7 +37,7 @@ const BASE36_DIGITS: &str = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 const LARGEST_UNPACKED: u64 = 1 << 31;
 
 pub fn arity(name: &str) -> Option<usize> {
-    FUNCTIONS.iter().find(|f| f.0 == name).map(|f| f.1)
+    FUNCTIONS.iter().chain(&markup::FUNCTIONS).find(|f| f.0 == name).map(|f| f.1)
 }
 
 pub fn constant(name: &str) -> Option<K> {
@@ -53,7 +53,7 @@ pub fn constant(name: &str) -> Option<K> {
         ".Q.t" => K::string(" bg xhijefcspmdznuvts"),
         ".Q.k" => K::Float(4.1),
         ".Q.res" => syms(RESERVED.split(' ').map(intern).collect()),
-        _ => return None,
+        _ => return markup::constant(name),
     })
 }
 
@@ -395,7 +395,7 @@ impl Engine<'_> {
                 let target = x.as_str().unwrap_or_else(|| x.cell_text());
                 crate::inspect::workspace_definition(self.ws, &target)?
             }
-            _ => return Err(KError::nyi(name.to_string())),
+            _ => self.markup_call(name, args)?,
         })
     }
 }

@@ -107,3 +107,50 @@ fn json_is_written_and_read() {
         (".j.k \"{oops\"", "'parse"),
     ]);
 }
+
+#[test]
+fn delimited_text_xml_and_spreadsheets() {
+    let mut c = session();
+    c.eval("t: ([] a: 1 2 3; b: `x`y`z)").unwrap();
+    check(&mut c, &[
+        (".h.cd t", "(\"a,b\";\"1,x\";\"2,y\";\"3,z\")"),
+        (".h.cd (`a`b`c; 1 2 3; \"xyz\")", "(\"a,1,x\";\"b,2,y\";\"c,3,z\")"),
+        (".h.td 1 # t", "(\"a\\tb\";\"1\\tx\")"),
+        // fields that need it are quoted, and read back
+        (".h.cd ([] s: (\"a,b\"; \"say \\\"hi\\\"\"))", "(,\"s\";\"\\\"a,b\\\"\";\"\\\"say \\\"\\\"hi\\\"\\\"\\\"\")"),
+        ("((enlist \"*\"; enlist \",\") 0: \",\" 0: ([] s: (\"a,b\"; \"c\"))) `s", "(\"a,b\";,\"c\")"),
+        ("n: ([] c: (1 2; 3 4)); .h.cd n", "(,\"c\";\"1 2\";\"3 4\")"),
+        (".h.d: \"*\"; .h.cd n", "(,\"c\";\"1*2\";\"3*4\")"),
+        (".h.xd 1 # t", "(\"<R>\";\"<r><a>1</a><b>x</b></r>\";\"</R>\")"),
+        ("x: .h.ed t; (count x; x 4)", "(9;\"<Row><Cell><Data ss:Type=\\\"Number\\\">1</Data></Cell><Cell><Data ss:Type=\\\"String\\\">x</Data></Cell></Row>\")"),
+        ("count .h.edsn `p`q!(t; t)", "15"),
+        (".h.tx[`csv] 1 # t", "(\"a,b\";\"1,x\")"),
+        (".h.tx[`json] 2 # t", "(\"{\\\"a\\\":1,\\\"b\\\":\\\"x\\\"}\";\"{\\\"a\\\":2,\\\"b\\\":\\\"y\\\"}\")"),
+        ("(.h.xt[`json; (\"{\\\"foo\\\":\\\"bar\\\"}\"; \"{\\\"this\\\":\\\"that\\\"}\")] 0) `foo", "\"bar\""),
+    ]);
+}
+
+#[test]
+fn markup_and_escapes() {
+    check(&mut session(), &[
+        (".h.xs \"Arthur & Co.\"", "\"Arthur &amp; Co.\""),
+        (".h.hc \"<foo>\"", "\"&lt;foo>\""),
+        (".h.hr \"foo\"", "\"---\""),
+        (".h.hu \"http://www.kx.com\"", "\"http%3a%2f%2fwww.kx.com\""),
+        (".h.uh \"http%3a%2f%2fwww.kx.com\"", "\"http://www.kx.com\""),
+        ("(.h.hug \"a\") \"a /\"", "(,\"a\";\"%20\";\"%2f\")"),
+        ("d: \"abc\"!10 20 30; d \"cab\"", "30 10 20"),
+        (".h.iso8601 100", "\"2000-01-01T00:00:00.000000100\""),
+        (".h.code \"foo\\tbar\"", "\"foo <code><nobr>bar</nobr></code>\""),
+        (".h.ha[`http://www.example.com; \"Main\"]", "\"<a href=http://www.example.com>Main</a>\""),
+        (".h.hb[\"u\"; \"Main\"]", "\"<a target=v href=\\\"u\\\">Main</a>\""),
+        (".h.htc[`tag; \"value\"]", "\"<tag>value</tag>\""),
+        (".h.htac[`a; (`href`target)!(\"u\"; \"_blank\"); \"Main\"]", "\"<a href=\\\"u\\\" target=\\\"_blank\\\">Main</a>\""),
+        (".h.http \"see http://www.example.com now\"", "\"see <a href=\\\"http://www.example.com\\\">http://www.example.com</a> now\""),
+        (".h.nbr \"foo bar\"", "\"<nobr>foo bar</nobr>\""),
+        (".h.pre (\"foo\"; \"bar\")", "\"<pre>foo\\nbar\\n</pre>\""),
+        (".h.text (\"foo\"; \"bar\")", "\"<p>foo</p>\\n<p>bar</p>\\n\""),
+        (".h.ty `json", "\"application/json\""),
+        ("(19 # .h.html \"<p>hi</p>\"; -23 # .h.html \"<p>hi</p>\")", "(\"<html><head><style>\";\"<p>hi</p></body></html>\")"),
+    ]);
+}

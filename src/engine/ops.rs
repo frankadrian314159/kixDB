@@ -3513,7 +3513,8 @@ pub fn dict_lookup(d: &Dict, key: &K) -> KResult<K> {
         }
     }
     if let K::Vector(kv) = key {
-        if !matches!(kv, ColVec::Char(_, _)) {
+        // (a string is one key, unless the keys are characters)
+        if !matches!(kv, ColVec::Char(_, _)) || matches!(&*d.keys, K::Vector(ColVec::Char(_, _))) {
             let mut out = Vec::with_capacity(kv.len());
             for i in 0..kv.len() {
                 out.push(dict_lookup(d, &kv.get_atom(i))?);
