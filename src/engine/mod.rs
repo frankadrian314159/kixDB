@@ -479,6 +479,37 @@ impl<'a> Engine<'a> {
         self.write_globals(changes.into_iter().map(|(name, val)| (name, Write::Value(val))).collect())
     }
 
+    /// Make here, as one record, what became of a copy of this workspace, `before` being the copy as it was and `after`
+    /// as it is: the globals, views and distributions that differ are written, and the globals of `drop` removed. The
+    /// tables mounted in the copy are taken over. With nothing to write, nothing is logged.
+    pub(crate) fn adopt(&mut self, before: &Workspace, after: &Workspace, drop: &[SymId]) -> KResult<()> {
+        self.ws.writable()?;
+        let moved = after.dist.iter().filter(|(table, mode)| before.dist.get(table) != Some(mode));
+        let mut ops: Vec<LogOp> = moved.map(|(&table, mode)| LogOp::SetDist { table, mode: mode.clone() }).collect();
+        for (&name, val) in after.vars.iter() {
+            if before.vars.get(&name).is_none_or(|old| !crate::delta::unchanged(old, val)) {
+                ops.push(log_of_value(self.ws.vars.get(&name).filter(|_| !self.ws.unlogged.contains(&name)), name, val));
+            }
+        }
+        let gone = before.vars.keys().chain(before.views.keys()).filter(|n| !after.vars.contains_key(n) && !after.views.contains_key(n));
+        ops.extend(gone.chain(drop).map(|&name| LogOp::DropVar { name }));
+        let defined = after.views.values().filter(|v| before.views.get(&v.name).map(|old| &old.expr) != Some(&v.expr));
+        ops.extend(defined.map(|def| LogOp::SetView { def: def.clone() }));
+        if !Arc::ptr_eq(&before.partitioned.0, &after.partitioned.0) {
+            self.ws.partitioned = after.partitioned.clone();
+        }
+        if ops.is_empty() {
+            return Ok(());
+        }
+        self.record_ops(ops.clone())?;
+        for op in &ops {
+            if let LogOp::SetVar { name, .. } = op {
+                self.ws.unlogged.remove(name);
+            }
+        }
+        crate::persist::apply_record(self.ws, &crate::persist::WalRecord { ts: self.ws.clock, ops })
+    }
+
     /// Write several fully qualified globals as one log record, so that a crash or a replica sees all of the writes or
     /// none. Ephemeral `.kix.tmp.*` shuffle/broadcast tables stay in memory only.
     pub fn write_globals(&mut self, writes: Vec<(SymId, Write)>) -> KResult<()> {
@@ -513,13 +544,7 @@ impl<'a> Engine<'a> {
                 let known = logged && !self.ws.unlogged.contains(name) && !self.ws.views.contains_key(name) && !writes[..i].iter().any(|w| w.0 == *name);
                 let old = self.ws.vars.get(name).filter(|_| known);
                 match write {
-                    Write::Value(Some(val)) => {
-                        let part = old.and_then(|old| match crate::delta::diff(old, val) {
-                            Some(changes) => Some(LogOp::ChangeVar { name: *name, changes }),
-                            None => crate::delta::removed(old, val).map(|removed| LogOp::RemoveRows { name: *name, removed }),
-                        });
-                        part.unwrap_or_else(|| LogOp::SetVar { name: *name, val: val.clone() })
-                    }
+                    Write::Value(Some(val)) => log_of_value(old, *name, val),
                     Write::Value(None) => LogOp::DropVar { name: *name },
                     Write::Change(changes) if old.is_some() || !logged => LogOp::ChangeVar { name: *name, changes: changes.clone() },
                     // (readers lack the value: they are given all of what it becomes)
@@ -2247,6 +2272,15 @@ impl<'a> Engine<'a> {
             _ => Err(KError::nyi(format!("unknown system command \\{cmd}"))),
         }
     }
+}
+
+/// The record of a global's new value: only what changed in it, where `old` is the value that the log's readers have.
+fn log_of_value(old: Option<&K>, name: SymId, val: &K) -> LogOp {
+    let part = old.and_then(|old| match crate::delta::diff(old, val) {
+        Some(changes) => Some(LogOp::ChangeVar { name, changes }),
+        None => crate::delta::removed(old, val).map(|removed| LogOp::RemoveRows { name, removed }),
+    });
+    part.unwrap_or_else(|| LogOp::SetVar { name, val: val.clone() })
 }
 
 pub(crate) fn is_ephemeral_var(name: SymId) -> bool {

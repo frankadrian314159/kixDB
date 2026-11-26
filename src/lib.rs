@@ -187,6 +187,15 @@ impl Server {
         Ok(true)
     }
 
+    /// A server on a copy of the workspace as it is, for work whose outcome is looked at before any of it is made here
+    /// (`Connection::adopt`). Nothing written to the copy is logged.
+    pub fn private_copy(&self) -> Server {
+        let mut copy = self.read_workspace(engine::Workspace::snapshot);
+        copy.read_only = false;
+        let copy = RwLock::new(copy);
+        Server { shared: Arc::new(Shared { ws: copy, next_session_id: AtomicU64::new(1), crashed: AtomicBool::new(false), interceptor: Mutex::new(None) }) }
+    }
+
     /// Log the next change to each variable the engine now holds as its whole new value: for the first start of a
     /// group's member, whose readers may not have the values it read from its own storage.
     pub fn log_values_whole(&self) {
@@ -284,6 +293,23 @@ pub struct Connection {
 }
 
 impl Connection {
+    /// The server whose workspace the connection works on.
+    pub fn server(&self) -> &Server {
+        &self.server
+    }
+
+    /// Have the session work on another server's workspace from now on; gives the one it worked on.
+    pub fn retarget(&mut self, server: Server) -> Server {
+        std::mem::replace(&mut self.server, server)
+    }
+
+    /// Make in the workspace what became of a copy of it (`Server::private_copy`), `before` being the copy as it was and
+    /// `after` as it is, and remove the globals of `drop`: all as one log record.
+    pub fn adopt(&mut self, before: &engine::Workspace, after: &engine::Workspace, drop: &[sym::SymId]) -> KResult<()> {
+        let mut ws = self.server.shared.ws.write().unwrap_or_else(|e| e.into_inner());
+        Engine::new(&mut ws, &mut self.session).adopt(before, after, drop)
+    }
+
     /// A flag that, once set, stops this connection's evaluation before its next step (`'stop`), for good.
     pub fn cancel_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
         self.session.cancel.clone()

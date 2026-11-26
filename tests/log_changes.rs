@@ -180,3 +180,36 @@ fn the_log_replays_changes_and_refuses_them_without_their_value() {
     stale.connect_internal().eval("x: enlist 1").unwrap();
     assert!(stale.apply_replicated(&WalRecord { ts: 100, ops: rec.ops }).is_err());
 }
+
+#[test]
+fn what_became_of_a_private_copy_is_written_as_one_record_or_none() {
+    let pair = Pair::new(Server::new(), Server::new());
+    pair.run("big: til 100000; gone: 1; f: {x + 1}; kept: (`a`b; {y})");
+    let mut c = pair.leader.connect_internal();
+    pair.run("v:: count big");
+    // run `q` on a copy, then make here what became of it: the records, and their size
+    let mut adopt = |q: &str| {
+        let copy = pair.leader.private_copy();
+        let before = copy.read_workspace(kixdb::engine::Workspace::snapshot);
+        copy.connect_internal().eval(q).unwrap_or_else(|e| panic!("{q}: {e}"));
+        assert!(pair.records.0.lock().unwrap().is_empty(), "{q}: the copy logs nothing");
+        copy.read_workspace(|after| c.adopt(&before, after, &[])).unwrap();
+        let records = std::mem::take(&mut *pair.records.0.lock().unwrap());
+        for bytes in &records {
+            pair.follower.apply_replicated(&postcard::from_bytes(bytes).unwrap()).unwrap_or_else(|e| panic!("{q}: {e}"));
+        }
+        assert_eq!(state(&pair.leader), state(&pair.follower), "after {q}");
+        (records.len(), records.iter().map(Vec::len).sum::<usize>())
+    };
+    // a value held for a while, or set to what it was, is not written
+    for unchanged in ["big: til 100000", "f: {x + 1}", "t: big; system \"x t\"", "gone: 1; f 2"] {
+        assert_eq!(adopt(unchanged).0, 0, "{unchanged}");
+    }
+    let (records, bytes) = adopt("big,: 7; n: 2; .kix.dist[`t; `replicated]; w:: n + 1; system \"x gone\"");
+    assert_eq!(records, 1);
+    assert!(bytes < 1000, "{bytes}");
+    assert_eq!(c.eval("(last big; n; w)").unwrap().to_string(), "7 2 3");
+    assert_eq!(c.eval("gone").unwrap_err().signal, "gone");
+    assert_eq!(pair.follower.connect_internal().eval("(last big; w; v)").unwrap().to_string(), "7 3 100001");
+}
+

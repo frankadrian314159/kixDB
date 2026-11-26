@@ -6,8 +6,8 @@
 //! * **pushed down** to the shards ([`plan`], [`exec`]): routed to one shard, run on every shard and concatenated or
 //!   merged, with joins made co-located by broadcasting or shuffling a table; inserts, upserts, updates and deletes are
 //!   split over the shards;
-//! * **gathered** ([`session`]): anything else gets the tables it names copied into the mirror, runs there, and the
-//!   tables it changed are distributed again.
+//! * **gathered** ([`session`]): anything else gets the tables it names copied into a private copy of the mirror, runs
+//!   there, and the tables it changed are distributed again; what else it changed is then written to the mirror.
 //!
 //! The number of shards can be changed while the cluster runs ([`resize`]), by command or as memory calls for it
 //! ([`autoscale`]).
