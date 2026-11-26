@@ -6,7 +6,7 @@ Expressions evaluate right to left with no operator precedence: `2 * 3 + 4` is `
 
 Atoms and typed vectors of boolean, guid, byte, short, int, long, real, float, char, symbol, timestamp, month, date,
 datetime, timespan, minute, second and time, with typed nulls and infinities (`0N`, `0W`, `0n`, `0w`); general lists;
-dictionaries; tables and keyed tables; functions. Vectors carry the attributes `` `s# `` `` `u# `` `` `p# `` `` `g# ``.
+enumerations ([below](#enumerations-foreign-keys-and-linked-columns)); dictionaries; tables and keyed tables; functions. Vectors carry the attributes `` `s# `` `` `u# `` `` `p# `` `` `g# ``.
 Integer arithmetic and aggregates wrap on overflow.
 
 * Arithmetic on booleans, bytes, shorts and ints gives ints; `&` and `|` give the wider of their two types. `div` rounds
@@ -15,7 +15,8 @@ Integer arithmetic and aggregates wrap on overflow.
   such as `12:34 01:02:03` takes the finer type, or the type a letter after its last item names (`u v t n`). A date plus a
   timespan is a timestamp.
 * A symbol compares only with a symbol (`'type`). Writing a value of another type into a simple list, or adding one with
-  `,:`, is `'type`; a general list whose items come to share a type becomes simple.
+  `,:`, is `'type`; a general list whose items come to share a type becomes simple. One exception: longs that fit are
+  taken into an `int` column of a table by `insert`, `upsert` and `t,:row` (`update` still wants ints).
 * Verbs applied to two dictionaries work key by key over the keys of both; a value only one has is kept, and compared
   with a null by comparisons. `d _ key` and `keys _ d` drop entries.
 * Casting a float to a whole number rounds it. A type can be given by number (`7h$x`), and `"ijf"$x` casts item by item.
@@ -26,6 +27,33 @@ Integer arithmetic and aggregates wrap on overflow.
   and `` get `.name `` gives the namespace as a dictionary.
 * `0x0 vs n` and `0b vs n` give a number's bytes or bits and `sv` puts them together; with a base, or a list of bases,
   they work in digits (`24 60 60 vs 3723`).
+
+## Enumerations, foreign keys and linked columns
+
+```q
+sym: `g`aapl`msft
+ev: `sym$`msft`g                     / only values that the list sym has, else 'cast
+`sym?`ibm                            / adds ibm to sym, then enumerates it
+kt: ([eid: 1001 1002] name: `Dent`Prefect)
+t: ([] eid: `kt$1002 1001; sc: 36 92)    / a foreign key: values of kt's key
+select eid.name, sc from t           / follows the key into kt
+tree: ([] pid: `tree!0N 0 0; v: 1 2 3)   / a linked column: row numbers of a table
+exec pid.v from tree
+```
+
+An enumeration holds its values, tagged with the name of the list or table they come from (its domain). Verbs on
+values (comparison, `in`, `?`, `string` and so on) see the values alone. Indexing, `#`, `_`, sorting, `distinct`,
+queries and joining two of one domain keep the tag. Adding to an enumeration or to an enumerated column (`,:`, `insert`,
+`upsert`, `update` of some rows, amend) checks the new values and signals `'cast` for one the domain lacks; nulls are
+accepted. `value x` gives the values, `key x` the domain's name, `` `long$x `` where each stands in the domain, and
+`meta` and `fkeys` show the foreign keys. A compound key is enumerated from a list of key rows
+(`` `ktc$(`Dent`Arthur;`Prefect`Ford) ``).
+
+Unlike kdb+, which holds positions in the domain:
+
+* changing an item of the domain (`sym[0]:`twit`) leaves enumerations as they were;
+* the type is `20h` (`-20h` for an atom) whatever the domain;
+* a key removed from its table stays in the column, and following it gives a null.
 
 ## Syntax
 
@@ -49,7 +77,7 @@ Integer arithmetic and aggregates wrap on overflow.
 | aggregates | `sum prd avg wavg wsum min max med var dev svar sdev cov scov cor` |
 | matrices | `mmu inv lsq` |
 | running, moving | `sums prds avgs mins maxs deltas ratios differ prev next fills mavg msum mcount mmin mmax mdev ema xbar` |
-| tables | `cols keys meta xasc xdesc xkey xcol xcols xgroup ungroup insert upsert fby tables views` |
+| tables | `cols keys meta fkeys xasc xdesc xkey xcol xcols xgroup ungroup insert upsert fby tables views` |
 | strings, casts | `string upper lower trim ltrim rtrim ss ssr vs sv $ md5` |
 | system | `get set value parse eval attr system show getenv setenv ltime gtime hopen hclose hcount 0: 1: -8! -9!` |
 | iterators | `each peach over scan prior` (`peach` runs as `each`) |
@@ -112,5 +140,6 @@ digit, unlike kdb+.
 ## Not implemented
 
 * `ej` only in bracket form.
-* Foreign keys and linked columns, `.Q` and `.z` callbacks (`.z.pg`, `.z.ps`, timers), log replay (`-11!`), and the rest
+* `.Q.en` records a table's symbols but returns the table without enumerating them.
+* `.Q` and `.z` callbacks (`.z.pg`, `.z.ps`, timers), log replay (`-11!`), and the rest
   of the `.Q` namespace beyond `.Q.en`, `.Q.dpft` and `.Q.s`.

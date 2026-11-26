@@ -563,6 +563,10 @@ impl<'a> Engine<'a> {
             let (_first, groups) = group_rows(&by_vecs, sub.nrows());
             for (cname, cs) in col_names.into_iter().zip(cols) {
                 let existing = work.col(cname).cloned();
+                let tag = match existing {
+                    Some(ColVec::Enum(tag, _)) => Some(tag),
+                    _ => None,
+                };
                 let mut full_atoms: Vec<K> = if let Some(ref ex) = existing {
                     (0..total).map(|r| ex.get_atom(r)).collect()
                 } else {
@@ -572,7 +576,10 @@ impl<'a> Engine<'a> {
 
                 for grp in &groups {
                     let gsub = sub.gather(grp);
-                    let gval = self.eval_in_rows(&gsub, numbers_of(&rows, grp), &cs.expr)?;
+                    let mut gval = self.eval_in_rows(&gsub, numbers_of(&rows, grp), &cs.expr)?;
+                    if let Some(tag) = tag {
+                        gval = self.enumerate(tag, &gval)?;
+                    }
                     match gval {
                         K::Vector(cv) if cv.len() == grp.len() => {
                             for (j, &local_r) in grp.iter().enumerate() {
@@ -631,6 +638,10 @@ impl<'a> Engine<'a> {
                     work.vals.push(new_cv);
                 }
             } else {
+                let val = match work.col(cname) {
+                    Some(&ColVec::Enum(tag, _)) => self.enumerate(tag, &val)?,
+                    _ => val,
+                };
                 let sub_cv = match val {
                     K::Vector(cv) if cv.len() == active_rows.len() => cv,
                     K::Vector(cv) if !matches!(cv, ColVec::Char(..)) => {
@@ -738,14 +749,15 @@ impl<'a> Engine<'a> {
         };
         // a global is changed where it is: only the rows touched are logged and copied
         if let Some(global) = self.global_to_change(name) {
-            let (incoming, start) = incoming_rows(&current, rows)?;
+            let (incoming, start) = self.incoming_rows(&current, rows)?;
             if let Some(change) = row_changes(&current, &incoming, !upsert)? {
                 drop(current);
                 self.write_globals(vec![(global, Write::Change(change.changes))])?;
                 return Ok((start, incoming.nrows()));
             }
         }
-        let (table, start, added) = append_to_table(&self.get_var(name)?, rows, upsert)?;
+        let table = self.get_var(name)?;
+        let (table, start, added) = self.append_to_table(&table, rows, upsert)?;
         self.set_global(name, table)?;
         Ok((start, added))
     }
@@ -766,46 +778,46 @@ impl<'a> Engine<'a> {
             self.add_rows(*tname, rhs, true)?;
             Ok(K::Sym(*tname))
         } else {
-            let (updated, _, _) = append_to_table(lhs, rhs, true)?;
+            let (updated, _, _) = self.append_to_table(lhs, rhs, true)?;
             Ok(updated)
         }
     }
-}
 
-/// The columns of a table as one flip (keys first), and the incoming rows as one of the same columns.
-fn incoming_rows(target: &K, rows: &K) -> KResult<(Flip, usize)> {
-    let full = match target {
-        K::Table(t) => (**t).clone(),
-        K::KeyedTable(kt) => kt.unkey(),
-        _ => return Err(KError::ty("insert/upsert target must be a table")),
-    };
-    let before = full.nrows();
-    Ok((coerce_rows_to_flip(&full.cols, &full.vals, rows)?, before))
-}
-
-/// The table `rows` make of `target`, the rows it had and how many came: by changes where they can be made to a copy,
-/// otherwise rebuilt.
-pub(crate) fn append_to_table(target: &K, rows: &K, allow_key_overwrite: bool) -> KResult<(K, usize, usize)> {
-    let (incoming, start) = incoming_rows(target, rows)?;
-    let added = incoming.nrows();
-    if let Some(change) = row_changes(target, &incoming, !allow_key_overwrite)? {
-        let mut table = target.clone();
-        if !crate::delta::patch(&mut table, &change.changes) {
-            return Err(KError::new("stale", "the table could not be changed"));
-        }
-        return Ok((table, start, added));
+    /// The incoming rows as a flip of the table's columns (keys first), and the rows the table has.
+    fn incoming_rows(&mut self, target: &K, rows: &K) -> KResult<(Flip, usize)> {
+        let full = match target {
+            K::Table(t) => (**t).clone(),
+            K::KeyedTable(kt) => kt.unkey(),
+            _ => return Err(KError::ty("insert/upsert target must be a table")),
+        };
+        let incoming = coerce_rows_to_flip(&full.cols, &full.vals, rows)?;
+        Ok((self.enumerate_rows(&full, incoming)?, full.nrows()))
     }
-    match target {
-        K::Table(t) => Ok((K::Table(Arc::new(t.concat(&incoming)?)), start, added)),
-        K::KeyedTable(kt) => {
-            let rows = KeyedTable::from_flip_nkeys(&incoming, kt.keys.ncols())?;
-            let K::KeyedTable(new) = &rows else { return Err(KError::ty("rows do not form a keyed table")) };
-            if !allow_key_overwrite && match_keys(kt, &new.keys.vals.iter().collect::<Vec<_>>(), added).iter().any(Option::is_some) {
-                return Err(KError::new("insert", "duplicate key in keyed table insert"));
+
+    /// The table `rows` make of `target`, the rows it had and how many came: by changes where they can be made to a
+    /// copy, otherwise rebuilt.
+    pub(crate) fn append_to_table(&mut self, target: &K, rows: &K, allow_key_overwrite: bool) -> KResult<(K, usize, usize)> {
+        let (incoming, start) = self.incoming_rows(target, rows)?;
+        let added = incoming.nrows();
+        if let Some(change) = row_changes(target, &incoming, !allow_key_overwrite)? {
+            let mut table = target.clone();
+            if !crate::delta::patch(&mut table, &change.changes) {
+                return Err(KError::new("stale", "the table could not be changed"));
             }
-            Ok((crate::engine::joins::union_join(target, &rows)?, start, added))
+            return Ok((table, start, added));
         }
-        _ => Err(KError::ty("insert/upsert target must be a table")),
+        match target {
+            K::Table(t) => Ok((K::Table(Arc::new(t.concat(&incoming)?)), start, added)),
+            K::KeyedTable(kt) => {
+                let rows = KeyedTable::from_flip_nkeys(&incoming, kt.keys.ncols())?;
+                let K::KeyedTable(new) = &rows else { return Err(KError::ty("rows do not form a keyed table")) };
+                if !allow_key_overwrite && match_keys(kt, &new.keys.vals.iter().collect::<Vec<_>>(), added).iter().any(Option::is_some) {
+                    return Err(KError::new("insert", "duplicate key in keyed table insert"));
+                }
+                Ok((crate::engine::joins::union_join(target, &rows)?, start, added))
+            }
+            _ => Err(KError::ty("insert/upsert target must be a table")),
+        }
     }
 }
 

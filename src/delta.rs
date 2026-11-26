@@ -52,6 +52,14 @@ fn identical(a: &K, b: &K) -> bool {
     }
 }
 
+/// Whether the columns are of one type, enumerations being of one domain too.
+fn alike(a: &ColVec, b: &ColVec) -> bool {
+    match (a, b) {
+        (ColVec::Enum(t, x), ColVec::Enum(u, y)) => t == u && alike(x, y),
+        _ => std::mem::discriminant(a) == std::mem::discriminant(b),
+    }
+}
+
 /// Whether `b` starts with exactly the items of `a`, in a column of the same type.
 fn begins(a: &ColVec, b: &ColVec) -> bool {
     macro_rules! on {
@@ -60,6 +68,7 @@ fn begins(a: &ColVec, b: &ColVec) -> bool {
                 $((ColVec::$same(_, x), ColVec::$same(_, y)) => Arc::ptr_eq(x, y) || y.starts_with(x),)*
                 $((ColVec::$float(_, x), ColVec::$float(_, y)) => x.len() <= y.len() && x.iter().zip(y.iter()).all(|(x, y)| x.to_bits() == y.to_bits()),)*
                 (ColVec::General(_, x), ColVec::General(_, y)) => x.len() <= y.len() && (Arc::ptr_eq(x, y) || x.iter().zip(y.iter()).all(|(x, y)| identical(x, y))),
+                (ColVec::Enum(t, x), ColVec::Enum(u, y)) => t == u && begins(x, y),
                 _ => false,
             }
         };
@@ -75,6 +84,7 @@ fn same_item(a: &ColVec, i: usize, b: &ColVec, j: usize) -> bool {
                 $((ColVec::$same(_, x), ColVec::$same(_, y)) => x[i] == y[j],)*
                 $((ColVec::$float(_, x), ColVec::$float(_, y)) => x[i].to_bits() == y[j].to_bits(),)*
                 (ColVec::General(_, x), ColVec::General(_, y)) => identical(&x[i], &y[j]),
+                (ColVec::Enum(t, x), ColVec::Enum(u, y)) => t == u && same_item(x, i, y, j),
                 _ => false,
             }
         };
@@ -105,7 +115,7 @@ pub fn removed(old: &K, new: &K) -> Option<Removed> {
 
 /// The rows of `a` that differ in `b`, which is no shorter and of its type, if there are at most `limit` of them.
 fn differing(a: &ColVec, b: &ColVec, limit: usize) -> Option<Vec<u64>> {
-    if std::mem::discriminant(a) != std::mem::discriminant(b) || b.len() < a.len() {
+    if !alike(a, b) || b.len() < a.len() {
         return None;
     }
     let mut rows = vec![];
@@ -153,6 +163,9 @@ pub fn diff(old: &K, new: &K) -> Option<Changes> {
 
 /// Add `tail` to a column of its type that holds `at` items.
 fn extend(col: &mut ColVec, at: u64, tail: &ColVec) -> bool {
+    if let ColVec::Enum(t, x) = col {
+        return matches!(tail, ColVec::Enum(u, y) if t == u && extend(x, at, y));
+    }
     macro_rules! on {
         ($($v:ident)*) => {
             match (col, tail) {
@@ -190,7 +203,10 @@ pub fn remove(value: &mut K, removed: &Removed) -> bool {
     for (col, &attr) in cols.iter_mut().zip(&removed.attrs) {
         macro_rules! on {
             ($($v:ident)*) => {
-                match &mut **col {
+                match match &mut **col {
+                    ColVec::Enum(_, values) => &mut **values,
+                    other => other,
+                } {
                     $(ColVec::$v(_, x) => {
                         let (mut row, mut gone) = (0, removed.rows.iter().peekable());
                         Arc::make_mut(x).retain(|_| {
@@ -198,6 +214,7 @@ pub fn remove(value: &mut K, removed: &Removed) -> bool {
                             gone.next_if_eq(&&(row - 1)).is_none()
                         });
                     })*
+                    ColVec::Enum(..) => return false,
                 }
             };
         }
@@ -211,6 +228,9 @@ pub fn remove(value: &mut K, removed: &Removed) -> bool {
 fn set(col: &mut ColVec, rows: &[u64], values: &ColVec) -> bool {
     if rows.len() != values.len() || rows.iter().any(|&r| r >= col.len() as u64) {
         return false;
+    }
+    if let ColVec::Enum(t, x) = col {
+        return matches!(values, ColVec::Enum(u, y) if t == u && set(x, rows, y));
     }
     macro_rules! on {
         ($($v:ident)*) => {
@@ -236,7 +256,7 @@ pub fn fits(value: &K, changes: &Changes) -> bool {
     let mut lengths: Vec<u64> = cols.iter().map(|c| c.len() as u64).collect();
     changes.iter().all(|(i, change)| {
         let Some((col, length)) = cols.get(*i as usize).zip(lengths.get_mut(*i as usize)) else { return false };
-        let like = |other: &ColVec| std::mem::discriminant(*col) == std::mem::discriminant(other);
+        let like = |other: &ColVec| alike(col, other);
         match change {
             ColChange::Replace(new) => {
                 *length = new.len() as u64;

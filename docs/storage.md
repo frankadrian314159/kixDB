@@ -43,6 +43,9 @@ the snapshot: an earlier version discards the log from the first record it canno
 `:file.csv 0: "," 0: t            / write CSV
 ```
 
+Enumerated values are saved with their domain's name, not the domain: save that too to check or follow them after
+loading. Earlier versions cannot read files, logs or snapshots that hold enumerations.
+
 Relative paths given to `set`, `get` and `.Q.dpft` are resolved against the workspace directory; `0:` and `.Q.en` use
 the process's current directory. The file format is kixDB's own and is not readable by kdb+.
 

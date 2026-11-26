@@ -165,6 +165,8 @@ fn load_changes(conn: &mut Connection, staged: &Changes, req: &LoadReq) -> KResu
     }
     let incoming = unkeyed(&rows)?;
     let current = staged_value(conn, staged, &req.table)?;
+    // values for foreign keys are checked against the keyed table, which every shard has whole
+    let incoming = conn.enumerate_rows(&unkeyed(&current)?, incoming, false)?;
     let keyed = match (&current, req.mode) {
         (K::Table(_), LoadMode::Append) => None,
         (K::KeyedTable(kt), LoadMode::Upsert | LoadMode::CheckInsert) => Some(kt),

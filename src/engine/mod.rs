@@ -2,6 +2,7 @@
 //! protected evaluation (`@[f;x;h]` / `.[f;args;h]`), views (`::`), and system commands (`\...`).
 pub mod joins;
 pub mod builtins;
+mod enums;
 pub mod ops;
 pub mod par;
 pub mod pure;
@@ -705,7 +706,10 @@ impl<'a> Engine<'a> {
                     }
                 }
                 let v = self.eval_step(base)?;
-                Ok(ops::eval_field(&v, *field)?)
+                match v.tag() {
+                    Some(tag) if tag.source != Source::List => Ok(self.follow(tag, &v, *field)?),
+                    _ => Ok(ops::eval_field(&v, *field)?),
+                }
             }
 
             Expr::List(items) => {
@@ -827,10 +831,15 @@ impl<'a> Engine<'a> {
                 let final_val = if let Some(op_sym) = op {
                     let cur = self.get_var(*name)?;
                     match (resolve(*op_sym).as_str(), &cur, &rhs) {
+                        // what is added to an enumeration is enumerated first
+                        (",", K::Vector(ColVec::Enum(tag, _)), more) => {
+                            let more = self.enumerate(*tag, more)?;
+                            self.eval_binary_dispatch(",", &cur, &more)?
+                        }
                         (",", K::Vector(list), more) if !matches!(list, ColVec::General(..)) && more.type_num().abs() != list.type_num() && more.count() > 0 => {
                             return Err(KError::ty("what is added must have the type of the list").into());
                         }
-                        (",", K::Table(_), _) => qsql::append_to_table(&cur, &rhs, false)?.0,
+                        (",", K::Table(_), _) => self.append_to_table(&cur, &rhs, false)?.0,
                         (op, ..) => self.eval_binary_dispatch(op, &cur, &rhs)?,
                     }
                 } else {
@@ -985,6 +994,11 @@ impl<'a> Engine<'a> {
                 let K::Sym(name) = x else { unreachable!() };
                 self.key_of_name(*name)
             }
+            "fkeys" if matches!(x, K::Sym(_)) => {
+                let K::Sym(name) = x else { unreachable!() };
+                let table = self.get_var(*name)?;
+                ops::eval_unary_prim("fkeys", &table)
+            }
             "show" => {
                 self.messages.push(crate::display::console(x));
                 Ok(K::Null)
@@ -1054,6 +1068,9 @@ impl<'a> Engine<'a> {
             self.set_global(*name, changed)?;
             return Ok(rhs.clone());
         }
+        if let Some(result) = self.enum_verb(op, lhs, rhs) {
+            return result;
+        }
         match op {
             "@" => self.apply_value(lhs, &[Some(rhs.clone())]),
             "each" | "peach" | "over" | "scan" | "prior" => {
@@ -1086,7 +1103,7 @@ impl<'a> Engine<'a> {
                 if matches!(lhs, K::Long(_) | K::Int(_)) {
                     match lhs.as_i64()? {
                         -8 => {
-                            let bytes = crate::ipc::encode_k_payload(rhs);
+                            let bytes = crate::ipc::encode_k_payload(&rhs.untagged());
                             return Ok(K::Vector(ColVec::Byte(Attr::None, Arc::new(bytes))));
                         }
                         -3 => return Ok(K::string(&rhs.q_repr())),
@@ -1724,6 +1741,11 @@ impl<'a> Engine<'a> {
                 Ok(v.clone())
             }
         };
+        // an enumeration is changed as its values are, and what results enumerated again (which checks it)
+        if let K::Vector(ColVec::Enum(tag, values)) = &target {
+            let amended = self.amend_in_place(K::Vector((**values).clone()), indices, op, &rhs.plain())?;
+            return self.enumerate(*tag, &amended);
+        }
         match target {
             K::Vector(mut cv) => {
                 match first {

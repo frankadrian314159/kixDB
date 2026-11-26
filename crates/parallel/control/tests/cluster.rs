@@ -289,6 +289,46 @@ fn tables_named_by_symbols_are_changed_on_the_shards() {
 }
 
 #[test]
+fn foreign_keys_and_enumerations_work_across_the_shards() {
+    let mut p = market(3);
+    p.check("kt: ([eid: 1001 1002 1003] name: `Dent`Beeblebrox`Prefect; iq: 98 42 126)");
+    p.session.eval("DISTRIBUTE kt REPLICATED").unwrap();
+    for statement in [
+        "d: ([] sym: 30#`a`b`c`d`e; eid: `kt$30#1003 1001 1002; sc: til 30)",
+        "select from d",
+        "meta d",
+        "select eid.name, sc from d",
+        "select sum sc by eid.name from d",
+        "select sc from d where eid.iq > 90",
+        "select sum eid.iq by sym from d",
+        "`d insert (`a; 1002; 100)",
+        "`d insert (`a; 1009; 101)",
+        "d ,: `sym`eid`sc!(`b; 1001; 102)",
+        "update eid: 1001 from `d where sc = 100",
+        "update eid: 1009 from `d where sc = 100",
+        "select eid.name, sc from d where sc >= 28",
+        // an enumeration of a list, which the shards do not have
+        "venue: `N`Q`L",
+        "e: ([] sym: 6#`a`b`c; x: `venue$6#`N`Q)",
+        "`e insert (`a; `L)",
+        "`e insert (`a; `Z)",
+        "update x: `Q from `e where sym = `a",
+        "select from e",
+        "meta e",
+    ] {
+        p.check(statement);
+    }
+    assert!(p.shards.rows("d").iter().filter(|&&r| r > 0).count() > 1, "d is on one shard only");
+    // (the changes that should be made were)
+    assert_eq!(p.session.eval("(count d; count e; exec sum eid from d where sc = 100)").unwrap().to_string(), "32 7 1001");
+    // a shard cannot follow a key into a table that it has only part of
+    p.session.eval("DISTRIBUTE kt BY eid").unwrap();
+    assert_eq!(p.session.eval("select eid.name from d").unwrap_err().signal, "nyi");
+    assert_eq!(p.session.eval("`d insert (`a; 1002; 103)").unwrap_err().signal, "nyi");
+    p.check("select eid, sc from d");
+}
+
+#[test]
 fn distribution_modes_and_namespaces() {
     let mut p = market(3);
     p.session.eval("DISTRIBUTE trade PARTITIONED BY time").unwrap();

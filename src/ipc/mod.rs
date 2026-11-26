@@ -112,6 +112,10 @@ fn write_k(buf: &mut Vec<u8>, val: &K) {
             buf.push((-19i8) as u8);
             buf.extend_from_slice(&v.to_le_bytes());
         }
+        K::Enum(tag, v) => {
+            write_tag(buf, -20, tag);
+            write_k(buf, v);
+        }
         K::Vector(cv) => write_colvec(buf, cv),
         K::Table(t) => {
             // kdb+ IPC table (`98`): `[98, 0(attr), 99(dict), sym_vec(cols), general_list(vals)]`
@@ -150,7 +154,19 @@ fn write_k(buf: &mut Vec<u8>, val: &K) {
     }
 }
 
+/// An enumeration, as saved files and the nodes of a cluster keep it (kixdb's own form: other programs are sent plain
+/// values): type 20, what the domain is, its name and the values.
+fn write_tag(buf: &mut Vec<u8>, type_num: i8, tag: &Tag) {
+    buf.push(type_num as u8);
+    buf.push(tag.source as u8);
+    write_nul_str(buf, &resolve(tag.domain));
+}
+
 fn write_colvec(buf: &mut Vec<u8>, cv: &ColVec) {
+    if let ColVec::Enum(tag, values) = cv {
+        write_tag(buf, 20, tag);
+        return write_colvec(buf, values);
+    }
     buf.push(cv.type_num() as u8);
     buf.push(cv.attr().ipc_byte());
     buf.extend_from_slice(&(cv.len() as u32).to_le_bytes());
@@ -208,6 +224,8 @@ fn write_colvec(buf: &mut Vec<u8>, cv: &ColVec) {
                 write_nul_str(buf, &resolve(s));
             }
         }
+        // (written above)
+        ColVec::Enum(..) => {}
     }
 }
 
@@ -219,7 +237,7 @@ fn decode_k_endian(data: &[u8], mut p: usize, le: bool) -> KResult<(K, usize)> {
     if p >= data.len() {
         return Err(KError::ipc("truncated IPC payload"));
     }
-    let tag = data[p] as i8;
+    let tag_byte = data[p] as i8;
     p += 1;
 
     let read_i16 = |b: &[u8], o: usize| -> KResult<i16> {
@@ -247,7 +265,7 @@ fn decode_k_endian(data: &[u8], mut p: usize, le: bool) -> KResult<(K, usize)> {
         Ok(if le { f64::from_le_bytes(arr) } else { f64::from_be_bytes(arr) })
     };
 
-    match tag {
+    match tag_byte {
         -128 => {
             let (err_s, next) = read_nul_str(data, p)?;
             let _ = next;
@@ -292,7 +310,7 @@ fn decode_k_endian(data: &[u8], mut p: usize, le: bool) -> KResult<(K, usize)> {
             let attr = Attr::from_ipc_byte(*data.get(p).ok_or_else(|| KError::ipc("truncated vec attr"))?);
             let n = read_u32(data, p + 1)? as usize;
             p += 5;
-            let cv = match tag {
+            let cv = match tag_byte {
                 0 => {
                     let mut xs = Vec::with_capacity(n);
                     for _ in 0..n {
@@ -335,7 +353,7 @@ fn decode_k_endian(data: &[u8], mut p: usize, le: bool) -> KResult<(K, usize)> {
                         xs.push(read_i32(data, p)?);
                         p += 4;
                     }
-                    match tag {
+                    match tag_byte {
                         6 => ColVec::Int(attr, Arc::new(xs)),
                         13 => ColVec::Month(attr, Arc::new(xs)),
                         14 => ColVec::Date(attr, Arc::new(xs)),
@@ -350,7 +368,7 @@ fn decode_k_endian(data: &[u8], mut p: usize, le: bool) -> KResult<(K, usize)> {
                         xs.push(read_i64(data, p)?);
                         p += 8;
                     }
-                    match tag {
+                    match tag_byte {
                         7 => ColVec::Long(attr, Arc::new(xs)),
                         12 => ColVec::Timestamp(attr, Arc::new(xs)),
                         _ => ColVec::Timespan(attr, Arc::new(xs)),
@@ -370,7 +388,7 @@ fn decode_k_endian(data: &[u8], mut p: usize, le: bool) -> KResult<(K, usize)> {
                         xs.push(read_f64(data, p)?);
                         p += 8;
                     }
-                    if tag == 9 {
+                    if tag_byte == 9 {
                         ColVec::Float(attr, Arc::new(xs))
                     } else {
                         ColVec::Datetime(attr, Arc::new(xs))
@@ -390,9 +408,25 @@ fn decode_k_endian(data: &[u8], mut p: usize, le: bool) -> KResult<(K, usize)> {
                     }
                     ColVec::Sym(attr, Arc::new(xs))
                 }
-                _ => return Err(KError::ipc(format!("unsupported vector tag {tag}"))),
+                _ => return Err(KError::ipc(format!("unsupported vector tag {tag_byte}"))),
             };
             Ok((K::Vector(cv), p))
+        }
+
+        20 | -20 => {
+            let source = match data.get(p) {
+                Some(0) => Source::List,
+                Some(1) => Source::Keys,
+                Some(2) => Source::Rows,
+                _ => return Err(KError::ipc("bad enumeration")),
+            };
+            let (domain, next) = read_nul_str(data, p + 1)?;
+            let tag = Tag { domain: intern(&domain), source };
+            match (tag_byte, decode_k_endian(data, next, le)?) {
+                (20, (K::Vector(values), next)) => Ok((K::Vector(ColVec::Enum(tag, Box::new(values))), next)),
+                (-20, (value, next)) => Ok((K::Enum(tag, Box::new(value)), next)),
+                _ => Err(KError::ipc("bad enumeration")),
+            }
         }
 
         98 => {
@@ -727,7 +761,7 @@ impl IpcClient {
     }
 
     pub fn query_k(&mut self, msg: &K) -> KResult<K> {
-        let payload = encode_k_payload(msg);
+        let payload = encode_k_payload(&msg.untagged());
         write_ipc_frame(&mut *self.stream, MSG_SYNC, &payload, self.compress)?;
         let (_mtype, le, resp) = read_ipc_frame(&mut *self.stream)?;
         let (k, _) = decode_k_endian(&resp, 0, le)?;
@@ -735,7 +769,7 @@ impl IpcClient {
     }
 
     pub fn send_async_k(&mut self, msg: &K) -> KResult<()> {
-        let payload = encode_k_payload(msg);
+        let payload = encode_k_payload(&msg.untagged());
         write_ipc_frame(&mut *self.stream, MSG_ASYNC, &payload, self.compress)
     }
 }
@@ -916,7 +950,7 @@ fn handle_client(
         if msg_type == MSG_SYNC {
             match res {
                 Ok(val) => {
-                    let payload = encode_k_payload(&val);
+                    let payload = encode_k_payload(&val.untagged());
                     write_ipc_frame(&mut *stream, MSG_RESPONSE, &payload, compress)?;
                 }
                 Err(err) => {

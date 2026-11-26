@@ -18,6 +18,7 @@ use std::sync::Arc;
 // ----- Temporal / Dict / Table `.field` Extraction --------------------------
 
 pub fn eval_field(val: &K, field: SymId) -> KResult<K> {
+    let val = &*val.plain();
     let fname = resolve(field);
     // Temporal component extraction (`date.year`, `date.mm`, `date.dd`, `time.hh`, `time.uu`, `time.ss`, `time.minute`, `time.second`, `ts.date`, `ts.time`, `ts.minute`)
     if let Some(extracted) = try_temporal_field(val, &fname) {
@@ -228,7 +229,23 @@ fn md5_op(x: &K) -> KResult<K> {
 
 // ----- Unary Primitives -----------------------------------------------------
 
+/// The verbs that keep the domain of an enumeration: those that only move values about, or look at the domain.
+const UNARY_KEEPING_TAGS: [&str; 18] =
+    ["type", "@", "count", "#", "reverse", "|", "first", "*", "last", "distinct", "?", "enlist", ",", "flip", "meta", "asc", "desc", "raze"];
+
 pub fn eval_unary_prim(op: &str, x: &K) -> KResult<K> {
+    if let Some(tag) = x.tag() {
+        match op {
+            "key" | "!" => return Ok(K::Sym(tag.domain)),
+            "value" => return Ok(x.plain().into_owned()),
+            _ => {}
+        }
+    }
+    if !UNARY_KEEPING_TAGS.contains(&op) {
+        if let Cow::Owned(plain) = x.plain() {
+            return eval_unary_prim(op, &plain);
+        }
+    }
     if let Some(result) = builtins::unary(op, x) {
         return result;
     }
@@ -304,6 +321,7 @@ pub fn eval_unary_prim(op: &str, x: &K) -> KResult<K> {
         "next" => shift_op(x, 1),
         "fills" => fills_op(x),
         "meta" => meta_op(x),
+        "fkeys" => fkeys_op(x),
         "ungroup" => ungroup_op(x),
         "md5" => md5_op(x),
         _ => Err(KError::nyi(format!("unknown unary verb '{op}'"))),
@@ -833,6 +851,7 @@ pub fn group_op(x: &K) -> KResult<K> {
 }
 
 pub fn iasc_indices(cv: &ColVec, desc: bool) -> Vec<usize> {
+    let cv = cv.plain();
     let mut idx: Vec<usize> = (0..cv.len()).collect();
     // Fast paths for common vector types
     match cv {
@@ -1334,7 +1353,10 @@ pub fn meta_op(x: &K) -> KResult<K> {
             _ => None,
         };
         t_chars.push(nested.unwrap_or_else(|| cv.meta_type_char()) as u8);
-        f_syms.push(SymId::EMPTY);
+        f_syms.push(match cv {
+            ColVec::Enum(tag, _) if tag.source != Source::List => tag.domain,
+            _ => SymId::EMPTY,
+        });
         a_syms.push(cv.attr().char().map(|c| intern(&c.to_string())).unwrap_or(SymId::EMPTY));
     }
     let _ = key_count;
@@ -1351,6 +1373,22 @@ pub fn meta_op(x: &K) -> KResult<K> {
         ],
     };
     Ok(K::KeyedTable(Arc::new(KeyedTable { keys, vals })))
+}
+
+/// The foreign keys of a table: a dictionary from each such column to its keyed table.
+fn fkeys_op(x: &K) -> KResult<K> {
+    let table = match x {
+        K::Table(t) => (**t).clone(),
+        K::KeyedTable(t) => t.unkey(),
+        _ => return Err(KError::ty("fkeys requires a table")),
+    };
+    let keys = table.cols.iter().zip(&table.vals).filter_map(|(&name, column)| match column {
+        ColVec::Enum(tag, _) if tag.source == Source::Keys => Some((name, tag.domain)),
+        _ => None,
+    });
+    let (names, domains): (Vec<SymId>, Vec<SymId>) = keys.unzip();
+    let list = |s| Box::new(K::Vector(ColVec::Sym(Attr::None, Arc::new(s))));
+    Ok(K::Dict(Arc::new(Dict { keys: list(names), vals: list(domains) })))
 }
 
 fn ungroup_op(x: &K) -> KResult<K> {
@@ -1400,6 +1438,14 @@ fn ungroup_op(x: &K) -> KResult<K> {
 // ----- Binary Primitives ----------------------------------------------------
 
 pub fn eval_binary_prim(op: &str, lhs: &K, rhs: &K) -> KResult<K> {
+    // (joining keeps the domain that both sides have)
+    let keeps = matches!(op, "#" | "_" | "~" | "sublist" | "rotate" | "!" | "@") || op == "," && lhs.tag() == rhs.tag();
+    if !keeps {
+        let (a, b) = (lhs.plain(), rhs.plain());
+        if matches!(a, Cow::Owned(_)) || matches!(b, Cow::Owned(_)) {
+            return eval_binary_prim(op, &a, &b);
+        }
+    }
     if let Some(result) = builtins::binary(op, lhs, rhs) {
         return result;
     }
@@ -2319,6 +2365,13 @@ pub fn cast_op(lhs: &K, rhs: &K) -> KResult<K> {
     }
 
     Err(KError::ty("unsupported cast LHS"))
+}
+
+/// Whether `` `name$x `` names a type or a part of a time, rather than a domain to enumerate from.
+pub fn is_type_name(name: &str) -> bool {
+    name.is_empty()
+        || "bgxhijefcspmdznuvt".chars().filter_map(type_name_from_char).any(|t| t == name)
+        || ["bool", "year", "mm", "dd", "hh", "uu", "ss", "week"].contains(&name)
 }
 
 fn type_name_from_char(c: char) -> Option<&'static str> {

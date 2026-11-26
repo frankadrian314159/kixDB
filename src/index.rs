@@ -54,6 +54,7 @@ fn backing_identity(cv: &ColVec) -> (CacheKey, Arc<dyn Any + Send + Sync>) {
         ColVec::Minute(_, v) => id!(v),
         ColVec::Second(_, v) => id!(v),
         ColVec::Time(_, v) => id!(v),
+        ColVec::Enum(_, v) => backing_identity(v),
     }
 }
 

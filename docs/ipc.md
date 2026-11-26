@@ -2,7 +2,8 @@
 
 `kix-serve`, `kix -p`, `kix-gui` and `kix-cluster` speak the kdb+ binary IPC protocol (version 3): the
 `user:password` handshake, synchronous, asynchronous and response messages, error replies, and message compression.
-Compatibility is by the published format; it has not been tested against kdb+ itself.
+Compatibility is by the published format; it has not been tested against kdb+ itself. Enumerations, foreign keys and
+linked columns are sent as their plain values.
 
 ## Server
 

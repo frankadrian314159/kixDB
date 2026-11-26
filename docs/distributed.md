@@ -143,6 +143,13 @@ q results depend on row order. A shard keeps its rows in their original relative
 parallel vector `.kix.ord.<table>` holds every row's global ordinal. The control node merges rows from several shards by
 ordinal, so they come back in the order one server would hold them.
 
+### Foreign keys, links and enumerations
+
+Enumerated columns keep their domains on the shards. A shard follows a key into its own copy of the table referred to,
+so that table must be **replicated**: a keyed table is sharded by default, so declare it first
+(`DISTRIBUTE kt REPLICATED`). Otherwise following its keys (`key.column`, `` `long$key ``) and adding rows to a table
+that refers to it signal `'nyi`. Values enumerated from a list are checked on the control node, which holds the list.
+
 ## How a statement runs
 
 `EXPLAIN statement` shows the plan without running it.
@@ -315,5 +322,6 @@ shards must match.
 * A shard makes one change at a time.
 * A change that is not an append, an assignment to some rows or columns or a removal of rows (a re-sort, for one) is logged and
   replicated as the whole new value of the table's slice (see [storage.md](storage.md)).
-* Tables move between shards (shuffle and broadcast) as kdb+ IPC bytes inside Flight actions; query results stream as
+* Tables move between shards (shuffle and broadcast) as kdb+ IPC bytes (with kixdb's own type for enumerations) inside
+  Flight actions; query results stream as
   Arrow batches.

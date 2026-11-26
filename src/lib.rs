@@ -398,6 +398,19 @@ impl Connection {
         Engine::new(&mut ws, &mut self.session).set_globals(changes)
     }
 
+    /// `rows` with the values for the enumerated columns of `table` enumerated, and so checked. With `lists_only`, only
+    /// the columns enumerated from lists and links: a cluster's control node has those domains but not the rows of keyed
+    /// tables, which its shards check.
+    pub fn enumerate_rows(&mut self, table: &Flip, rows: Flip, lists_only: bool) -> KResult<Flip> {
+        let mut ws = self.server.shared.ws.write().unwrap_or_else(|e| e.into_inner());
+        let mut target = table.clone();
+        if lists_only {
+            let keep: Vec<usize> = (0..target.ncols()).filter(|&c| !matches!(&target.vals[c], ColVec::Enum(t, _) if t.source == types::Source::Keys)).collect();
+            target = Flip { cols: keep.iter().map(|&c| table.cols[c]).collect(), vals: keep.iter().map(|&c| table.vals[c].clone()).collect() };
+        }
+        Engine::new(&mut ws, &mut self.session).enumerate_rows(&target, rows)
+    }
+
     /// Directly store or replace a table/value in the workspace without serializing through `q` text (fast bulk load for shards).
     pub fn set_var_direct(&mut self, name: &str, val: K) -> KResult<()> {
         let mut ws = self.server.shared.ws.write().unwrap_or_else(|e| e.into_inner());

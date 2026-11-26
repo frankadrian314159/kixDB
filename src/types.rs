@@ -5,6 +5,7 @@ use crate::error::{KError, KResult};
 use crate::sym::{intern, resolve, SymId};
 use chrono::{Datelike, NaiveDate};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
@@ -268,6 +269,24 @@ impl Attr {
     }
 }
 
+// ----- Enumerations ---------------------------------------------------------
+
+/// What the values of an enumeration are drawn from: the items of a list, the keys of a keyed table (a foreign key), or,
+/// as row numbers, the rows of a table (a linked column).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Source {
+    List,
+    Keys,
+    Rows,
+}
+
+/// The tag of enumerated values: the global they are drawn from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tag {
+    pub domain: SymId,
+    pub source: Source,
+}
+
 // ----- Typed Column Vectors (`ColVec`) --------------------------------------
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -291,6 +310,8 @@ pub enum ColVec {
     Minute(Attr, Arc<Vec<i32>>),
     Second(Attr, Arc<Vec<i32>>),
     Time(Attr, Arc<Vec<i32>>),
+    /// Values (never themselves tagged) tagged with their domain. (Last, so that files saved before it existed load.)
+    Enum(Tag, Box<ColVec>),
 }
 
 impl PartialEq for ColVec {
@@ -321,6 +342,7 @@ impl PartialEq for ColVec {
             (ColVec::Minute(_, a), ColVec::Minute(_, b)) => a == b,
             (ColVec::Second(_, a), ColVec::Second(_, b)) => a == b,
             (ColVec::Time(_, a), ColVec::Time(_, b)) => a == b,
+            (ColVec::Enum(t, a), ColVec::Enum(u, b)) => t == u && a == b,
             _ => false,
         }
     }
@@ -348,6 +370,7 @@ impl ColVec {
             ColVec::Minute(_, v) => v.len(),
             ColVec::Second(_, v) => v.len(),
             ColVec::Time(_, v) => v.len(),
+            ColVec::Enum(_, v) => v.len(),
         }
     }
 
@@ -376,6 +399,7 @@ impl ColVec {
             | ColVec::Minute(a, _)
             | ColVec::Second(a, _)
             | ColVec::Time(a, _) => *a,
+            ColVec::Enum(_, v) => v.attr(),
         }
     }
 
@@ -400,6 +424,7 @@ impl ColVec {
             | ColVec::Minute(a, _)
             | ColVec::Second(a, _)
             | ColVec::Time(a, _) => *a = na,
+            ColVec::Enum(_, v) => v.set_attr_unchecked(na),
         }
     }
 
@@ -463,6 +488,7 @@ impl ColVec {
             ColVec::Minute(_, _) => 17,
             ColVec::Second(_, _) => 18,
             ColVec::Time(_, _) => 19,
+            ColVec::Enum(..) => 20,
         }
     }
 
@@ -494,6 +520,7 @@ impl ColVec {
             ColVec::Minute(_, _) => 'u',
             ColVec::Second(_, _) => 'v',
             ColVec::Time(_, _) => 't',
+            ColVec::Enum(_, v) => v.meta_type_char(),
         }
     }
 
@@ -519,6 +546,7 @@ impl ColVec {
             ColVec::Minute(_, _) => "minute",
             ColVec::Second(_, _) => "second",
             ColVec::Time(_, _) => "time",
+            ColVec::Enum(_, v) => v.type_name(),
         }
     }
 
@@ -543,6 +571,15 @@ impl ColVec {
             ColVec::Minute(_, _) => K::Minute(NULL_INT),
             ColVec::Second(_, _) => K::Second(NULL_INT),
             ColVec::Time(_, _) => K::Time(NULL_INT),
+            ColVec::Enum(t, v) => K::Enum(*t, Box::new(v.null_atom())),
+        }
+    }
+
+    /// The values without an enumeration tag.
+    pub fn plain(&self) -> &ColVec {
+        match self {
+            ColVec::Enum(_, v) => v,
+            other => other,
         }
     }
 
@@ -595,6 +632,7 @@ impl ColVec {
             ColVec::Minute(_, v) => K::Minute(v[idx]),
             ColVec::Second(_, v) => K::Second(v[idx]),
             ColVec::Time(_, v) => K::Time(v[idx]),
+            ColVec::Enum(t, v) => K::Enum(*t, Box::new(v.get_atom(idx))),
         }
     }
 
@@ -646,6 +684,7 @@ impl ColVec {
             ColVec::Minute(_, v) => pick!(Minute, v, NULL_INT),
             ColVec::Second(_, v) => pick!(Second, v, NULL_INT),
             ColVec::Time(_, v) => pick!(Time, v, NULL_INT),
+            ColVec::Enum(t, v) => ColVec::Enum(*t, Box::new(v.gather(indices))),
         }
     }
 
@@ -687,6 +726,7 @@ impl ColVec {
             ColVec::Minute(_, v) => pick!(Minute, v, NULL_INT),
             ColVec::Second(_, v) => pick!(Second, v, NULL_INT),
             ColVec::Time(_, v) => pick!(Time, v, NULL_INT),
+            ColVec::Enum(t, v) => ColVec::Enum(*t, Box::new(v.gather_signed(indices))),
         }
     }
 
@@ -759,6 +799,13 @@ impl ColVec {
         if items.is_empty() {
             return ColVec::General(Attr::None, Arc::new(items));
         }
+        // atoms of one enumeration make an enumeration
+        if let K::Enum(tag, _) = items[0] {
+            if items.iter().all(|x| matches!(x, K::Enum(t, _) if *t == tag)) {
+                let values = items.into_iter().map(|x| x.plain().into_owned()).collect();
+                return ColVec::Enum(tag, Box::new(ColVec::from_atoms(values)));
+            }
+        }
         let t0 = items[0].type_num();
         if t0 < 0 && items.iter().all(|x| x.type_num() == t0) {
             match t0 {
@@ -797,6 +844,9 @@ impl ColVec {
             }};
         }
         match (self, other) {
+            (ColVec::Enum(t, a), ColVec::Enum(u, b)) if t == u => ColVec::Enum(*t, Box::new(a.concat(b))),
+            // (values of different domains, or with others that have none, lose their tags)
+            (ColVec::Enum(..), _) | (_, ColVec::Enum(..)) if !self.is_empty() && !other.is_empty() => self.plain().concat(other.plain()),
             (ColVec::Bool(_, a), ColVec::Bool(_, b)) => cat!(Bool, a, b),
             (ColVec::Guid(_, a), ColVec::Guid(_, b)) => cat!(Guid, a, b),
             (ColVec::Byte(_, a), ColVec::Byte(_, b)) => cat!(Byte, a, b),
@@ -832,6 +882,15 @@ impl ColVec {
 
     /// Strict typed append for table `insert`/`upsert` (coerces int->long/float where safe, errors on incompatible types).
     pub fn append_strict(&self, other: &ColVec) -> KResult<ColVec> {
+        // an enumeration takes only its own: the engine enumerates new values, checking them, before it adds them
+        match (self, other) {
+            (ColVec::Enum(t, a), ColVec::Enum(u, b)) if t == u => return Ok(ColVec::Enum(*t, Box::new(a.append_strict(b)?))),
+            (ColVec::Enum(..), _) if other.is_empty() => return Ok(self.clone()),
+            (ColVec::Enum(t, _), _) => return Err(KError::new("cast", format!("not values of `{}", resolve(t.domain)))),
+            (ColVec::General(..), ColVec::Enum(..)) if self.is_empty() => return Ok(other.clone()),
+            (_, ColVec::Enum(_, b)) => return self.append_strict(b),
+            _ => {}
+        }
         if self.type_num() == other.type_num() || matches!(self, ColVec::General(_, _)) {
             if matches!(self, ColVec::General(_, _)) && self.is_empty() && !matches!(other, ColVec::General(_, _)) {
                 return Ok(other.clone());
@@ -842,8 +901,15 @@ impl ColVec {
         if other.is_empty() {
             return Ok(self.clone());
         }
-        // Safe numeric widening into float or long
+        // Safe numeric widening into float or long, and longs that fit into int
         match (self, other) {
+            (ColVec::Int(_, a), ColVec::Long(_, b)) => {
+                let mut out = (**a).clone();
+                for &v in b.iter() {
+                    out.push(long_as_int(v).ok_or_else(|| KError::ty(format!("{v} does not fit an int column")))?);
+                }
+                Ok(ColVec::Int(Attr::None, Arc::new(out)))
+            }
             (ColVec::Float(_, a), _) if other.is_numeric() => {
                 let mut out = (**a).clone();
                 for i in 0..other.len() {
@@ -924,6 +990,7 @@ impl ColVec {
             ColVec::Float(_, v) | ColVec::Datetime(_, v) => par(v, |&x| float(x)),
             ColVec::Sym(_, v) => par(v, |&x| u64::from(x.0)),
             ColVec::General(..) | ColVec::Guid(..) => return None,
+            ColVec::Enum(_, v) => return v.key_bits(),
         })
     }
 
@@ -956,6 +1023,7 @@ impl ColVec {
             }
             ColVec::Real(_, v) => Some(v.iter().map(|&x| x as f64).collect()),
             ColVec::Float(_, v) | ColVec::Datetime(_, v) => Some((**v).clone()),
+            ColVec::Enum(_, v) => v.as_f64_vec(),
             _ => None,
         }
     }
@@ -972,12 +1040,13 @@ impl ColVec {
             | ColVec::Second(_, v)
             | ColVec::Time(_, v) => Some(v.iter().map(|&x| if x == NULL_INT { NULL_LONG } else { x as i64 }).collect()),
             ColVec::Long(_, v) | ColVec::Timestamp(_, v) | ColVec::Timespan(_, v) => Some((**v).clone()),
+            ColVec::Enum(_, v) => v.as_i64_vec(),
             _ => None,
         }
     }
 
     pub fn as_str(&self) -> Option<String> {
-        if let ColVec::Char(_, bytes) = self {
+        if let ColVec::Char(_, bytes) = self.plain() {
             Some(String::from_utf8_lossy(bytes).into_owned())
         } else {
             None
@@ -1005,6 +1074,7 @@ impl ColVec {
             | ColVec::Datetime(_, _)
             | ColVec::Timespan(_, _) => n * 8,
             ColVec::Guid(_, _) => n * 16,
+            ColVec::Enum(_, v) => v.approx_bytes(),
         }
     }
 }
@@ -1275,6 +1345,8 @@ pub enum K {
     KeyedTable(Arc<KeyedTable>),
     Dict(Arc<Dict>),
     Func(Func),
+    /// An atom (or the key of a compound foreign key) tagged with its domain. (Last, as for `ColVec::Enum`.)
+    Enum(Tag, Box<K>),
 }
 
 impl PartialEq for K {
@@ -1304,6 +1376,7 @@ impl PartialEq for K {
             (K::KeyedTable(a), K::KeyedTable(b)) => a == b,
             (K::Dict(a), K::Dict(b)) => a == b,
             (K::Func(a), K::Func(b)) => a == b,
+            (K::Enum(t, a), K::Enum(u, b)) => t == u && a == b,
             _ => false,
         }
     }
@@ -1318,8 +1391,69 @@ impl K {
         K::Sym(intern(s))
     }
 
+    /// Whether there are enumeration tags at the top or in the items of a list of mixed values; with `deep`, in tables
+    /// and dictionaries too.
+    fn has_tags(&self, deep: bool) -> bool {
+        let column = |c: &ColVec| match c {
+            ColVec::Enum(..) => true,
+            ColVec::General(_, items) => items.iter().any(|i| i.has_tags(deep)),
+            _ => false,
+        };
+        match self {
+            K::Enum(..) => true,
+            K::Vector(c) => column(c),
+            K::Table(t) if deep => t.vals.iter().any(column),
+            K::KeyedTable(t) if deep => t.keys.vals.iter().chain(&t.vals.vals).any(column),
+            K::Dict(d) if deep => d.keys.has_tags(true) || d.vals.has_tags(true),
+            _ => false,
+        }
+    }
+
+    /// The value without the tags that `has_tags` finds.
+    fn stripped(&self, deep: bool) -> K {
+        let column = |c: &ColVec| match c {
+            ColVec::Enum(_, values) => (**values).clone(),
+            ColVec::General(a, items) => ColVec::General(*a, Arc::new(items.iter().map(|i| i.stripped(deep)).collect())),
+            other => other.clone(),
+        };
+        let flip = |f: &Flip| Flip { cols: f.cols.clone(), vals: f.vals.iter().map(column).collect() };
+        match self {
+            K::Enum(_, v) => (**v).clone(),
+            K::Vector(c) => K::Vector(column(c)),
+            K::Table(t) if deep => K::Table(Arc::new(flip(t))),
+            K::KeyedTable(t) if deep => K::KeyedTable(Arc::new(KeyedTable { keys: flip(&t.keys), vals: flip(&t.vals) })),
+            K::Dict(d) if deep => K::Dict(Arc::new(Dict { keys: Box::new(d.keys.stripped(true)), vals: Box::new(d.vals.stripped(true)) })),
+            other => other.clone(),
+        }
+    }
+
+    /// The value as verbs that work on values see it: without enumeration tags.
+    pub fn plain(&self) -> Cow<'_, K> {
+        match self.has_tags(false) {
+            true => Cow::Owned(self.stripped(false)),
+            false => Cow::Borrowed(self),
+        }
+    }
+
+    /// The value as it goes to another program: with no enumeration tags anywhere.
+    pub fn untagged(&self) -> Cow<'_, K> {
+        match self.has_tags(true) {
+            true => Cow::Owned(self.stripped(true)),
+            false => Cow::Borrowed(self),
+        }
+    }
+
+    /// The domain of an enumerated atom or vector.
+    pub fn tag(&self) -> Option<Tag> {
+        match self {
+            K::Enum(t, _) | K::Vector(ColVec::Enum(t, _)) => Some(*t),
+            _ => None,
+        }
+    }
+
     pub fn type_num(&self) -> i16 {
         match self {
+            K::Enum(..) => -20,
             K::Null => 101,
             K::Bool(_) => -1,
             K::Guid(_) => -2,
@@ -1372,6 +1506,7 @@ impl K {
             K::Float(v) | K::Datetime(v) => v.is_nan(),
             K::Char(c) => *c == NULL_CHAR,
             K::Sym(s) => s.is_null(),
+            K::Enum(_, v) => v.is_null(),
             _ => false,
         }
     }
@@ -1383,6 +1518,7 @@ impl K {
             K::Short(v) => Ok(*v != 0),
             K::Int(v) => Ok(*v != 0),
             K::Long(v) => Ok(*v != 0),
+            K::Enum(_, v) => v.as_bool(),
             _ => Err(KError::ty("expected boolean condition")),
         }
     }
@@ -1396,6 +1532,7 @@ impl K {
                 Ok(if *v == NULL_INT { NULL_LONG } else { *v as i64 })
             }
             K::Long(v) | K::Timestamp(v) | K::Timespan(v) => Ok(*v),
+            K::Enum(_, v) => v.as_i64(),
             _ => Err(KError::ty("expected integer")),
         }
     }
@@ -1411,6 +1548,7 @@ impl K {
             K::Long(v) | K::Timestamp(v) | K::Timespan(v) => Ok(if *v == NULL_LONG { f64::NAN } else { *v as f64 }),
             K::Real(v) => Ok(*v as f64),
             K::Float(v) | K::Datetime(v) => Ok(*v),
+            K::Enum(_, v) => v.as_f64(),
             _ => Err(KError::ty("expected number")),
         }
     }
@@ -1420,6 +1558,7 @@ impl K {
             K::Char(c) => Some((*c as char).to_string()),
             K::Sym(s) => Some(resolve(*s)),
             K::Vector(v) => v.as_str(),
+            K::Enum(_, v) => v.as_str(),
             _ => None,
         }
     }
@@ -1438,6 +1577,8 @@ impl K {
     pub fn k_cmp(&self, other: &Self) -> std::cmp::Ordering {
         use std::cmp::Ordering;
         match (self, other) {
+            (K::Enum(_, a), b) => a.k_cmp(b),
+            (a, K::Enum(_, b)) => a.k_cmp(b),
             (K::Sym(a), K::Sym(b)) => a.cmp(b),
             (K::Char(a), K::Char(b)) => a.cmp(b),
             (K::Guid(a), K::Guid(b)) => a.cmp(b),
@@ -1481,6 +1622,9 @@ impl K {
 
     /// Canonical byte key for hashing/grouping/distinct (`NaN` canonicalized so nulls group together).
     pub fn hash_key(&self) -> Vec<u8> {
+        if let K::Enum(_, v) = self {
+            return v.hash_key();
+        }
         let mut out = Vec::with_capacity(12);
         out.extend_from_slice(&self.type_num().to_le_bytes());
         match self {
@@ -1530,6 +1674,7 @@ impl K {
         match self {
             K::Float(v) if v.is_finite() => v.to_string(),
             K::Real(v) if v.is_finite() => v.to_string(),
+            K::Enum(_, v) => v.data_text(),
             other => other.cell_text(),
         }
     }
@@ -1557,6 +1702,7 @@ impl K {
             K::Second(v) => if *v == NULL_INT { String::new() } else { format_second(*v) },
             K::Time(v) => if *v == NULL_INT { String::new() } else { format_time(*v) },
             K::Vector(ColVec::Char(_, bytes)) => String::from_utf8_lossy(bytes).into_owned(),
+            K::Enum(_, v) => v.cell_text(),
             other => other.q_repr(),
         }
     }
@@ -1613,6 +1759,7 @@ impl K {
             K::KeyedTable(kt) => format!("({})!{}", table_repr(&kt.keys), table_repr(&kt.vals)),
             K::Dict(d) => dict_repr(d.keys.q_repr(), d.vals.q_repr()),
             K::Func(f) => f.source_text(),
+            K::Enum(tag, v) => enum_repr(tag, v),
         }
     }
 }
@@ -1666,11 +1813,28 @@ fn escape_q_char(b: u8) -> String {
     }
 }
 
+/// `` `sym$`a `` for an enumeration of a list or of keys, `` `t!0 `` for row numbers.
+fn enum_repr(tag: &Tag, values: &K) -> String {
+    let verb = if tag.source == Source::Rows { '!' } else { '$' };
+    format!("`{}{verb}{}", resolve(tag.domain), values.q_repr())
+}
+
+/// A long as an int, if it is one: nulls and infinities become int ones.
+fn long_as_int(v: i64) -> Option<i32> {
+    match v {
+        NULL_LONG => Some(NULL_INT),
+        INF_LONG => Some(INF_INT),
+        NINF_LONG => Some(NINF_INT),
+        other => i32::try_from(other).ok().filter(|&i| i != NULL_INT),
+    }
+}
+
 fn format_vector_q(v: &ColVec) -> String {
     let pfx = v.attr().prefix();
     let single = v.len() == 1;
     let enlist = if single && !matches!(v, ColVec::Char(_, _)) { "," } else { "" };
     match v {
+        ColVec::Enum(tag, values) => enum_repr(tag, &K::Vector((**values).clone())),
         ColVec::Bool(_, xs) => {
             if xs.is_empty() {
                 format!("{pfx}`boolean$()")

@@ -177,7 +177,10 @@ pub fn set(a: &Flip, b: &Flip, kind: Set) -> KResult<K> {
 
 /// A table made of rows given as dictionaries of its columns, or as lists of values that fit them.
 pub fn from_rows(cols: &[crate::sym::SymId], proto: &[ColVec], rows: &[K]) -> Option<KResult<Flip>> {
-    let fits = |value: &K, column: &ColVec| matches!(column, ColVec::General(..)) || value.type_num().abs() == column.type_num() || column.is_numeric() && matches!(value, K::Long(_) | K::Int(_));
+    let fits = |value: &K, column: &ColVec| {
+        let (value, column) = (value.plain(), column.plain());
+        matches!(column, ColVec::General(..)) || value.type_num().abs() == column.type_num() || column.is_numeric() && matches!(*value, K::Long(_) | K::Int(_))
+    };
     let row = |r: &K| -> Option<Vec<K>> {
         match r {
             K::Dict(d) => cols.iter().map(|&c| ops::dict_lookup(d, &K::Sym(c)).ok()).collect(),

@@ -52,6 +52,7 @@ pub fn is_unary_keyword(s: &str) -> bool {
             | "keys"
             | "cols"
             | "meta"
+            | "fkeys"
             | "tables"
             | "views"
             | "value"
