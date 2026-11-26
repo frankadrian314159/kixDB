@@ -458,8 +458,7 @@ fn reads_on_every_node_see_each_change_whole() {
     let mut g = Group::start(2, 3);
     let third = g.shards.add(2);
     let master = g.master();
-    // a batch that stays, so that there are always rows (`all` of none is not `1b`)
-    g.session(master).eval("ledger: ([] batch: 6#0; sym: `a`b`c`d`e`f; amount: 1 -1 2 -2 3 -3)").unwrap();
+    g.session(master).eval("ledger: ([] batch: `long$(); sym: `symbol$(); amount: `long$())").unwrap();
     let others: Vec<u64> = g.nodes.keys().copied().filter(|&id| id != master).collect();
     let stop = Arc::new(AtomicBool::new(false));
     // batches of rows over the shards that sum to nothing, some changed and removed again
@@ -473,7 +472,7 @@ fn reads_on_every_node_see_each_change_whole() {
             }
             let statement = match n % 5 {
                 3 => format!("update amount: 2 * amount from `ledger where batch > {}", n - 4),
-                4 => format!("delete from `ledger where batch > 0, batch < {}", n - 12),
+                4 => format!("delete from `ledger where batch < {}", n - 12),
                 _ => format!("`ledger insert (6#{n}; `a`b`c`d`e`f; {n} * 1 -1 2 -2 3 -3)"),
             };
             acknowledged += usize::from(writing.eval(&statement).is_ok());
