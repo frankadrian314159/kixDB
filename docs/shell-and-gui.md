@@ -10,7 +10,8 @@ Without a data directory the workspace is in memory. `-Q` (also `-q`, `-c`) and 
 script and exit. `-p` serves the workspace over IPC on the loopback address, without a password. Input continues over
 lines while a bracket, brace or string is open.
 
-q's `\` commands work (see [language.md](language.md#system-commands)), plus `\p [port]` and `\\` to quit.
+q's `\` commands work (see [language.md](language.md#system-commands)), plus `\p [port]` and `\\` to quit. `\t 1000` calls `.z.ts` every second; `.z.pi` and `.z.exit` take the shell's input
+and hear it leave ([callbacks](ipc.md#callbacks)). Arguments after `--` are in `.z.x`.
 
 Values print as in q's console: a list of mixed values one item a line, dictionaries and tables in columns, floats to 7
 significant digits (`\P 12` shows more, `\P 0` all), and no more than 25 lines of 80 characters, with `..` where output

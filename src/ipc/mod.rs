@@ -7,7 +7,7 @@ use crate::error::{KError, KResult};
 use crate::parser::parse_script;
 use crate::sym::{intern, resolve};
 use crate::types::*;
-use crate::Server;
+use crate::{Connection, Server};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use std::collections::HashMap;
@@ -873,6 +873,10 @@ fn handle_client(
 ) -> KResult<()> {
     let _ = tcp.set_nodelay(true);
     let compress = tcp.peer_addr().is_ok_and(|a| !a.ip().is_loopback());
+    let address = tcp.peer_addr().ok().and_then(|a| match a.ip() {
+        std::net::IpAddr::V4(ip) => Some(u32::from(ip)),
+        std::net::IpAddr::V6(ip) => ip.to_ipv4().map(u32::from),
+    });
     let (tls, force_tls) = {
         let g = cfg.read().unwrap_or_else(|e| e.into_inner());
         (g.tls.clone(), g.force_tls)
@@ -925,37 +929,55 @@ fn handle_client(
         }
     }
 
+    let mut conn = server.connect_as_trusted(if user.is_empty() { "anonymous" } else { user });
+    conn.connected_from(address.map_or(0, |a| a as i32));
+    if !conn.authorized(user, pass) {
+        conn.closed(false);
+        let _ = stream.write_all(&[0xff]);
+        let _ = stream.flush();
+        return Ok(());
+    }
+
+    let served = serve_client(&mut *stream, &mut conn, cap, compress, &stop);
+    conn.closed(true);
+    served
+}
+
+/// Accept a client that has been let in, and answer its messages until it leaves.
+fn serve_client(stream: &mut dyn Wire, conn: &mut Connection, cap: u8, compress: bool, stop: &AtomicBool) -> KResult<()> {
     stream.write_all(&[cap.min(3)])?;
     stream.flush()?;
-
-    let mut conn = server.connect_as_trusted(if user.is_empty() { "anonymous" } else { user });
+    conn.opened();
 
     while !stop.load(Ordering::SeqCst) {
-        let (msg_type, le, raw_body) = match read_ipc_frame(&mut *stream) {
+        let (msg_type, le, raw_body) = match read_ipc_frame(stream) {
             Ok(frame) => frame,
             Err(_) => break,
         };
         let (req_k, _) = match decode_k_endian(&raw_body, 0, le) {
             Ok(v) => v,
             Err(e) => {
+                if conn.bad_message(&raw_body) {
+                    break;
+                }
                 if msg_type == MSG_SYNC {
                     let ep = encode_error_payload(&e);
-                    let _ = write_ipc_frame(&mut *stream, MSG_RESPONSE, &ep, compress);
+                    let _ = write_ipc_frame(stream, MSG_RESPONSE, &ep, compress);
                 }
                 continue;
             }
         };
 
-        let res = conn.eval_ipc_message(&req_k);
+        let res = conn.answer(&req_k, msg_type == MSG_SYNC);
         if msg_type == MSG_SYNC {
             match res {
                 Ok(val) => {
                     let payload = encode_k_payload(&val.untagged());
-                    write_ipc_frame(&mut *stream, MSG_RESPONSE, &payload, compress)?;
+                    write_ipc_frame(stream, MSG_RESPONSE, &payload, compress)?;
                 }
                 Err(err) => {
                     let ep = encode_error_payload(&err);
-                    write_ipc_frame(&mut *stream, MSG_RESPONSE, &ep, compress)?;
+                    write_ipc_frame(stream, MSG_RESPONSE, &ep, compress)?;
                 }
             }
         }

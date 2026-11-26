@@ -82,7 +82,9 @@ Unlike kdb+, which holds positions in the domain:
 | system | `get set value parse eval attr system show getenv setenv ltime gtime hopen hclose hcount 0: 1: -8! -9!` |
 | iterators | `each peach over scan prior` (`peach` runs as `each`) |
 
-`.z.p .z.P .z.d .z.D .z.t .z.T .z.u .z.i .z.o .z.K` give the time, user and process. Date and time parts are read with
+`.z.p .z.P .z.d .z.D .z.t .z.T .z.n .z.N .z.z .z.Z` give the time and date; `.z.u .z.i .z.o .z.K .z.h .z.c .z.l .z.q
+.z.r` the user and process; `.z.x .z.X .z.f` the command line (`.z.x`: the arguments after `--`; passwords show as
+`***`); `.z.w .z.a .z.H .z.W` connections ([ipc.md](ipc.md#callbacks)). Date and time parts are read with
 `` `year$x `` or `x.year`, `.mm`, `.dd`, `.hh`, `.uu`, `.ss`, `.minute`, `.date` and so on.
 
 ## qSQL
@@ -128,7 +130,8 @@ parses to a `.kix.table` form, and `'` applied to a named function appears as `e
 ## System commands
 
 `\a` tables, `\b` views, `\v` variables, `\f` functions, `\d` namespace, `\l` load a script or directory, `\t` and `\ts`
-(with `:n` repetitions) timing, `\w` workspace statistics, `\P` significant digits of floats, `\c` lines and characters
+(with `:n` repetitions) timing, `\t 1000` the timer's interval in milliseconds (`\t 0` stops it), `\x name` removes a
+variable, `\w` workspace statistics, `\P` significant digits of floats, `\c` lines and characters
 of printed output.
 
 ## Printing
@@ -162,7 +165,10 @@ A variable assigned one of these names takes its place. Where they differ from k
 
 * `ej` only in bracket form.
 * `.Q.en` records a table's symbols but returns the table without enumerating them.
-* `.z` callbacks (`.z.pg`, `.z.ps`, timers), log replay (`-11!`), and the rest of the `.Q` namespace: functions for
+* Sending to a client that connected (`neg[.z.w] msg`, so no publishing from `.z.ts`), and the callbacks of web and
+  socket servers (`.z.ph .z.pp .z.pm .z.ac .z.ws .z.wo .z.wc`), `.z.pq` and `.z.pd`: kixdb has none of these.
+* `.z.e .z.ex .z.ey .z.k .z.m .z.M .z.zd`.
+* Log replay (`-11!`), and the rest of the `.Q` namespace: functions for
   partitioned databases and files, `.Q.hg` and `.Q.hp` (HTTP), `.Q.host`, `.Q.K`, and kdb+ internals (`.Q.ipc`,
   `.Q.prf0`, `.Q.rp`, `.Q.m`).
 * The parts of `.h` that serve web pages (`.h.he .h.hn .h.hp .h.hy .h.ka .h.jx .h.val .h.HOME .h.ht .h.fram .h.logo`):

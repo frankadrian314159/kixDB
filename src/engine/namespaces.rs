@@ -127,6 +127,14 @@ fn decode_digits(x: &K, digits: &str, width: usize) -> KResult<K> {
     Ok(K::string(&String::from_utf8_lossy(&out)))
 }
 
+/// The IPv4 address of a host, by name or dotted number, as an int (-1 if it has none).
+pub(crate) fn address(host: &str) -> i32 {
+    let found = host.parse::<Ipv4Addr>().ok().or_else(|| {
+        (host, 0).to_socket_addrs().ok()?.find_map(|a| if let SocketAddr::V4(a) = a { Some(*a.ip()) } else { None })
+    });
+    found.map_or(-1, |ip| u32::from(ip) as i32)
+}
+
 /// `.Q.id`: names made into valid ones that differ from each other and from q's words.
 fn identifiers(names: &[SymId]) -> Vec<SymId> {
     let mut made: Vec<SymId> = vec![];
@@ -271,13 +279,7 @@ impl Engine<'_> {
                 let first = i32::try_from(total.div_euclid(12)).ok().and_then(|y| date_from_ymd(y, total.rem_euclid(12) as u32 + 1, 1));
                 Ok(K::Date(first.map_or(NULL_INT, |first| first + day as i32 - 1)))
             })?,
-            ".Q.addr" => {
-                let host = text(x)?;
-                let found = host.parse::<Ipv4Addr>().ok().or_else(|| {
-                    (host.as_str(), 0).to_socket_addrs().ok()?.find_map(|a| if let SocketAddr::V4(a) = a { Some(*a.ip()) } else { None })
-                });
-                K::Int(found.map_or(-1, |ip| u32::from(ip) as i32))
-            }
+            ".Q.addr" => K::Int(address(&text(x)?)),
             ".Q.atob" => byte_list(BASE64.decode(bytes(x)?).map_err(|e| KError::domain(format!("not base64: {e}")))?),
             ".Q.btoa" => K::string(&BASE64.encode(bytes(x)?)),
             ".Q.sha1" => byte_list(Sha1::digest(bytes(x)?).to_vec()),

@@ -2299,6 +2299,7 @@ dependencies = [
  "egui",
  "egui_extras",
  "flate2",
+ "gethostname",
  "md-5",
  "mimalloc",
  "postcard",

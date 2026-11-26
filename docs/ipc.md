@@ -20,6 +20,33 @@ The shell (`kix -p`) and `kix-gui` listen on this machine only.
 
 Compressed messages are always accepted. Replies over 2,000 bytes are compressed for clients on other machines.
 
+## Callbacks
+
+A function assigned to one of these names is called by `kix-serve`, `kix -p` and `kix-gui`:
+
+| Name | Called with | When |
+| --- | --- | --- |
+| `.z.pw` | user (symbol), password (string) | a client connects, after `-u`; only `1b` lets it in |
+| `.z.po`, `.z.pc` | the client's handle | after a client is let in, and after it leaves |
+| `.z.pg`, `.z.ps` | the message | a synchronous or asynchronous request, in place of evaluating it |
+| `.z.bm` | `(handle; bytes)` | a message cannot be read; the connection is then closed |
+| `.z.ts` | the time (UTC timestamp) | every `\t` milliseconds, in `kix` and `kix-serve` |
+| `.z.vs` | name, `()` | a global in the root namespace is set (the indices of an amend are not given) |
+| `.z.pi` | the line | in the shell, in place of evaluating what is typed (not system commands) |
+| `.z.exit` | the exit code | the shell ends (`kix-serve`, which is stopped by a signal, does not call it) |
+
+In a callback `.z.w` is the client's handle, `.z.a` its address and `.z.u` its user. `\x .z.pg` restores a default.
+What `show` and `0N!` print in a callback goes to the console of the process.
+
+* **While any request has a callback to run, it runs alone:** with `.z.pg` defined, queries no longer run at the same
+  time as each other (see [Concurrency](#concurrency)).
+* **Callbacks are variables,** so a durable workspace keeps them. A `.z.pw` that lets nobody in locks every client out:
+  open the data directory with `kix` and remove it with `\x .z.pw`.
+* **They are not a sandbox.** `.z.pg` replaces evaluation only for synchronous requests; define `.z.ps` too to control
+  asynchronous ones. Any client let in can otherwise run any q, including changing the callbacks.
+* `.z.pw` does not count as the password that listening beyond this machine requires.
+* Nothing can be sent to a client other than the answer to its request: `neg[.z.w] msg` signals `'nyi`.
+
 ## Concurrency
 
 Statements that only read run side by side, each on the data as it was when it started, and a change does not wait for

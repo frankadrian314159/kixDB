@@ -22,6 +22,8 @@ Enter q / qSQL expressions at the q) prompt. Backslash commands match kdb+, and 
   \\d [.ns]                   show or switch current namespace
   \\l PATH                    load a .q script or mount an HDB directory
   \\t [:N] EXPR               execution time in milliseconds (N iterations)
+  \\t [MS]                    show or set the interval of the timer that calls .z.ts (0: off)
+  \\x NAME                    remove a variable, such as a callback
   \\ts [:N] EXPR              time (ms) and space (bytes) of EXPR
   \\p [PORT]                  start/show background IPC listener on PORT
   \\w  | .storage             workspace memory, symbol pool, and WAL statistics
@@ -40,10 +42,11 @@ Dot commands:
   .checkpoint                fold WAL into an atomic snapshot now
   .help                      show this help";
 
-const USAGE: &str = "usage: kix [DATA_DIR | SCRIPT.q] [-D dir] [-p port] [--connect host[:port]] [-U user -P pass] [-Q expr]... [-i script.q]...
+const USAGE: &str = "usage: kix [DATA_DIR | SCRIPT.q] [-D dir] [-p port] [--connect host[:port]] [-U user -P pass] [-Q expr]... [-i script.q]... [-- ARGS]
 
 Without a data directory the workspace lives in memory only. Passing a .q file loads it before entering the REPL
-(or exits if -Q/-q is also given). --connect attaches the shell to a remote kix-serve / kix-cluster over kdb+ IPC.";
+(or exits if -Q/-q is also given). --connect attaches the shell to a remote kix-serve / kix-cluster over kdb+ IPC.
+Arguments after -- are the script's own, in .z.x.";
 
 enum Target {
     Local {
@@ -81,6 +84,7 @@ fn main() -> ExitCode {
 
     while let Some(a) = args.next() {
         match a.as_str() {
+            "--" => break,
             "-h" | "--help" | "-?" => {
                 println!("{USAGE}\n\n{HELP}");
                 return ExitCode::SUCCESS;
@@ -164,6 +168,11 @@ fn main() -> ExitCode {
     };
 
     let mut sh = Shell { target, timer: false, failed: false };
+    // (stopped before the workspace closes)
+    let _timer = match &sh.target {
+        Target::Local { server, .. } => Some(server.start_timer()),
+        Target::Remote { .. } => None,
+    };
     for s in &preload_scripts {
         sh.run_code(s);
     }
@@ -172,6 +181,7 @@ fn main() -> ExitCode {
         for j in &jobs {
             sh.run_code(j);
         }
+        sh.leave(i32::from(sh.failed));
         return if sh.failed { ExitCode::FAILURE } else { ExitCode::SUCCESS };
     }
 
@@ -189,6 +199,7 @@ fn main() -> ExitCode {
         }
     }
     sh.repl(interactive);
+    sh.leave(0);
     ExitCode::SUCCESS
 }
 
@@ -257,12 +268,35 @@ impl Shell {
             buf.push_str(&line);
             if tools::delimiters_balanced(&buf) {
                 let code = std::mem::take(&mut buf);
-                self.run_code(&code);
+                if !self.input_callback(&code) {
+                    self.run_code(&code);
+                }
             }
         }
         if !buf.trim().is_empty() {
             self.run_code(&buf);
         }
+    }
+
+    fn leave(&mut self, code: i32) {
+        if let Target::Local { conn, .. } = &mut self.target {
+            conn.leaving(code);
+        }
+    }
+
+    /// Whether `.z.pi` took what was typed. (System commands never go to it, so `\\x .z.pi` can remove it.)
+    fn input_callback(&mut self, code: &str) -> bool {
+        let Target::Local { conn, .. } = &mut self.target else { return false };
+        if code.trim_start().starts_with('\\') {
+            return false;
+        }
+        match conn.console_input(code) {
+            None => return false,
+            Some(Ok(K::Null)) => {}
+            Some(Ok(value)) => println!("{}", kixdb::display::console(&value)),
+            Some(Err(e)) => eprintln!("{e}"),
+        }
+        true
     }
 
     fn handle_port_cmd(&mut self, arg: &str) {

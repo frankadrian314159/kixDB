@@ -2,6 +2,7 @@
 //! protected evaluation (`@[f;x;h]` / `.[f;args;h]`), views (`::`), and system commands (`\...`).
 pub mod joins;
 pub mod builtins;
+mod dotz;
 mod enums;
 mod json;
 mod markup;
@@ -23,10 +24,10 @@ use crate::sym::{intern, resolve, sym_count, SymId};
 use crate::types::*;
 use chrono::{Datelike, Local, Timelike, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -126,7 +127,22 @@ impl<T: Clone> DerefMut for Shared<T> {
     }
 }
 
+/// What a workspace shares with the processes that serve it, and with its copies.
+#[derive(Debug, Default)]
+pub struct Host {
+    /// The handles of the clients that are connected.
+    pub clients: Mutex<BTreeSet<i32>>,
+    /// The interval of the timer (`\t`), 0 for none.
+    pub timer_ms: AtomicU64,
+    /// Set on a cluster's control node, which does not make the callbacks in `NOT_ON_A_CLUSTER`.
+    pub cluster: AtomicBool,
+}
+
+/// Callbacks that a cluster's control node refuses, so that none is taken to be in force when it is not.
+const NOT_ON_A_CLUSTER: [&str; 4] = [".z.pg", ".z.ps", ".z.ts", ".z.vs"];
+
 pub struct Workspace {
+    pub host: Arc<Host>,
     pub vars: Shared<HashMap<SymId, K>>,
     pub views: Shared<HashMap<SymId, ViewDef>>,
     pub dist: Shared<HashMap<SymId, DistMode>>,
@@ -151,6 +167,7 @@ impl Default for Workspace {
 impl Workspace {
     pub fn new() -> Self {
         Self {
+            host: Arc::default(),
             vars: Shared::default(),
             views: Shared::default(),
             dist: Shared::default(),
@@ -169,6 +186,7 @@ impl Workspace {
     /// shared until one side writes them.
     pub fn snapshot(&self) -> Workspace {
         Workspace {
+            host: self.host.clone(),
             vars: self.vars.clone(),
             views: self.views.clone(),
             dist: self.dist.clone(),
@@ -207,6 +225,8 @@ pub struct SessionState {
     pub next_handle: i32,
     /// `\P` and `\c`.
     pub display: crate::display::Settings,
+    /// For a client's connection, its handle (`.z.w`) and IPv4 address (`.z.a`).
+    pub client: Option<(i32, i32)>,
     /// Set (from any thread) to stop what the session is evaluating before its next step, with `'stop`.
     pub cancel: Arc<AtomicBool>,
 }
@@ -220,6 +240,7 @@ impl SessionState {
             handles: HashMap::new(),
             next_handle: 3,
             display: Default::default(),
+            client: None,
             cancel: Arc::default(),
         }
     }
@@ -254,6 +275,8 @@ pub struct Engine<'a> {
     table_scopes: Vec<TableScope>,
     /// The lambdas being called, innermost last.
     running: Vec<Arc<Lambda>>,
+    /// Whether `.z.vs` is being called, which does not call itself.
+    watching: bool,
     /// Where the last error not yet trapped arose, for `.Q.trp`.
     backtrace: Vec<K>,
     /// The views being computed.
@@ -284,10 +307,16 @@ impl<'a> Engine<'a> {
             table_scopes: Vec::new(),
             running: Vec::new(),
             backtrace: Vec::new(),
+            watching: false,
             viewing: Vec::new(),
             messages: Vec::new(),
             replaying: false,
         }
+    }
+
+    /// What `show` and `0N!` have printed since the last call.
+    pub(crate) fn take_messages(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.messages)
     }
 
     pub fn eval_str(&mut self, src: &str) -> KResult<K> {
@@ -403,6 +432,19 @@ impl<'a> Engine<'a> {
     pub fn write_globals(&mut self, writes: Vec<(SymId, Write)>) -> KResult<()> {
         let logged = !self.replaying && (self.ws.persist.get_mut().is_ok_and(|p| p.is_some()) || self.ws.replicator.get_mut().is_ok_and(|r| r.is_some()));
         self.ws.writable()?;
+        if self.ws.host.cluster.load(Ordering::SeqCst) {
+            let refused = |w: &(SymId, Write)| !matches!(w.1, Write::Value(None)) && NOT_ON_A_CLUSTER.contains(&resolve(w.0).as_str());
+            if let Some((name, _)) = writes.iter().find(|w| refused(w)) {
+                return Err(KError::nyi(format!("{} on a cluster", resolve(*name))));
+            }
+        }
+        // `.z.vs` hears of each global set in the root namespace
+        let watched = !self.replaying && !self.watching;
+        let watcher = watched.then(|| self.ws.vars.get(&intern(".z.vs")).cloned()).flatten();
+        let set: Vec<SymId> = match watcher {
+            Some(_) => writes.iter().filter(|w| !matches!(w.1, Write::Value(None)) && !resolve(w.0).starts_with('.')).map(|w| w.0).collect(),
+            None => vec![],
+        };
         // every change must find the value it was made from before any of them is logged or made
         for (name, write) in &writes {
             if matches!(write, Write::Change(c) if !self.ws.vars.get(name).is_some_and(|v| crate::delta::fits(v, c))) {
@@ -452,6 +494,15 @@ impl<'a> Engine<'a> {
                         crate::delta::patch(value, &changes);
                     }
                 }
+            }
+        }
+        if let Some(watcher) = watcher {
+            for name in set {
+                self.watching = true;
+                let none = K::Vector(ColVec::General(Attr::None, Arc::new(vec![])));
+                let heard = self.apply_value(&watcher, &[Some(K::Sym(name)), Some(none)]);
+                self.watching = false;
+                heard?;
             }
         }
         Ok(())
@@ -678,6 +729,7 @@ impl<'a> Engine<'a> {
             ".z.s" => Ok(self.running.last().map(|lam| K::Func(Func::Lambda(lam.clone())))),
             ".z.i" => Ok(Some(K::Int(std::process::id() as i32))),
             ".z.u" => Ok(Some(K::Sym(intern(&self.session.login)))),
+            _ if s.starts_with(".z.") && self.system_value(s).is_some() => Ok(self.system_value(s)),
             ".z.o" => Ok(Some(K::Sym(intern(if cfg!(windows) { "w64" } else if cfg!(target_os = "macos") { "m64" } else { "l64" })))),
             // a variable of the same name takes the place of a built-in of these namespaces
             _ if [".Q.", ".h.", ".j.", ".kix."].iter().any(|ns| s.starts_with(ns)) && !self.ws.vars.contains_key(&intern(s)) => {
@@ -1031,6 +1083,8 @@ impl<'a> Engine<'a> {
                     let applied = match items.first() {
                         Some(K::Func(f)) => Some(K::Func(f.clone())),
                         Some(K::Sym(name)) => Some(self.get_var(*name)?),
+                        // (a function as its source, as a client may send it)
+                        Some(K::Vector(ColVec::Char(_, source))) if items.len() > 1 => Some(self.eval_str(&String::from_utf8_lossy(source))?),
                         _ => None,
                     };
                     if let Some(f) = applied {
@@ -1149,6 +1203,9 @@ impl<'a> Engine<'a> {
             K::Long(h) if (*h as i32 != 0) && self.session.handles.contains_key(&((*h as i32).abs())) => {
                 let hi = *h as i32;
                 self.apply_value(&K::Int(hi), args)
+            }
+            K::Int(h) if self.ws.host.clients.lock().unwrap_or_else(|e| e.into_inner()).contains(&h.saturating_abs()) => {
+                Err(KError::nyi("sending to a client that connected"))
             }
             // Symbol handle one-shot IPC `` `:localhost:5000 "1+1" ``
             K::Sym(s) if resolve(*s).starts_with("::") || (resolve(*s).starts_with(':') && resolve(*s)[1..].contains(':')) => {
@@ -2034,8 +2091,13 @@ impl<'a> Engine<'a> {
                 }
             }
             "t" => {
+                // `\t` shows the timer's interval and `\t 100` sets it
                 if arg.is_empty() {
-                    return Ok(K::Int(0));
+                    return Ok(K::Int(self.ws.host.timer_ms.load(Ordering::SeqCst) as i32));
+                }
+                if let Ok(ms) = arg.parse::<u32>() {
+                    self.ws.host.timer_ms.store(u64::from(ms), Ordering::SeqCst);
+                    return Ok(K::Null);
                 }
                 // `\t:100 expr` runs 100 times!
                 let (iters, code) = if let Some(rest) = arg.strip_prefix(':') {
@@ -2069,6 +2131,14 @@ impl<'a> Engine<'a> {
                 }
                 let ms = t0.elapsed().as_millis() as i64;
                 Ok(K::Vector(ColVec::Long(Attr::None, Arc::new(vec![ms, last_bytes as i64]))))
+            }
+            // `\x name` removes a variable, and so restores a callback's default
+            "x" => {
+                let name = self.qualify(intern(arg));
+                if self.ws.vars.contains_key(&name) {
+                    self.set_globals(vec![(name, None)])?;
+                }
+                Ok(K::Null)
             }
             "w" => {
                 let used = self.ws.approx_memory_bytes() as i64;

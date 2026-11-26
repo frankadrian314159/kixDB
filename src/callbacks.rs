@@ -1,0 +1,150 @@
+//! The `.z` callbacks that a shell or server makes, calling the functions that the workspace holds under those names: on
+//! connections (`.z.pw`, `.z.po`, `.z.pc`), messages (`.z.pg`, `.z.ps`, `.z.bm`), the timer (`.z.ts`), console input
+//! (`.z.pi`) and leaving (`.z.exit`). (`.z.vs`, on setting a global, is the engine's.)
+use crate::engine::Engine;
+use crate::error::KResult;
+use crate::sym::intern;
+use crate::types::*;
+use crate::{Connection, Server};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+/// The first handle given to a client that connects.
+const FIRST_CLIENT: i32 = 1000;
+
+/// How often the timer looks for a change of its interval (`\t`).
+const TICK: Duration = Duration::from_millis(20);
+
+impl Connection {
+    /// Call the callback `name`, if there is one, in the root namespace and alone on the workspace. What it prints goes
+    /// to the console.
+    fn callback(&mut self, name: &str, args: &[K]) -> Option<KResult<K>> {
+        let function = self.server.read_workspace(|ws| ws.vars.get(&intern(name)).cloned())?;
+        let namespace = std::mem::take(&mut self.session.current_ns);
+        let result = {
+            let mut ws = self.server.shared.ws.write().unwrap_or_else(|e| e.into_inner());
+            let mut engine = Engine::new(&mut ws, &mut self.session);
+            let args: Vec<Option<K>> = args.iter().cloned().map(Some).collect();
+            let result = engine.apply_value(&function, &args);
+            engine.take_messages().iter().for_each(|m| println!("{m}"));
+            result
+        };
+        self.session.current_ns = namespace;
+        Some(result)
+    }
+
+    /// A callback whose result is not wanted: an error is printed.
+    fn notify(&mut self, name: &str, args: &[K]) {
+        if let Some(Err(e)) = self.callback(name, args) {
+            eprintln!("'{} in {name}: {e}", e.signal);
+        }
+    }
+
+    /// Take this connection to be a client's, from the IPv4 `address`: it gets a handle (`.z.w`).
+    pub(crate) fn connected_from(&mut self, address: i32) {
+        let handle = self.server.read_workspace(|ws| {
+            let mut clients = ws.host.clients.lock().unwrap_or_else(|e| e.into_inner());
+            let free = (FIRST_CLIENT..).find(|h| !clients.contains(h)).unwrap_or(FIRST_CLIENT);
+            clients.insert(free);
+            free
+        });
+        self.session.client = Some((handle, address));
+    }
+
+    /// Whether `.z.pw` lets the user in: anything but true, an error included, keeps them out.
+    pub(crate) fn authorized(&mut self, user: &str, password: &str) -> bool {
+        let answer = self.callback(".z.pw", &[K::sym(user), K::string(password)]);
+        answer.is_none_or(|a| matches!(a, Ok(K::Bool(true))))
+    }
+
+    pub(crate) fn opened(&mut self) {
+        if let Some((handle, _)) = self.session.client {
+            self.notify(".z.po", &[K::Int(handle)]);
+        }
+    }
+
+    /// Forget the client's handle and, for a connection that was `opened`, call `.z.pc` with it.
+    pub(crate) fn closed(&mut self, opened: bool) {
+        let Some((handle, _)) = self.session.client.take() else { return };
+        self.server.read_workspace(|ws| ws.host.clients.lock().unwrap_or_else(|e| e.into_inner()).remove(&handle));
+        if opened {
+            self.notify(".z.pc", &[K::Int(handle)]);
+        }
+    }
+
+    /// The answer to a client's message: what `.z.pg` (`.z.ps` for an asynchronous one) makes of it, or else its value.
+    pub(crate) fn answer(&mut self, message: &K, sync: bool) -> KResult<K> {
+        let name = if sync { ".z.pg" } else { ".z.ps" };
+        self.callback(name, std::slice::from_ref(message)).unwrap_or_else(|| self.eval_ipc_message(message))
+    }
+
+    /// Give `.z.bm` a message that could not be read; whether there is one (the connection is then closed).
+    pub(crate) fn bad_message(&mut self, bytes: &[u8]) -> bool {
+        let handle = K::Int(self.session.client.map_or(0, |c| c.0));
+        let raw = K::Vector(ColVec::Byte(Attr::None, Arc::new(bytes.to_vec())));
+        let report = K::Vector(ColVec::General(Attr::None, Arc::new(vec![handle, raw])));
+        let handled = self.callback(".z.bm", &[report]);
+        if let Some(Err(e)) = &handled {
+            eprintln!("'{} in .z.bm: {e}", e.signal);
+        }
+        handled.is_some()
+    }
+
+    /// What `.z.pi` makes of a line typed at the console, if there is one.
+    pub fn console_input(&mut self, line: &str) -> Option<KResult<K>> {
+        self.callback(".z.pi", &[K::string(line)])
+    }
+
+    /// Call `.z.exit` with the exit code, before the process ends.
+    pub fn leaving(&mut self, code: i32) {
+        self.notify(".z.exit", &[K::Int(code)]);
+    }
+}
+
+/// The thread that calls `.z.ts` every `\t` milliseconds; dropping this stops it.
+pub struct Timer {
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Drop for Timer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            thread.thread().unpark();
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Server {
+    /// Run the timer, which `\t` sets, until what this returns is dropped.
+    pub fn start_timer(&self) -> Timer {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (stopping, mut conn) = (stop.clone(), self.connect_internal());
+        let host = self.read_workspace(|ws| ws.host.clone());
+        let thread = std::thread::spawn(move || {
+            // the interval that was set and when it next ends
+            let mut next: Option<(u64, Instant)> = None;
+            while !stopping.load(Ordering::SeqCst) {
+                let now = Instant::now();
+                next = match (host.timer_ms.load(Ordering::SeqCst), next) {
+                    (0, _) => None,
+                    (ms, Some(running)) if running.0 == ms => Some(running),
+                    (ms, _) => now.checked_add(Duration::from_millis(ms)).map(|due| (ms, due)),
+                };
+                if let Some((ms, due)) = next.filter(|n| n.1 <= now) {
+                    if let Ok(time) = conn.eval(".z.p") {
+                        conn.notify(".z.ts", &[time]);
+                    }
+                    // (intervals missed while the call ran are not made up)
+                    next = Some((ms, (due + Duration::from_millis(ms)).max(Instant::now())));
+                }
+                std::thread::park_timeout(next.map_or(TICK, |n| n.1.saturating_duration_since(Instant::now()).min(TICK)));
+            }
+        });
+        Timer { stop, thread: Some(thread) }
+    }
+}

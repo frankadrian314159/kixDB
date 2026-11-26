@@ -398,6 +398,23 @@ fn clients_see_one_database_over_ipc() {
 }
 
 #[test]
+fn callbacks_a_cluster_cannot_make_are_refused() {
+    let p = market(2);
+    let listener = Listener::bind(p.cluster.gateway(), "127.0.0.1:0", IpcConfig::default()).unwrap();
+    let address = listener.local_addr().to_string();
+    let mut client = IpcClient::connect_addr(&address, "alice", "").unwrap();
+    // none is left in force for a client to rely on, however it is set
+    for statement in [".z.pg: {'denied}", ".z.ps: {x}", "`.z.ts set {x}", ".z.vs: {[n; i] n}"] {
+        assert_eq!(client.query_str(statement).err().map(|e| e.signal), Some("nyi".into()), "{statement}");
+    }
+    assert_eq!(client.query_str("count trade").unwrap(), K::Long(240));
+    // who connects is still checked
+    client.query_str(".z.pw: {[user; password] user = `alice}").unwrap();
+    assert!(IpcClient::connect_addr(&address, "alice", "").is_ok());
+    assert!(IpcClient::connect_addr(&address, "mallory", "").is_err());
+}
+
+#[test]
 fn concurrent_sessions() {
     let p = market(3);
     std::thread::scope(|scope| {

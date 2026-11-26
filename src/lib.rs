@@ -9,6 +9,7 @@
 //! ```
 pub mod ast;
 pub mod bytes;
+mod callbacks;
 pub mod delta;
 pub mod display;
 pub mod engine;
@@ -30,6 +31,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+pub use callbacks::Timer;
 pub use engine::{flip_to_resultset, k_to_resultset, BatchResult, DistMode, Event, ResultSet};
 pub use error::{KError, KResult};
 pub use inspect::StoreStats;
@@ -152,6 +154,11 @@ impl Server {
     }
 
     // ----- Replication, Snapshot & Lifecycle Hooks --------------------------
+
+    /// Make this the workspace of a cluster's control node, which refuses the callbacks it does not make.
+    pub fn serve_a_cluster(&self) {
+        self.read_workspace(|ws| ws.host.cluster.store(true, Ordering::SeqCst));
+    }
 
     pub fn set_replicator(&self, r: Option<Arc<dyn persist::Replicator>>) {
         let g = self.shared.ws.read().unwrap_or_else(|e| e.into_inner());

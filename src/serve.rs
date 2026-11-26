@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! kix-serve [DATA_DIR] [-p|--port N] [--bind ADDR] [-u USER:PASS] [--tls-cert FILE --tls-key FILE | --tls] [--no-sync]
+//!           [-- ARGS]
 //! ```
 //!
 //! An address other machines can reach needs `-u` and `--force-tls`, or `--insecure-clients` to listen unprotected.
@@ -56,6 +57,8 @@ fn main() {
             "--force-tls" => force_tls = true,
             "--insecure-clients" => insecure_clients = true,
             "-h" | "--help" => usage(),
+            // (what follows is the workspace's own, in `.z.x`)
+            "--" => break,
             other if !other.starts_with('-') && dir.is_none() => dir = Some(other.to_string()),
             _ => usage(),
         }
@@ -107,7 +110,8 @@ fn main() {
         Ok(()) => {}
     }
 
-    let listener = match Listener::bind(server, (bind.as_str(), port), ipc_cfg) {
+    let _timer = server.start_timer();
+    let listener = match Listener::bind(server.clone(), (bind.as_str(), port), ipc_cfg) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("cannot listen on {bind}:{port}: {e}");

@@ -296,6 +296,7 @@ impl Cluster {
     /// A server whose connections run on the cluster: bind a `kixdb::ipc::Listener` to it to serve kdb+ IPC clients
     /// (`kix`, `kix-gui`, `hopen`) as one database.
     pub fn gateway(&self) -> Server {
+        self.inner.mirror.serve_a_cluster();
         let inner = Arc::downgrade(&self.inner);
         let cluster_gone = || -> Box<dyn Interceptor> { Box::new(Closed) };
         self.inner.mirror.set_interceptor(Some(Arc::new(move || match inner.upgrade() {

@@ -143,6 +143,12 @@ q results depend on row order. A shard keeps its rows in their original relative
 parallel vector `.kix.ord.<table>` holds every row's global ordinal. The control node merges rows from several shards by
 ordinal, so they come back in the order one server would hold them.
 
+### Callbacks
+
+The control node calls `.z.pw`, `.z.po`, `.z.pc` and `.z.bm` ([ipc.md](ipc.md#callbacks)). It does not call `.z.pg`,
+`.z.ps`, `.z.ts` or `.z.vs`, and refuses to let them be assigned (`'nyi`), so that no access rule is taken to be in
+force when it is not.
+
 ### Foreign keys, links and enumerations
 
 Enumerated columns keep their domains on the shards. A shard follows a key into its own copy of the table referred to,
