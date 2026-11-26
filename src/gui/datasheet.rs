@@ -340,7 +340,7 @@ impl Datasheet {
             self.load(conn);
         }
         if let Some((r, c)) = start_edit {
-            let cur = self.rows.get(r).and_then(|row| row.get(c)).map(|v| v.cell_text()).unwrap_or_default();
+            let cur = self.rows.get(r).and_then(|row| row.get(c)).map(|v| v.data_text()).unwrap_or_default();
             self.editing = Some(Edit { row: r, col: c, text: cur, focused: false });
         }
         if cancel_edit {

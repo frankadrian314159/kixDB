@@ -100,7 +100,14 @@ parses to a `.kix.table` form, and `'` applied to a named function appears as `e
 ## System commands
 
 `\a` tables, `\b` views, `\v` variables, `\f` functions, `\d` namespace, `\l` load a script or directory, `\t` and `\ts`
-(with `:n` repetitions) timing, `\w` workspace statistics.
+(with `:n` repetitions) timing, `\w` workspace statistics, `\P` significant digits of floats, `\c` lines and characters
+of printed output.
+
+## Printing
+
+`.Q.s x` is what the console shows for `x`; `.Q.s1 x` and `-3!x` give its one-line q form (`` `a`b!1 2 ``,
+`` +`c!,1 2 ``). Both round floats to `\P` digits, as `string` does. Files written with `0:` and exported CSV keep every
+digit, unlike kdb+.
 
 ## Not implemented
 

@@ -246,7 +246,7 @@ impl QueryTab {
                                 ui.monospace(format!("({} row(s), {} col(s))", rs.rows.len(), rs.columns.len()));
                             }
                             OutputItem::Value(k) => {
-                                ui.monospace(k.q_repr());
+                                ui.monospace(kixdb::display::console(k));
                             }
                             OutputItem::Message(m) => {
                                 ui.monospace(m);

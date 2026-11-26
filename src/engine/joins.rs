@@ -457,11 +457,9 @@ pub fn asof_join(cols_k: &K, lhs: &K, rhs: &K, preserve_lhs_time: bool) -> KResu
 }
 
 pub fn asof_op(lhs: &K, rhs: &K) -> KResult<K> {
-    let lf = match lhs {
-        K::Table(t) => (**t).clone(),
-        K::KeyedTable(kt) => kt.unkey(),
-        _ => return Err(KError::ty("asof LHS must be a table")),
-    };
+    if !matches!(lhs, K::Table(_) | K::KeyedTable(_)) {
+        return Err(KError::ty("asof LHS must be a table"));
+    }
     let cols = match rhs {
         K::Dict(d) => {
             let K::Vector(ColVec::Sym(_, cs)) = &*d.keys else {
@@ -469,13 +467,23 @@ pub fn asof_op(lhs: &K, rhs: &K) -> KResult<K> {
             };
             let probe_t = crate::engine::ops::enlist_op(rhs);
             let joined = asof_join(&K::Vector(ColVec::Sym(Attr::None, cs.clone())), &probe_t, lhs, true)?;
-            return Ok(crate::engine::ops::first_op(&joined));
+            return Ok(crate::engine::ops::first_op(&without(joined, cs)?));
         }
         K::Table(rt) => rt.cols.clone(),
         _ => return Err(KError::ty("asof RHS must be dict or table")),
     };
-    let _ = lf;
-    asof_join(&K::Vector(ColVec::Sym(Attr::None, Arc::new(cols))), rhs, lhs, true)
+    without(asof_join(&K::Vector(ColVec::Sym(Attr::None, Arc::new(cols.clone()))), rhs, lhs, true)?, &cols)
+}
+
+/// A table without the columns `names`: `asof` gives only what it looked up.
+fn without(table: K, names: &[SymId]) -> KResult<K> {
+    match table {
+        K::Table(t) => {
+            let (cols, vals) = t.cols.iter().zip(&t.vals).filter(|(c, _)| !names.contains(c)).map(|(c, v)| (*c, v.clone())).unzip();
+            Ok(K::Table(Arc::new(Flip { cols, vals })))
+        }
+        other => Ok(other),
+    }
 }
 
 // ----- Window Join (`wj`, `wj1`) --------------------------------------------

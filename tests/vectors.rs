@@ -151,7 +151,7 @@ fn aggregates_over_all_groups_at_once_match_the_group_by_group_results() {
         ("(select ok: 1b, n: count i by k from t) ~ ([k: 1 2 3] ok: 111b; n: 2 3 1)", "1b"),
         // keys sort by every column, the first one first
         ("(key select count i by s, k from t) ~ ([] s: ``a`b`b; k: 1 2 1 3)", "1b"),
-        ("exec r from select r: (sum j) % count i, q: sums j by k from t", "2 3.3333333 5"),
+        ("exec r from select r: (sum j) % count i, q: sums j by k from t", "2 3.333333 5"),
     ] {
         assert_eq!(eval(&mut c, code), expected, "{code}");
     }

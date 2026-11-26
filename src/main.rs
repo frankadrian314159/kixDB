@@ -25,6 +25,8 @@ Enter q / qSQL expressions at the q) prompt. Backslash commands match kdb+, and 
   \\ts [:N] EXPR              time (ms) and space (bytes) of EXPR
   \\p [PORT]                  start/show background IPC listener on PORT
   \\w  | .storage             workspace memory, symbol pool, and WAL statistics
+  \\P [DIGITS]                show or set the significant digits of floats (7; 0: all)
+  \\c [LINES CHARS]           show or set the size of printed output (25 80)
   \\\\  | .quit | exit         exit shell
 
 Dot commands:
@@ -290,7 +292,7 @@ impl Shell {
             }
             Target::Remote { client, .. } => match client.query_str(code) {
                 Ok(K::Null) => {}
-                Ok(val) => println!("{}", val.q_repr()),
+                Ok(val) => println!("{}", kixdb::display::console(&val)),
                 Err(e) => {
                     self.failed = true;
                     eprintln!("{e}");
@@ -308,10 +310,10 @@ impl Shell {
         for ev in &res.events {
             match ev {
                 Event::Rows(rs) => {
-                    let _ = writeln!(out, "{}", tools::format_grid(rs, 60));
+                    let _ = writeln!(out, "{}", kixdb::display::grid(rs));
                 }
                 Event::Value(v) => {
-                    let _ = writeln!(out, "{}", v.q_repr());
+                    let _ = writeln!(out, "{}", kixdb::display::console(v));
                 }
                 Event::Message(m) => {
                     let _ = writeln!(out, "{m}");

@@ -874,6 +874,12 @@ pub fn exec_by_result(kt: &KeyedTable) -> K {
         K::Vector(ColVec::General(_, items)) => crate::engine::rows::collapse((*items).clone()),
         other => other,
     };
+    if let K::Table(table) = &values {
+        // (keys with a table of values are a keyed table)
+        if let Ok(keyed) = KeyedTable::new(kt.keys.clone(), (**table).clone()) {
+            return K::KeyedTable(Arc::new(keyed));
+        }
+    }
     K::Dict(Arc::new(Dict { keys: Box::new(side(&kt.keys)), vals: Box::new(values) }))
 }
 

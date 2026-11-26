@@ -176,8 +176,8 @@ fn run_input(cluster: &Cluster, show_plan: bool) -> ExitCode {
     let mut run = |code: &str| {
         for event in session.execute(code).events {
             match event {
-                Event::Rows(rs) => println!("{}", tools::format_grid(&rs, 60)),
-                Event::Value(v) => println!("{}", v.q_repr()),
+                Event::Rows(rs) => println!("{}", kixdb::display::grid(&rs)),
+                Event::Value(v) => println!("{}", kixdb::display::console(&v)),
                 Event::Message(m) => println!("{m}"),
                 Event::Error(e) => {
                     eprintln!("{e}");

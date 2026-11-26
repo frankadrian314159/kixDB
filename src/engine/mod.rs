@@ -201,6 +201,8 @@ pub struct SessionState {
     pub current_ns: String,
     pub handles: HashMap<i32, crate::ipc::IpcClient>,
     pub next_handle: i32,
+    /// `\P` and `\c`.
+    pub display: crate::display::Settings,
     /// Set (from any thread) to stop what the session is evaluating before its next step, with `'stop`.
     pub cancel: Arc<AtomicBool>,
 }
@@ -213,6 +215,7 @@ impl SessionState {
             current_ns: String::new(),
             handles: HashMap::new(),
             next_handle: 3,
+            display: Default::default(),
             cancel: Arc::default(),
         }
     }
@@ -267,6 +270,7 @@ impl From<KError> for StepErr {
 
 impl<'a> Engine<'a> {
     pub fn new(ws: &'a mut Workspace, session: &'a mut SessionState) -> Self {
+        crate::display::apply(session.display);
         Self {
             ws,
             session,
@@ -982,7 +986,7 @@ impl<'a> Engine<'a> {
                 self.key_of_name(*name)
             }
             "show" => {
-                self.messages.push(x.q_repr());
+                self.messages.push(crate::display::console(x));
                 Ok(K::Null)
             }
             "get" => self.eval_get(x),
@@ -1032,7 +1036,8 @@ impl<'a> Engine<'a> {
                     ops::eval_unary_prim("value", x)
                 }
             }
-            ".Q.s" | ".Q.s1" => Ok(K::string(&x.q_repr())),
+            ".Q.s" => Ok(K::string(&format!("{}\n", crate::display::console(x)))),
+            ".Q.s1" => Ok(K::string(&x.q_repr())),
             ".kix.objects" => crate::inspect::workspace_objects_table(self.ws),
             ".kix.def" => {
                 let target = x.as_str().unwrap_or_else(|| x.cell_text());
@@ -1084,6 +1089,7 @@ impl<'a> Engine<'a> {
                             let bytes = crate::ipc::encode_k_payload(rhs);
                             return Ok(K::Vector(ColVec::Byte(Attr::None, Arc::new(bytes))));
                         }
+                        -3 => return Ok(K::string(&rhs.q_repr())),
                         -9 => {
                             let K::Vector(ColVec::Byte(_, bs)) = rhs else {
                                 return Err(KError::ty("-9! expects byte vector"));
@@ -1338,7 +1344,7 @@ impl<'a> Engine<'a> {
                     for i in 0..cv.len() {
                         out.push(self.apply_func(inner, &[cv.get_atom(i)])?);
                     }
-                    Ok(K::Vector(ColVec::from_atoms(out)))
+                    Ok(rows::collapse(out))
                 }
                 2 => {
                     let (a, b) = (&vals[0], &vals[1]);
@@ -2056,6 +2062,19 @@ impl<'a> Engine<'a> {
                     let src = std::fs::read_to_string(p)?;
                     self.eval_str(&src)
                 }
+            }
+            "P" | "c" => {
+                let given: Vec<u16> = arg.split_whitespace().map(|n| n.parse().map_err(|_| KError::domain(format!("\\{cmd} takes numbers")))).collect::<KResult<_>>()?;
+                let held = &mut self.session.display;
+                match (cmd, given.as_slice()) {
+                    ("P", []) => return Ok(K::Int(i32::from(held.precision))),
+                    ("c", []) => return Ok(K::Vector(ColVec::Int(Attr::None, Arc::new(vec![i32::from(held.rows), i32::from(held.cols)])))),
+                    ("P", [digits]) => held.precision = (*digits).min(17) as u8,
+                    ("c", [rows, cols]) => (held.rows, held.cols) = (*rows, *cols),
+                    _ => return Err(KError::domain("\\P takes digits, \\c lines and characters")),
+                }
+                crate::display::apply(*held);
+                Ok(K::Null)
             }
             "\\" => Ok(K::Null),
             _ => Err(KError::nyi(format!("unknown system command \\{cmd}"))),

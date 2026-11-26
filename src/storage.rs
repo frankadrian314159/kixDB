@@ -499,7 +499,7 @@ pub fn zero_colon(lhs: &K, rhs: &K) -> KResult<K> {
         let hdr: Vec<String> = flip.cols.iter().map(|&c| resolve(c)).collect();
         lines.push(K::string(&hdr.join(&dch.to_string())));
         for r in 0..flip.nrows() {
-            let cells: Vec<String> = flip.vals.iter().map(|c| c.get_atom(r).cell_text()).collect();
+            let cells: Vec<String> = flip.vals.iter().map(|c| c.get_atom(r).data_text()).collect();
             lines.push(K::string(&cells.join(&dch.to_string())));
         }
         return Ok(K::Vector(ColVec::General(Attr::None, Arc::new(lines))));

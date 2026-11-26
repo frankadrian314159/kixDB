@@ -20,7 +20,7 @@ fn each_over_scan_and_adverbs_after_operators() {
         ("(neg;abs)@'1 -2", "-1 2"),
         ("-2_til 5", "0 1 2"),
         ("f: {42}; f[]", "42"),
-        (".Q.s 1 2", "\"1 2\""),
+        (".Q.s 1 2", "\"1 2\\n\""),
     ]);
 }
 

@@ -10,6 +10,7 @@
 pub mod ast;
 pub mod bytes;
 pub mod delta;
+pub mod display;
 pub mod engine;
 pub mod error;
 pub mod index;

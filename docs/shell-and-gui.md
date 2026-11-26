@@ -12,6 +12,10 @@ lines while a bracket, brace or string is open.
 
 q's `\` commands work (see [language.md](language.md#system-commands)), plus `\p [port]` and `\\` to quit.
 
+Values print as in q's console: a list of mixed values one item a line, dictionaries and tables in columns, floats to 7
+significant digits (`\P 12` shows more, `\P 0` all), and no more than 25 lines of 80 characters, with `..` where output
+is cut (`\c 50 200` changes that). A script that reads the shell's output should set `\P` and `\c` first.
+
 | Command | Does |
 | --- | --- |
 | `.tables` `.views` `.functions` `.vars` | list objects |

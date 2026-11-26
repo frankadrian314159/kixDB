@@ -1234,7 +1234,8 @@ impl Func {
             Func::Lambda(l) => l.source.clone(),
             Func::Adverb { kind, inner } => format!("{}{}", inner.source_text(), kind.symbol()),
             Func::Proj { func, args, .. } => {
-                let parts: Vec<String> = args
+                let given = args.iter().rposition(Option::is_some).map_or(0, |last| last + 1);
+                let parts: Vec<String> = args[..given]
                     .iter()
                     .map(|a| a.as_ref().map(|k| k.q_repr()).unwrap_or_default())
                     .collect();
@@ -1508,7 +1509,8 @@ impl K {
                     out.extend_from_slice(&v.get_atom(i).hash_key());
                 }
             }
-            _ => out.extend_from_slice(self.q_repr().as_bytes()),
+            // (in full: printing rounds)
+            _ => out.extend_from_slice(format!("{self:?}").as_bytes()),
         }
         out
     }
@@ -1523,18 +1525,28 @@ impl K {
         }
     }
 
-    /// Plain cell text for grids and CSV export (no quotes around strings or backticks on symbols).
+    /// `cell_text` with floats in full, for files: what the console rounds away must not be lost.
+    pub fn data_text(&self) -> String {
+        match self {
+            K::Float(v) if v.is_finite() => v.to_string(),
+            K::Real(v) if v.is_finite() => v.to_string(),
+            other => other.cell_text(),
+        }
+    }
+
+    /// Plain cell text for grids and `string` (no quotes around strings or backticks on symbols).
     pub fn cell_text(&self) -> String {
         match self {
             K::Null => String::new(),
-            K::Bool(b) => if *b { "1b".into() } else { "0b".into() },
+            K::Bool(b) => if *b { "1".into() } else { "0".into() },
             K::Guid(g) => if *g == NULL_GUID { String::new() } else { format_guid(g) },
             K::Byte(b) => format!("0x{b:02x}"),
             K::Short(v) => if *v == NULL_SHORT { String::new() } else if *v == INF_SHORT { "0Wh".into() } else if *v == NINF_SHORT { "-0Wh".into() } else { v.to_string() },
             K::Int(v) => if *v == NULL_INT { String::new() } else if *v == INF_INT { "0Wi".into() } else if *v == NINF_INT { "-0Wi".into() } else { v.to_string() },
             K::Long(v) => if *v == NULL_LONG { String::new() } else if *v == INF_LONG { "0W".into() } else if *v == NINF_LONG { "-0W".into() } else { v.to_string() },
             K::Real(v) => format_float_cell(*v as f64),
-            K::Float(v) | K::Datetime(v) => format_float_cell(*v),
+            K::Float(v) => format_float_cell(*v),
+            K::Datetime(v) => if v.is_nan() { String::new() } else { format_datetime(*v) },
             K::Char(c) => (*c as char).to_string(),
             K::Sym(s) => resolve(*s),
             K::Timestamp(v) => if *v == NULL_LONG { String::new() } else { format_timestamp(*v) },
@@ -1582,10 +1594,11 @@ impl K {
                 } else if *v == f32::NEG_INFINITY {
                     "-0We".into()
                 } else {
-                    format!("{v}e")
+                    format!("{}e", crate::display::float(f64::from(*v)))
                 }
             }
-            K::Float(v) | K::Datetime(v) => format_float_q(*v),
+            K::Float(v) => format_float_q(*v),
+            K::Datetime(v) => format_datetime(*v),
             K::Char(c) => format!("\"{}\"", escape_q_char(*c)),
             K::Sym(s) => format!("`{}", resolve(*s)),
             K::Timestamp(v) => format_timestamp(*v),
@@ -1596,53 +1609,49 @@ impl K {
             K::Second(v) => format_second(*v),
             K::Time(v) => format_time(*v),
             K::Vector(v) => format_vector_q(v),
-            K::Table(t) => crate::tools::format_flip(t, 40),
-            K::KeyedTable(kt) => crate::tools::format_keyed_table(kt, 40),
-            K::Dict(d) => crate::tools::format_dict(d),
+            K::Table(t) => table_repr(t),
+            K::KeyedTable(kt) => format!("({})!{}", table_repr(&kt.keys), table_repr(&kt.vals)),
+            K::Dict(d) => dict_repr(d.keys.q_repr(), d.vals.q_repr()),
             K::Func(f) => f.source_text(),
         }
     }
 }
 
 fn format_float_cell(v: f64) -> String {
-    if v.is_nan() {
-        String::new()
-    } else if v == f64::INFINITY {
-        "0w".into()
-    } else if v == f64::NEG_INFINITY {
-        "-0w".into()
-    } else {
-        format_float_num(v, false)
-    }
+    if v.is_nan() { String::new() } else { crate::display::float(v) }
 }
 
+/// A float atom: one that looks like a whole number is marked `f`.
 fn format_float_q(v: f64) -> String {
-    if v.is_nan() {
-        "0n".into()
-    } else if v == f64::INFINITY {
-        "0w".into()
-    } else if v == f64::NEG_INFINITY {
-        "-0w".into()
-    } else {
-        format_float_num(v, true)
+    let s = crate::display::float(v);
+    match s.contains(['.', 'e', 'n', 'w']) {
+        true => s,
+        false => format!("{s}f"),
     }
 }
 
-fn format_float_num(v: f64, suffix_if_int: bool) -> String {
-    let v = if v == 0.0 { 0.0 } else { v };
-    // Round to 7 significant-ish decimal places like kdb+'s `\P 7` default to avoid 0.30000000000000004 noise
-    let s = if v.abs() >= 1e9 || (v != 0.0 && v.abs() < 1e-5) {
-        format!("{v:.7e}")
-    } else {
-        let rounded = (v * 1e7).round() / 1e7;
-        let raw = format!("{rounded}");
-        raw
-    };
-    if suffix_if_int && !s.contains('.') && !s.contains('e') {
-        format!("{s}f")
-    } else {
-        s
+/// A datetime (days since 2000.01.01), to the millisecond.
+pub fn format_datetime(days: f64) -> String {
+    if !days.is_finite() {
+        return format!("{}z", &crate::display::float(days).replace('n', "N"));
     }
+    let ms = (days * 86_400_000.0).round() as i64;
+    format!("{}T{}", format_date(ms.div_euclid(86_400_000) as i32), format_time(ms.rem_euclid(86_400_000) as i32))
+}
+
+/// `keys!values` as q writes it; keys that begin with a verb are put in brackets.
+fn dict_repr(keys: String, values: String) -> String {
+    match keys.starts_with([',', '+']) {
+        true => format!("({keys})!{values}"),
+        false => format!("{keys}!{values}"),
+    }
+}
+
+/// `+names!columns`
+fn table_repr(t: &Flip) -> String {
+    let names = K::Vector(ColVec::Sym(Attr::None, Arc::new(t.cols.clone())));
+    let columns = K::Vector(ColVec::General(Attr::None, Arc::new(t.vals.iter().cloned().map(K::Vector).collect())));
+    format!("+{}", dict_repr(names.q_repr(), columns.q_repr()))
 }
 
 fn escape_q_char(b: u8) -> String {
@@ -1742,13 +1751,12 @@ fn format_vector_q(v: &ColVec) -> String {
                 format!("{pfx}{enlist}{}", parts.join(" "))
             }
         }
-        ColVec::Float(_, xs) | ColVec::Datetime(_, xs) => {
+        ColVec::Float(_, xs) => {
             if xs.is_empty() {
                 format!("{pfx}`float$()")
             } else {
-                let any_dot = xs.iter().any(|x| x.is_nan() || x.is_infinite() || x.fract() != 0.0);
-                let parts: Vec<String> = xs.iter().map(|&x| format_float_num_vec(x)).collect();
-                let tail = if any_dot { "" } else { "f" };
+                let parts: Vec<String> = xs.iter().map(|&x| crate::display::float(x)).collect();
+                let tail = if parts.iter().any(|p| p.contains(['.', 'e', 'n', 'w'])) { "" } else { "f" };
                 format!("{pfx}{enlist}{}{tail}", parts.join(" "))
             }
         }
@@ -1756,7 +1764,7 @@ fn format_vector_q(v: &ColVec) -> String {
             if xs.is_empty() {
                 format!("{pfx}`real$()")
             } else {
-                let parts: Vec<String> = xs.iter().map(|&x| format_float_num_vec(x as f64)).collect();
+                let parts: Vec<String> = xs.iter().map(|&x| crate::display::float(f64::from(x))).collect();
                 format!("{pfx}{enlist}{}e", parts.join(" "))
             }
         }
@@ -1778,18 +1786,6 @@ fn format_vector_q(v: &ColVec) -> String {
                 format!("{pfx}{enlist}{}", parts.join(" "))
             }
         }
-    }
-}
-
-fn format_float_num_vec(v: f64) -> String {
-    if v.is_nan() {
-        "0n".into()
-    } else if v == f64::INFINITY {
-        "0w".into()
-    } else if v == f64::NEG_INFINITY {
-        "-0w".into()
-    } else {
-        format_float_num(v, false)
     }
 }
 

@@ -1727,14 +1727,19 @@ fn minmax_bin_op(lhs: &K, rhs: &K, is_min: bool) -> KResult<K> {
         if let (K::Bool(x), K::Bool(y)) = (a, b) {
             return Ok(K::Bool(if is_min { *x && *y } else { *x || *y }));
         }
-        let numbers = |k: &K| NUMBERS.iter().position(|&n| n.0 == k.type_num().abs());
-        let (a, b) = match (numbers(a), numbers(b)) {
-            (Some(x), Some(y)) if x < y => (cast_by_name(NUMBERS[y].1, a)?, b.clone()),
-            (Some(x), Some(y)) if y < x => (a.clone(), cast_by_name(NUMBERS[x].1, b)?),
-            _ => temporal::align(a, b).unwrap_or_else(|| (a.clone(), b.clone())),
-        };
+        let (a, b) = widen(a, b)?;
         let cmp = a.k_cmp(&b);
         Ok(if (is_min && cmp != Ordering::Greater) || (!is_min && cmp != Ordering::Less) { a } else { b })
+    })
+}
+
+/// Two atoms as the wider of their types, if both are numbers or times of one family.
+fn widen(a: &K, b: &K) -> KResult<(K, K)> {
+    let numbers = |k: &K| NUMBERS.iter().position(|&n| n.0 == k.type_num().abs());
+    Ok(match (numbers(a), numbers(b)) {
+        (Some(x), Some(y)) if x < y => (cast_by_name(NUMBERS[y].1, a)?, b.clone()),
+        (Some(x), Some(y)) if y < x => (a.clone(), cast_by_name(NUMBERS[x].1, b)?),
+        _ => temporal::align(a, b).unwrap_or_else(|| (a.clone(), b.clone())),
     })
 }
 
@@ -1763,11 +1768,8 @@ fn fill_op(lhs: &K, rhs: &K) -> KResult<K> {
         _ => {}
     }
     broadcast_atoms(lhs, rhs, |fill_val, v| {
-        if v.is_null() {
-            Ok(fill_val.clone())
-        } else {
-            Ok(v.clone())
-        }
+        let (fill_val, v) = widen(fill_val, v)?;
+        Ok(if v.is_null() { fill_val } else { v })
     })
 }
 
@@ -2061,6 +2063,10 @@ fn take_or_attr_op(lhs: &K, rhs: &K) -> KResult<K> {
         if let Some(attr) = Attr::from_sym(&s_str) {
             return match rhs {
                 K::Vector(cv) => Ok(K::Vector(cv.with_attr(attr)?)),
+                K::Dict(d) => match &*d.keys {
+                    K::Vector(keys) => Ok(K::Dict(Arc::new(Dict { keys: Box::new(K::Vector(keys.with_attr(attr)?)), vals: d.vals.clone() }))),
+                    _ => Err(KError::ty("an attribute needs a dictionary with a list of keys")),
+                },
                 K::Table(t) => {
                     if t.vals.is_empty() {
                         Ok(rhs.clone())
@@ -2198,24 +2204,7 @@ fn drop_syms(syms: &[SymId], rhs: &K) -> KResult<K> {
             }
             Ok(K::Table(Arc::new(Flip { cols, vals })))
         }
-        K::Dict(d) => {
-            let mut keys = Vec::new();
-            let mut vals = Vec::new();
-            for i in 0..d.keys.count() {
-                let k = index_k(&d.keys, &[Some(K::Long(i as i64))])?;
-                if let K::Sym(ks) = k {
-                    if syms.contains(&ks) {
-                        continue;
-                    }
-                }
-                keys.push(k);
-                vals.push(index_k(&d.vals, &[Some(K::Long(i as i64))])?);
-            }
-            Ok(K::Dict(Arc::new(Dict {
-                keys: Box::new(K::Vector(ColVec::from_atoms(keys))),
-                vals: Box::new(K::Vector(ColVec::from_atoms(vals))),
-            })))
-        }
+        K::Dict(d) => drop_keys(d, &K::Vector(ColVec::Sym(Attr::None, Arc::new(syms.to_vec())))),
         _ => Err(KError::ty("symbol _ expects table or dictionary")),
     }
 }
@@ -3036,9 +3025,9 @@ fn moving_op(lhs: &K, rhs: &K, kind: MovingKind) -> KResult<K> {
             let mut out = Vec::with_capacity(n);
             for i in 0..n {
                 let s = i.saturating_sub(w - 1);
-                out.push(fs[s..=i].iter().filter(|v| !v.is_nan()).count() as i64);
+                out.push(fs[s..=i].iter().filter(|v| !v.is_nan()).count() as i32);
             }
-            Ok(K::Vector(ColVec::Long(Attr::None, Arc::new(out))))
+            Ok(K::Vector(ColVec::Int(Attr::None, Arc::new(out))))
         }
         MovingKind::Sum => {
             if let Some(is) = cv.as_i64_vec() {
@@ -3486,6 +3475,13 @@ pub fn dict_lookup(d: &Dict, key: &K) -> KResult<K> {
             return index_k(&d.vals, &[Some(K::Long(i as i64))]);
         }
     }
+    // (with sorted keys, a missing key has the value of the greatest key below it)
+    if keys_cv.attr() == Attr::Sorted {
+        let below = (0..keys_cv.len()).take_while(|&i| keys_cv.get_atom(i).k_cmp(key) == Ordering::Less).count();
+        if below > 0 {
+            return index_k(&d.vals, &[Some(K::Long(below as i64 - 1))]);
+        }
+    }
     // Missing key in kdb+ returns a typed null of the value vector!
     if let K::Vector(vals_cv) = &*d.vals {
         Ok(vals_cv.null_atom())
@@ -3516,6 +3512,9 @@ pub fn index_k(target: &K, args: &[Option<K>]) -> KResult<K> {
             }
             _ => return Err(KError::ty("invalid vector index")),
         },
+        K::Dict(d) if matches!(first, None | Some(K::Null)) && !rest.is_empty() => {
+            return Ok(K::Dict(Arc::new(Dict { keys: d.keys.clone(), vals: Box::new(index_k(&d.vals, args)?) })));
+        }
         K::Dict(d) => match first {
             None | Some(K::Null) => (*d.vals).clone(),
             Some(k) => dict_lookup(d, k)?,
