@@ -14,9 +14,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 /// Each function and the number of its arguments.
-const FUNCTIONS: [(&str, usize); 44] = [
-    (".Q.addmonths", 2), (".Q.addr", 1), (".Q.atob", 1), (".Q.bt", 1), (".Q.btoa", 1), (".Q.dd", 2), (".Q.def", 2),
-    (".Q.dpft", 4), (".Q.en", 2), (".Q.f", 2), (".Q.fc", 2), (".Q.ff", 2), (".Q.fk", 1), (".Q.fmt", 3), (".Q.fs", 2),
+const FUNCTIONS: [(&str, usize); 49] = [
+    (".Q.addmonths", 2), (".Q.addr", 1), (".Q.atob", 1), (".Q.bt", 1), (".Q.btoa", 1), (".Q.chk", 1), (".Q.dd", 2), (".Q.def", 2),
+    (".Q.dpft", 4), (".Q.dpfts", 5), (".Q.en", 2), (".Q.ens", 3), (".Q.ind", 2), (".Q.view", 1), (".Q.f", 2), (".Q.fc", 2), (".Q.ff", 2), (".Q.fk", 1), (".Q.fmt", 3), (".Q.fs", 2),
     (".Q.fsn", 3), (".Q.ft", 2), (".Q.fu", 2), (".Q.gc", 1), (".Q.gz", 1), (".Q.id", 1), (".Q.j10", 1), (".Q.j12", 1), (".Q.opt", 1), (".Q.qt", 1),
     (".Q.s", 1), (".Q.s1", 1), (".Q.sbt", 1), (".Q.sha1", 1), (".Q.trp", 3), (".Q.trpd", 3), (".Q.ts", 2),
     (".Q.ty", 1), (".Q.v", 1), (".Q.V", 1), (".Q.w", 1), (".Q.x10", 1), (".Q.x12", 1), (".j.j", 1), (".j.jd", 1),
@@ -24,7 +24,7 @@ const FUNCTIONS: [(&str, usize); 44] = [
 ];
 
 /// Those that change the workspace or write files.
-const WRITERS: [&str; 4] = [".Q.dpft", ".Q.en", ".Q.opt", ".kix.dist"];
+const WRITERS: [&str; 8] = [".Q.chk", ".Q.dpft", ".Q.dpfts", ".Q.en", ".Q.ens", ".Q.opt", ".Q.view", ".kix.dist"];
 
 /// q's control words and the keywords of k.
 const RESERVED: &str = "abs acos asin atan avg bin binr by cor cos cov delete dev div do enlist exec exit exp from getenv \
@@ -384,8 +384,20 @@ impl Engine<'_> {
                 let values = vec![used, NULL_LONG, NULL_LONG, 0, 0, NULL_LONG, sym_count() as i64, NULL_LONG];
                 dict(syms(names), K::Vector(ColVec::Long(Attr::None, Arc::new(values))))
             }
-            ".Q.en" => crate::storage::q_en(self.ws, x, y)?,
-            ".Q.dpft" => crate::storage::q_dpft(self.ws, x, y, &args[2], &args[3])?,
+            ".Q.en" => self.enumerate_symbols(x, y, intern("sym"))?,
+            ".Q.ens" => {
+                let K::Sym(domain) = &args[2] else { return Err(KError::ty(".Q.ens takes the domain's name")) };
+                self.enumerate_symbols(x, y, *domain)?
+            }
+            ".Q.dpfts" => {
+                let K::Sym(domain) = &args[4] else { return Err(KError::ty(".Q.dpfts takes the domain's name")) };
+                self.write_partition(x, y, &args[2], &args[3], *domain)?
+            }
+            ".Q.chk" => self.check_partitions(x)?,
+            ".Q.view" => self.view_partitions(x)?,
+            // (a partitioned table is loaded whole when it is named, so its rows are indexed like any table's)
+            ".Q.ind" => index_k(x, &[Some(y.clone())])?,
+            ".Q.dpft" => self.write_partition(x, y, &args[2], &args[3], intern("sym"))?,
             ".j.j" => K::string(&json::write(x, false)),
             ".j.jd" => {
                 let pair = items(x);

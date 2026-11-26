@@ -2044,6 +2044,8 @@ pub fn concat_k(lhs: &K, rhs: &K) -> KResult<K> {
         }
         (K::KeyedTable(ka), K::KeyedTable(kb)) => crate::engine::joins::union_join(&K::KeyedTable(ka.clone()), &K::KeyedTable(kb.clone())),
         (K::Dict(da), K::Dict(db)) => dict_merge(da, db),
+        // (nothing joined to a table is the table)
+        (K::Vector(ColVec::General(_, a)), table @ (K::Table(_) | K::KeyedTable(_))) if a.is_empty() => Ok(table.clone()),
         (K::Vector(ColVec::General(_, a)), other) => {
             let mut v = (**a).clone();
             v.push(other.clone());

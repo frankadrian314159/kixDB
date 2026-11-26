@@ -282,7 +282,8 @@ impl Engine<'_> {
     pub(crate) fn load(&mut self, x: &K) -> KResult<K> {
         let path = storage::path_of(self.ws, x)?;
         let name = path.file_name().map(|n| intern(&n.to_string_lossy())).ok_or_else(|| KError::domain("load needs a file name"))?;
-        let value = storage::load_path(self.ws, &path.to_string_lossy())?;
+        // (the path already starts from the workspace's directory)
+        let value = storage::load_file(&path)?;
         self.set_global(name, value)?;
         Ok(K::Sym(name))
     }

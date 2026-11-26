@@ -5,6 +5,7 @@ pub mod builtins;
 mod dotz;
 mod enums;
 pub mod files;
+mod hdb;
 mod json;
 mod markup;
 pub mod namespaces;
@@ -376,7 +377,9 @@ impl<'a> Engine<'a> {
     }
 
     pub fn has_partitioned(&self, name: SymId) -> bool {
-        self.ws.partitioned.contains_key(&name)
+        // (a local of the name takes its place, as in reading the name)
+        let local = self.locals.last().is_some_and(|f| f.contains_key(&name));
+        !local && self.ws.partitioned.contains_key(&name)
     }
 
     pub fn resolve_table_for_query(&mut self, name: SymId, where_clauses: &[Expr], needed: Option<&[SymId]>) -> KResult<K> {
@@ -490,7 +493,13 @@ impl<'a> Engine<'a> {
             self.ws.views.remove(&name);
             self.ws.unlogged.remove(&name);
             match write {
-                Write::Value(Some(val)) => drop(self.ws.vars.insert(name, val)),
+                Write::Value(Some(val)) => {
+                    // a value assigned to the name of a mounted table takes its place
+                    if self.ws.partitioned.contains_key(&name) {
+                        self.ws.partitioned.remove(&name);
+                    }
+                    self.ws.vars.insert(name, val);
+                }
                 Write::Value(None) => drop(self.ws.vars.remove(&name)),
                 Write::Change(changes) => {
                     if let Some(value) = self.ws.vars.get_mut(&name) {
@@ -609,6 +618,10 @@ impl<'a> Engine<'a> {
 
         if let Some(namespace) = self.namespace(&s) {
             return Ok(namespace);
+        }
+        // the partitions mounted are listed under the name of their column, such as `date`
+        if let Some(values) = self.partition_values(Some(name), false) {
+            return Ok(values);
         }
         if s == "csv" {
             return Ok(K::Char(b','));
@@ -735,6 +748,7 @@ impl<'a> Engine<'a> {
                 Ok(Some(K::Time(ms)))
             }
             ".z.K" => Ok(Some(K::Float(4.1))),
+            ".Q.pv" | ".Q.PV" | ".Q.pf" | ".Q.pt" => Ok(self.partition_info(s)),
             ".z.b" => Ok(Some(self.dependencies())),
             ".z.s" => Ok(self.running.last().map(|lam| K::Func(Func::Lambda(lam.clone())))),
             ".z.i" => Ok(Some(K::Int(std::process::id() as i32))),
@@ -1066,7 +1080,7 @@ impl<'a> Engine<'a> {
                 self.key_of_name(*name)
             }
             "key" if matches!(x, K::Sym(_)) => self.key_of_path(x),
-            "fkeys" | "meta" | "cols" if matches!(x, K::Sym(_)) => {
+            "fkeys" | "meta" | "cols" | "iasc" | "idesc" if matches!(x, K::Sym(_)) => {
                 let K::Sym(table) = x else { unreachable!() };
                 let table = self.get_var(*table)?;
                 ops::eval_unary_prim(name.as_str(), &table)
@@ -2138,12 +2152,20 @@ impl<'a> Engine<'a> {
                 if arg.is_empty() {
                     return Err(KError::domain("\\l requires a file or directory path"));
                 }
-                let p = std::path::Path::new(arg);
-                if p.is_dir() {
-                    storage::mount_hdb_dir(self.ws, p)?;
+                // (in the workspace's directory, else in the process's)
+                let held = storage::path_of(self.ws, &K::sym(arg))?;
+                let p = if held.exists() { held } else { PathBuf::from(arg) };
+                if p.is_dir() && !p.join(".d").exists() {
+                    // the tables mounted take the place of variables of their names
+                    let mounted = storage::mount_hdb_dir(self.ws, &p)?;
+                    let replaced: Vec<_> = mounted.into_iter().filter(|t| self.ws.vars.contains_key(t)).map(|t| (t, None)).collect();
+                    if !replaced.is_empty() {
+                        self.set_globals(replaced)?;
+                    }
                     Ok(K::Null)
-                } else if storage::holds_value(&storage::path_of(self.ws, &K::sym(arg))?) {
-                    self.load(&K::sym(arg))
+                } else if p.is_dir() || storage::holds_value(&p) {
+                    // a splayed table or a file holding a value: the variable named after it
+                    self.load(&K::sym(&p.to_string_lossy()))
                 } else {
                     let src = std::fs::read_to_string(p)?;
                     self.eval_str(&src)

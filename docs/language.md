@@ -148,7 +148,8 @@ digit, unlike kdb+.
 | characters, types | `.Q.A .Q.a .Q.an .Q.b6 .Q.n .Q.nA .Q.t .Q.res .Q.k .Q.ty .Q.qt` |
 | text and dates | `.Q.f .Q.fmt .Q.id .Q.dd .Q.s .Q.s1 .Q.addmonths` |
 | encoding | `.Q.btoa .Q.atob .Q.sha1 .Q.gz .Q.j10 .Q.x10 .Q.j12 .Q.x12 .Q.addr` |
-| tables | `.Q.en .Q.dpft .Q.ff .Q.fk .Q.ft .Q.V` |
+| tables | `.Q.ff .Q.fk .Q.ft .Q.ind .Q.V` |
+| databases ([storage.md](storage.md#partitioned-databases-and-column-attributes)) | `.Q.en .Q.ens .Q.dpft .Q.dpfts .Q.chk .Q.view .Q.pv .Q.PV .Q.pf .Q.pt` |
 | files | `.Q.fs .Q.fsn` |
 | functions | `.Q.fc .Q.fu .Q.ts .Q.trp .Q.trpd .Q.sbt .Q.bt .Q.v` |
 | command line, memory | `.Q.opt .Q.def .Q.x .Q.gc .Q.w` |
@@ -166,15 +167,14 @@ A variable assigned one of these names takes its place. Where they differ from k
 ## Not implemented
 
 * `ej` only in bracket form.
-* `.Q.en` records a table's symbols but returns the table without enumerating them.
 * Deferred responses (`-30!`), a synchronous call to a client, and a process that runs the messages a server sends it
   while it is idle (a subscriber's `upd`; it can take them with `h[]`, see [ipc.md](ipc.md#client)).
 * The callbacks of web and socket servers (`.z.ph .z.pp .z.pm .z.ac .z.ws .z.wo .z.wc`), `.z.pq` and `.z.pd`: kixdb has
   none of these.
 * `.z.e .z.ex .z.ey .z.k .z.m .z.M .z.zd`.
 * Reading binary records with `1:`, and compressed files.
-* Log replay (`-11!`), and the rest of the `.Q` namespace: functions for
-  partitioned databases, `.Q.hg` and `.Q.hp` (HTTP), `.Q.host`, `.Q.K`, and kdb+ internals (`.Q.ipc`,
-  `.Q.prf0`, `.Q.rp`, `.Q.m`).
+* Log replay (`-11!`), and the rest of the `.Q` namespace: other functions for partitioned databases (such as
+  `.Q.par .Q.dpt .Q.hdpf .Q.cn .Q.pn .Q.pd .Q.P .Q.qp .Q.MAP`), `.Q.hg` and `.Q.hp` (HTTP), `.Q.host`, `.Q.K`, and
+  kdb+ internals (`.Q.ipc`, `.Q.prf0`, `.Q.rp`, `.Q.m`).
 * The parts of `.h` that serve web pages (`.h.he .h.hn .h.hp .h.hy .h.ka .h.jx .h.val .h.HOME .h.ht .h.fram .h.logo`):
   kixdb has no web server.

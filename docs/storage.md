@@ -35,11 +35,18 @@ the snapshot: an earlier version discards the log from the first record it canno
 
 ```q
 `:prices.bin set 1 2 3            / a flat file; get `:prices.bin, or \l prices.bin for the variable prices.bin
-`:ref/ set t                      / a splayed table: .d and one file per column
-.Q.en[`:hdb; t]                   / record the table's symbols in hdb/sym
-.Q.dpft[`:hdb; 2026.11.24; `sym; `trade]   / write a partition, sorted and parted by sym
+`:ref/ set .Q.en[`:hdb; t]        / a splayed table: .d and one file per column
+\l hdb/ref                        / load a splayed table as the variable ref
+.Q.en[`:hdb; t]                   / t with its symbol columns enumerated from hdb/sym
+.Q.ens[`:hdb; t; `venue]          / from hdb/venue, and the global venue
+.Q.dpft[`:hdb; 2026.11.24; `sym; `trade]   / write a partition, sorted and parted by sym (.Q.dpfts names the domain)
 \l hdb                            / mount it
 ```
+
+`.Q.en` adds the symbols that `hdb/sym` lacks, sets the global `sym` to the list and enumerates the columns from it
+([language.md](language.md#enumerations-foreign-keys-and-linked-columns)). So a symbol that is not in the domain cannot
+be put into such a column: `insert` and `upsert` signal `'cast` unless the rows go through `.Q.en` too. (Earlier
+versions returned the table unchanged, and saved plain symbols.)
 
 ### A file by its name
 
@@ -95,7 +102,21 @@ directory.) The file format is kixDB's own and is not readable by kdb+.
 ## Partitioned databases and column attributes
 
 Directories named `YYYY.MM.DD`, `YYYY.MM`, `YYYY` (`1800..=2999`) or an integer are partitions; each table inside is
-splayed. The partition appears as the virtual column `date`, `month`, `year` or `int`.
+splayed. The partition appears as the virtual column `date`, `month`, `year` or `int`, and its values are listed under
+that name (`date`). A `par.txt` file in the database's directory lists further directories (segments), one to a line,
+whose partitions belong to it too.
+
+* The columns of a table are those of its last partition. A query that needs one that an older partition lacks signals
+  `'mismatch`; `.Q.chk` gives partitions the tables that they lack, empty, but adds no columns.
+* Assigning to the name of a mounted table replaces it, until the database is mounted again; `\l` of the database
+  replaces variables of its tables' names. (A variable that was there before `.Q.dpft`, or that a durable workspace
+  restores, stays beside the table: queries read the table, and other uses of the name the variable.)
+* `.Q.view 2026.11.23 2026.11.24` hides the other partitions from queries until `.Q.view[]`. `.Q.pv` and `.Q.PV` give
+  the values shown and all of them, `.Q.pf` the partition column, `.Q.pt` the partitioned tables, and
+  `.Q.ind[table; rows]` rows by number.
+* Mounting a directory loads its tables and values; it does not run the scripts in it. `\l` looks in the workspace's
+  directory first, then in the process's.
+* A linked column (`` `other!rows ``) is not followed from one partitioned table to another.
 
 * Any `where` clause on the partition column prunes partitions (`=`, `<`, `<=`, `>`, `>=`, `in`, `within`), whether it is
   the first clause or appears after other row-wise filters.

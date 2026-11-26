@@ -9,7 +9,6 @@ use crate::error::{KError, KResult};
 use crate::ipc::{decode_k_payload, encode_k_payload};
 use crate::sym::{intern, resolve, SymId};
 use crate::types::*;
-use std::collections::HashSet;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -36,8 +35,36 @@ pub struct PartitionedTable {
     pub name: SymId,
     pub part_col: SymId,
     pub kind: PartKind,
+    /// The partitions that queries see, in order, and those that `.Q.view` hides.
     pub slices: Vec<PartitionSlice>,
+    pub hidden: Vec<PartitionSlice>,
+    /// The partition column, then the columns of the last partition.
     pub cols: Vec<SymId>,
+}
+
+/// A partition's kind, column, value and directory.
+type Partition = (PartKind, SymId, K, PathBuf);
+
+/// The partition directories of the database in `dir`, in order of their values: those in it, and those in the
+/// directories that its `par.txt` lists, if it has one.
+pub fn partition_dirs(ws: &Workspace, dir: &Path) -> KResult<Vec<Partition>> {
+    let mut roots = vec![dir.to_path_buf()];
+    if let Ok(listed) = fs::read_to_string(dir.join("par.txt")) {
+        roots.extend(listed.lines().map(str::trim).filter(|l| !l.is_empty()).map(|l| resolve_fs_path(ws, l.trim_start_matches(':'))));
+    }
+    let mut found = Vec::new();
+    for root in roots {
+        let missing = |e: std::io::Error| KError::io(format!("cannot read the partitions in '{}': {e}", root.display()));
+        for entry in fs::read_dir(&root).map_err(missing)? {
+            let path = entry?.path();
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            if let Some((kind, column, value)) = parse_partition_dir_name(&name).filter(|_| path.is_dir()) {
+                found.push((kind, column, value, path));
+            }
+        }
+    }
+    found.sort_by(|a, b| a.2.k_cmp(&b.2));
+    Ok(found)
 }
 
 fn resolve_fs_path(ws: &Workspace, rel: &str) -> PathBuf {
@@ -124,12 +151,16 @@ pub fn save_path(ws: &Workspace, rel: &str, val: &K) -> KResult<()> {
 }
 
 pub fn load_path(ws: &Workspace, rel: &str) -> KResult<K> {
-    let path = resolve_fs_path(ws, rel.trim_end_matches(['/', '\\']));
+    load_file(&resolve_fs_path(ws, rel.trim_end_matches(['/', '\\'])))
+}
+
+/// The splayed table or the value at `path`.
+pub fn load_file(path: &Path) -> KResult<K> {
     if path.is_dir() && path.join(".d").exists() {
-        let flip = read_splayed_table(&path, None)?;
+        let flip = read_splayed_table(path, None)?;
         Ok(K::Table(Arc::new(flip)))
     } else {
-        read_flat_k(&path)
+        read_flat_k(path)
     }
 }
 
@@ -164,108 +195,21 @@ pub fn read_splayed_table(dir: &Path, needed_cols: Option<&[SymId]>) -> KResult<
     Flip::new(cols_to_read, vals)
 }
 
-/// `.Q.en[`:dir; table]` — enumerates symbol columns against `dir/sym` and persists updated `sym` domain.
-pub fn q_en(ws: &Workspace, dir_k: &K, tbl_k: &K) -> KResult<K> {
-    if !matches!(dir_k, K::Sym(_)) {
-        return Err(KError::ty(".Q.en first argument must be `:dir"));
-    }
-    let dir_path = path_of(ws, dir_k)?;
-    fs::create_dir_all(&dir_path)?;
-    let sym_file = dir_path.join("sym");
-
-    let mut domain: Vec<SymId> = if sym_file.exists() {
-        if let Ok(K::Vector(ColVec::Sym(_, existing))) = read_flat_k(&sym_file) {
-            (*existing).clone()
-        } else {
-            vec![]
-        }
-    } else {
-        vec![]
-    };
-    let mut seen: HashSet<SymId> = domain.iter().copied().collect();
-
-    let flip = match tbl_k {
-        K::Table(t) => (**t).clone(),
-        K::KeyedTable(kt) => kt.unkey(),
-        _ => return Err(KError::ty(".Q.en second argument must be a table")),
-    };
-    for cv in &flip.vals {
-        if let ColVec::Sym(_, xs) = cv {
-            for &s in xs.iter() {
-                if seen.insert(s) {
-                    domain.push(s);
-                }
-            }
-        }
-    }
-    write_flat_k(&sym_file, &K::Vector(ColVec::Sym(Attr::Unique, Arc::new(domain))))?;
-    Ok(tbl_k.clone())
-}
-
-/// `.Q.dpft[`:dir; partition; `field; `tablename]` — sorts `tablename` by `field`, applies `` `p# ``, splays to `dir/partition/tablename/`, and refreshes HDB mount!
-pub fn q_dpft(ws: &mut Workspace, dir_k: &K, part_k: &K, field_k: &K, tbl_name_k: &K) -> KResult<K> {
-    let K::Sym(dir_s) = dir_k else {
-        return Err(KError::ty(".Q.dpft[dir; part; field; table] expects `:dir"));
-    };
-    let K::Sym(field_s) = field_k else {
-        return Err(KError::ty(".Q.dpft field must be a symbol"));
-    };
-    let K::Sym(tbl_s) = tbl_name_k else {
-        return Err(KError::ty(".Q.dpft table must be a symbol (`table)"));
-    };
-    let tbl_val = ws.vars.get(tbl_s).cloned().ok_or_else(|| KError::value(resolve(*tbl_s)))?;
-    let sorted = crate::engine::ops::table_sort_op(&K::Sym(*field_s), &tbl_val, false)?;
-    let K::Table(sorted_flip) = sorted else {
-        return Err(KError::ty(".Q.dpft requires an unkeyed table"));
-    };
-    let mut cols = vec![*field_s];
-    for &c in &sorted_flip.cols {
-        if c != *field_s {
-            cols.push(c);
-        }
-    }
-    let mut vals = Vec::with_capacity(cols.len());
-    for (i, &c) in cols.iter().enumerate() {
-        let mut cv = sorted_flip.col(c).cloned().ok_or_else(|| KError::value(resolve(c)))?;
-        if i == 0 {
-            cv = cv.with_attr(Attr::Parted)?;
-        }
-        vals.push(cv);
-    }
-    let final_flip = Flip::new(cols, vals)?;
-    let raw_dir = resolve(*dir_s);
-    let base = resolve_fs_path(ws, raw_dir.strip_prefix(':').unwrap_or(&raw_dir));
-    let _ = q_en(ws, dir_k, &K::Table(Arc::new(final_flip.clone())))?;
-
-    let part_str = match part_k {
-        K::Date(d) => format_date(*d),
-        K::Month(m) => format_month(*m).trim_end_matches('m').to_string(),
-        other => other.as_i64()?.to_string(),
-    };
-    let target_dir = base.join(&part_str).join(resolve(*tbl_s));
-    write_splayed_table(&target_dir, &final_flip)?;
-    mount_hdb_dir(ws, &base)?;
-    Ok(K::Sym(*tbl_s))
-}
-
 /// Mount an HDB directory (`\l dir`): loads flat files, splayed tables, and partitioned (`YYYY.MM.DD/...`) tables!
-pub fn mount_hdb_dir(ws: &mut Workspace, dir: &Path) -> KResult<()> {
+/// Gives the names of the partitioned tables.
+pub fn mount_hdb_dir(ws: &mut Workspace, dir: &Path) -> KResult<Vec<SymId>> {
     if !dir.exists() {
-        return Ok(());
+        return Ok(vec![]);
     }
-    let mut part_entries: Vec<(PartKind, SymId, K, PathBuf)> = Vec::new();
-
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
         let fname = entry.file_name().to_string_lossy().into_owned();
-        if fname.starts_with('.') || fname == "sym" || fname.starts_with("kix.") {
+        if fname.starts_with('.') || fname == "par.txt" || fname.starts_with("kix.") {
             continue;
         }
         if path.is_dir() {
-            if let Some((kind, pcol, pval)) = parse_partition_dir_name(&fname) {
-                part_entries.push((kind, pcol, pval, path));
-            } else if path.join(".d").exists() {
+            if parse_partition_dir_name(&fname).is_none() && path.join(".d").exists() {
                 // Top-level splayed table!
                 let flip = read_splayed_table(&path, None)?;
                 ws.vars.insert(intern(&fname), K::Table(Arc::new(flip)));
@@ -279,10 +223,9 @@ pub fn mount_hdb_dir(ws: &mut Workspace, dir: &Path) -> KResult<()> {
         }
     }
 
-    // Group partition slices by table name and sort chronologically
-    part_entries.sort_by(|a, b| a.2.k_cmp(&b.2));
+    // Group partition slices by table name
     let mut by_table: std::collections::HashMap<SymId, PartitionedTable> = std::collections::HashMap::new();
-    for (kind, pcol, pval, pdir) in part_entries {
+    for (kind, pcol, pval, pdir) in partition_dirs(ws, dir)? {
         for sub in fs::read_dir(&pdir)? {
             let sub = sub?;
             let spath = sub.path();
@@ -290,25 +233,25 @@ pub fn mount_hdb_dir(ws: &mut Workspace, dir: &Path) -> KResult<()> {
                 let tname = intern(&sub.file_name().to_string_lossy());
                 let d_k = read_flat_k(&spath.join(".d"))?;
                 let K::Vector(ColVec::Sym(_, s_cols)) = d_k else { continue };
-                let pt = by_table.entry(tname).or_insert_with(|| {
-                    let mut cols = vec![pcol];
-                    cols.extend(s_cols.iter().copied());
-                    PartitionedTable {
-                        name: tname,
-                        part_col: pcol,
-                        kind: kind.clone(),
-                        slices: Vec::new(),
-                        cols,
-                    }
+                let pt = by_table.entry(tname).or_insert_with(|| PartitionedTable {
+                    name: tname,
+                    part_col: pcol,
+                    kind: kind.clone(),
+                    slices: Vec::new(),
+                    hidden: Vec::new(),
+                    cols: Vec::new(),
                 });
+                // (the last partition has the say on the columns, as in q)
+                pt.cols = [pt.part_col].into_iter().chain(s_cols.iter().copied()).collect();
                 pt.slices.push(PartitionSlice { part_val: pval.clone(), path: spath });
             }
         }
     }
+    let mounted = by_table.keys().copied().collect();
     for (tname, pt) in by_table {
         ws.partitioned.insert(tname, pt);
     }
-    Ok(())
+    Ok(mounted)
 }
 
 fn parse_partition_dir_name(name: &str) -> Option<(PartKind, SymId, K)> {
@@ -348,14 +291,11 @@ pub fn load_partitioned_filtered(
     mut eval_rhs: impl FnMut(&Expr) -> KResult<K>,
 ) -> KResult<Flip> {
     // only the referenced columns are read from disk (at least one, to know the number of rows)
-    let needed: Option<Vec<SymId>> = needed.map(|n| {
-        let mut on_disk: Vec<SymId> = pt.cols[1..].iter().copied().filter(|c| n.contains(c)).collect();
-        if on_disk.is_empty() {
-            on_disk.extend(pt.cols.get(1));
-        }
-        on_disk
-    });
-    let needed = needed.as_deref();
+    let on_disk = pt.cols.get(1..).unwrap_or_default();
+    let mut wanted: Vec<SymId> = on_disk.iter().copied().filter(|c| needed.is_none_or(|n| n.contains(c))).collect();
+    if wanted.is_empty() {
+        wanted.extend(on_disk.first());
+    }
     let mut selected_slices: Vec<&PartitionSlice> = pt.slices.iter().collect();
     for wc in where_clauses {
         // Stop pruning if an earlier clause references virtual row index `i` (whose numbering depends on prior clauses).
@@ -377,8 +317,8 @@ pub fn load_partitioned_filtered(
             PartKind::Int => ColVec::Long(Attr::Sorted, Arc::new(vec![])),
         };
         vals.push(p_empty);
-        if let Some(sample_slice) = pt.slices.first() {
-            let sf = read_splayed_table(&sample_slice.path, needed)?;
+        if let Some(sample_slice) = pt.slices.last().or(pt.hidden.last()) {
+            let sf = read_slice(&sample_slice.path, &wanted)?;
             let mut cols = vec![pt.part_col];
             cols.extend(&sf.cols);
             vals.extend(sf.vals.iter().map(|v| v.take(0)));
@@ -389,9 +329,10 @@ pub fn load_partitioned_filtered(
 
     let mut acc: Option<Flip> = None;
     for slice in selected_slices {
-        let sf = read_splayed_table(&slice.path, needed)?;
+        let sf = read_slice(&slice.path, &wanted)?;
         let nrows = sf.nrows();
-        let mut pcol = ColVec::from_atoms(vec![slice.part_val.clone(); nrows]);
+        // (typed even for a partition with no rows)
+        let mut pcol = ColVec::from_atoms(vec![slice.part_val.clone()]).gather(&vec![0; nrows]);
         pcol.set_attr_unchecked(Attr::Sorted);
         let mut cols = vec![pt.part_col];
         cols.extend_from_slice(&sf.cols);
@@ -404,6 +345,14 @@ pub fn load_partitioned_filtered(
         });
     }
     Ok(acc.unwrap())
+}
+
+/// The columns `wanted` of the partition of a table in `dir`, in that order.
+fn read_slice(dir: &Path, wanted: &[SymId]) -> KResult<Flip> {
+    let held = read_splayed_table(dir, Some(wanted))?;
+    let lacking = |c| KError::new("mismatch", format!("{} has no column {}", dir.display(), resolve(c)));
+    let vals = wanted.iter().map(|&c| held.col(c).cloned().ok_or_else(|| lacking(c))).collect::<KResult<Vec<_>>>()?;
+    Flip::new(wanted.to_vec(), vals)
 }
 
 type PartPred = Box<dyn Fn(&K) -> bool>;
