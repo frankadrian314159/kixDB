@@ -10,7 +10,7 @@ use crate::catalog::{rekey, unkey, Names, Table};
 use crate::client::ShardClient;
 use crate::exec::{augmented, with_ordinals};
 use crate::plan::Layout;
-use crate::{Inner, Topology};
+use crate::{cluster_error, Inner, Topology};
 use kix_shared_ces::route::{rebalanced, SLOTS};
 use kix_shared_ces::wire::{moving_var, LoadMode, LoadReq, MoveReq, TxnOp, Work, JOINING_VAR, LAYOUT_VAR, ORD_COL};
 use kix_shared_ces::ShardInfo;
@@ -27,17 +27,13 @@ use std::sync::Arc;
 
 /// The layout as shard 0 holds it.
 #[derive(Serialize, Deserialize)]
-struct Held {
+pub(crate) struct Held {
     /// How many times the number of shards has changed.
-    resizes: u64,
-    slots: Vec<u32>,
-    shards: Vec<ShardInfo>,
+    pub(crate) resizes: u64,
+    pub(crate) slots: Vec<u32>,
+    pub(crate) shards: Vec<ShardInfo>,
     /// Every shard is known to have made the change that brought this layout.
     done: bool,
-}
-
-fn cluster_error(message: impl Into<String>) -> KError {
-    KError::new("cluster", message)
 }
 
 fn longs(v: Vec<i64>) -> K {
@@ -70,7 +66,7 @@ fn adding(t: &Table) -> LoadMode {
 impl Inner {
     /// Before a statement: have the layout that shard 0 holds, and finish or abandon changes left half made.
     pub(crate) fn settle(&self) -> KResult<()> {
-        if !self.layout_unsure.load(Ordering::SeqCst) && !self.unsettled() {
+        if self.current()? && !self.layout_unsure.load(Ordering::SeqCst) && !self.unsettled() {
             return Ok(());
         }
         let _alone = self.gate.write().unwrap_or_else(|e| e.into_inner());
@@ -79,6 +75,10 @@ impl Inner {
 
     /// `settle`, for a caller that has the cluster to itself.
     fn settle_alone(&self) -> KResult<()> {
+        self.take_over()?;
+        if self.group.get().is_some() {
+            self.finish_pending()?;
+        }
         if self.layout_unsure.load(Ordering::SeqCst) {
             self.adopt_layout()?;
         }
@@ -88,29 +88,22 @@ impl Inner {
         Ok(())
     }
 
+    /// The layout that shard 0 holds, if it holds one.
+    pub(crate) fn fetch_layout(&self) -> KResult<Option<Held>> {
+        let query = Work::Q(format!("@[value; `{LAYOUT_VAR}; 0#0x00]"));
+        match self.wait(self.shard(0)?.query(query))? {
+            K::Vector(ColVec::Byte(_, bytes)) if !bytes.is_empty() => {
+                postcard::from_bytes(&bytes).map(Some).map_err(|e| cluster_error(format!("the layout on shard 0 is damaged: {e}")))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Take up the layout that shard 0 holds, if it holds one. A change of the number of shards that not every shard is
     /// known to have made is finished first: until then nothing is read, as rows could be seen in two places.
     pub(crate) fn adopt_layout(&self) -> KResult<()> {
-        let query = Work::Q(format!("@[value; `{LAYOUT_VAR}; 0#0x00]"));
-        let held = match self.wait(self.shard(0)?.query(query))? {
-            K::Vector(ColVec::Byte(_, bytes)) if !bytes.is_empty() => {
-                Some(postcard::from_bytes::<Held>(&bytes).map_err(|e| cluster_error(format!("the layout on shard 0 is damaged: {e}")))?)
-            }
-            _ => None,
-        };
-        if let Some(held) = held {
-            let old = self.topology();
-            let shards = held.shards.iter().enumerate().map(|(i, info)| match old.shards.get(i).filter(|s| s.shares(&info.addr)) {
-                Some(known) => {
-                    info.endpoints().iter().for_each(|a| {
-                        known.learn(a);
-                    });
-                    Ok(known.clone())
-                }
-                None => self.new_shard(info.id, &info.addr),
-            });
-            let topology = Topology { shards: shards.collect::<KResult<_>>()?, slots: Arc::new(held.slots), resizes: held.resizes };
-            self.set_topology(topology);
+        if let Some(held) = self.fetch_layout()? {
+            self.set_topology(self.topology_of(&held.shards, held.slots, held.resizes)?);
             if !held.done {
                 self.resolve();
                 if self.in_doubt() {
@@ -125,10 +118,9 @@ impl Inner {
 
     /// A connection to the shard at the comma-separated `addresses`.
     pub(crate) fn new_shard(&self, id: u32, addresses: &str) -> KResult<Arc<ShardClient>> {
-        let known = self.shard(0)?;
         let _in_runtime = self.runtime.enter();
-        let shard = ShardClient::new(id, addresses, self.tls.clone())?;
-        shard.set_limit(known.limit());
+        let shard = ShardClient::new(id, addresses, self.tls.clone())?.fenced_by(self.term.clone());
+        shard.set_limit(self.request_limit());
         Ok(Arc::new(shard))
     }
 
@@ -206,6 +198,9 @@ impl Inner {
         let leads = matches!(ask(format!("@[value; `{LAYOUT_VAR}; 0#0x00]"))?, K::Vector(held) if !held.is_empty());
         if leads || (!joining && !tables.is_empty()) {
             return Err(KError::domain("the new shard is not empty"));
+        }
+        if self.group.get().is_some() {
+            self.wait(shard.fence())?;
         }
         // (a change that an earlier attempt left prepared would refuse what is loaded)
         self.resolve();

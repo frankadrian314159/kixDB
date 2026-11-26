@@ -8,10 +8,12 @@ use crate::catalog::{column_type, rekey, schema_of, unkey, with_attrs, Names, Ta
 use crate::exec::{augmented, in_order};
 use crate::plan::{has_query, is_constant, rowwise, scan_filters, Layout, Planner, Push};
 use crate::Inner;
-use kix_shared_ces::wire::{LoadMode, LoadReq, MemberReq, MutateReq, TxnOp, Work, ORD_COL};
+use kix_shared_ces::wire::{ForwardReply, ForwardReq, Forwarded, LoadMode, LoadReq, MemberReq, MutateReq, TxnOp, Work, ORD_COL};
 use kixdb::ast::{ColSpec, Expr, QSql, QSqlKind};
 use kixdb::engine::qsql::resolve_col_names;
-use kixdb::engine::{DistMode, Workspace};
+use kixdb::engine::{changes, DistMode, Workspace};
+use kixdb::ipc::{decode_k_payload, encode_k_payload};
+use kixdb::persist::LogOp;
 use kixdb::parser::parse_script;
 use kixdb::sym::{intern, resolve, SymId};
 use kixdb::{k_to_resultset, Attr, BatchResult, ColVec, Connection, Event, Flip, Func, Interceptor, KError, KResult, K};
@@ -29,6 +31,8 @@ pub struct ClusterSession {
     changes: Vec<(usize, TxnOp)>,
     /// The shards did not take a change of the statement being run, so nothing it made here is kept.
     refused: bool,
+    /// While a statement runs on a private copy of the mirror: the copy as the mirror last took it.
+    before: Option<Workspace>,
 }
 
 fn cluster_error(message: impl Into<String>) -> KError {
@@ -102,7 +106,7 @@ struct Mutation {
 impl ClusterSession {
     pub(crate) fn new(inner: Arc<Inner>) -> ClusterSession {
         let conn = inner.mirror.connect_internal();
-        ClusterSession { inner, conn, plan: vec![], changes: vec![], refused: false }
+        ClusterSession { inner, conn, plan: vec![], changes: vec![], refused: false, before: None }
     }
 
     /// How the statements of the last request ran.
@@ -110,9 +114,35 @@ impl ClusterSession {
         &self.plan
     }
 
+    /// What the master of this node's group answers to `what`, if another node is the master.
+    fn passed_on(&mut self, what: impl FnOnce() -> Forwarded) -> Option<KResult<K>> {
+        let reply = self.inner.pass_on(self.conn.current_namespace(), what)?;
+        Some(reply.and_then(|reply| {
+            self.conn.eval(&format!("\\d {}", reply.namespace))?;
+            match reply.answer {
+                Ok(value) => decode_k_payload(&value, 0).map(|v| v.0),
+                Err((signal, detail)) => Err(KError::new(&signal, detail)),
+            }
+        }))
+    }
+
+    /// Run what another control node passed to this one.
+    pub(crate) fn run_passed_on(&mut self, req: ForwardReq) -> ForwardReply {
+        let result = self.conn.eval(&format!("\\d {}", req.namespace)).and_then(|_| match req.what {
+            Forwarded::Eval(code) => self.eval(&code),
+            Forwarded::Message(bytes) => decode_k_payload(&bytes, 0).and_then(|(msg, _)| self.message(&msg)),
+            Forwarded::Explain(code) => self.explain(&code).map(|lines| K::Vector(strings(lines))),
+        });
+        let answer = result.map(|value| encode_k_payload(&value)).map_err(|e| (e.signal, e.detail));
+        ForwardReply { namespace: self.conn.current_namespace(), answer }
+    }
+
     /// Run `q` source (or a cluster command) and return the value of the last statement.
     pub fn eval(&mut self, code: &str) -> KResult<K> {
         self.plan.clear();
+        if let Some(r) = self.passed_on(|| Forwarded::Eval(code.to_string())) {
+            return r;
+        }
         if let Some(r) = self.command(code) {
             return r;
         }
@@ -130,7 +160,8 @@ impl ClusterSession {
             Some(rs) => Event::Rows(rs),
             None => Event::Value(v),
         };
-        if let Some(r) = self.command(code) {
+        // (a node that passes statements on gives the value of the last one)
+        if let Some(r) = self.passed_on(|| Forwarded::Eval(code.to_string())).or_else(|| self.command(code)) {
             return BatchResult { events: vec![r.map(show).unwrap_or_else(Event::Error)] };
         }
         let mut events = vec![];
@@ -154,6 +185,10 @@ impl ClusterSession {
 
     /// How each statement would run, without running it.
     pub fn explain(&mut self, code: &str) -> KResult<Vec<String>> {
+        if let Some(r) = self.passed_on(|| Forwarded::Explain(code.to_string())) {
+            let K::Vector(ColVec::General(_, lines)) = r? else { return Ok(vec![]) };
+            return Ok(lines.iter().filter_map(K::as_str).collect());
+        }
         let inner = self.inner.clone();
         let _shared = inner.gate.read().unwrap_or_else(|e| e.into_inner());
         let mut out = vec![];
@@ -191,7 +226,8 @@ impl ClusterSession {
 
     // ----- Cluster commands --------------------------------------------------
 
-    /// `EXPLAIN`, `DISTRIBUTE`, `SHARDS`, `ADD SHARD`, `REMOVE SHARD`, `REPLICAS`, `ADD REPLICA` and `REMOVE REPLICA`.
+    /// `EXPLAIN`, `DISTRIBUTE`, `SHARDS`, `ADD SHARD`, `REMOVE SHARD`, `REPLICAS`, `ADD REPLICA`, `REMOVE REPLICA`,
+    /// `CONTROLS` and `REMOVE CONTROL`.
     fn command(&mut self, code: &str) -> Option<KResult<K>> {
         if let Some(query) = code.trim().strip_prefix("EXPLAIN ") {
             let lines = self.explain(query);
@@ -221,6 +257,8 @@ impl ClusterSession {
             ["ADD", "SHARD", addr] => self.inner.resize(Some(addr)).and_then(|_| self.shards()),
             ["REMOVE", "SHARD"] => self.inner.resize(None).and_then(|_| self.shards()),
             ["REPLICAS", s] => number(s).and_then(|s| self.members(s, MemberReq::default())),
+            ["CONTROLS"] => self.controls(None),
+            ["REMOVE", "CONTROL", id] => number(id).and_then(|id| self.controls(Some(id))),
             ["ADD", "REPLICA", s, id, addr] => number(s).and_then(|s| {
                 let add = Some((number(id)?, addr.to_string()));
                 self.members(s, MemberReq { add, remove: None })
@@ -253,6 +291,16 @@ impl ClusterSession {
             ("term", longs(terms)),
             ("applied", longs(applied)),
             ("memory", longs(memory)),
+        ])
+    }
+
+    fn controls(&mut self, remove: Option<u64>) -> KResult<K> {
+        let (members, master) = self.inner.controls(remove)?;
+        table(vec![
+            ("id", longs(members.iter().map(|m| m.0 as i64).collect())),
+            ("addr", strings(members.iter().map(|m| m.1.clone()).collect())),
+            ("voter", ColVec::Bool(Attr::None, Arc::new(members.iter().map(|m| m.2).collect()))),
+            ("master", ColVec::Bool(Attr::None, Arc::new(members.iter().map(|m| m.0 == master).collect()))),
         ])
     }
 
@@ -416,15 +464,31 @@ impl ClusterSession {
     /// not take a change. (So nothing is written there that is only held for the statement, such as a gathered table.)
     fn on_a_copy(&mut self, e: &Expr) -> KResult<K> {
         let copy = self.inner.mirror.private_copy();
-        let before = copy.read_workspace(Workspace::snapshot);
-        let mirror = self.conn.retarget(copy.clone());
+        self.before = Some(copy.read_workspace(Workspace::snapshot));
+        let mirror = self.conn.retarget(copy);
         self.refused = false;
         let result = self.exclusive(e);
+        let kept = if self.refused { Ok(()) } else { self.publish(&[]) };
         self.conn.retarget(mirror);
-        if !self.refused {
-            copy.read_workspace(|after| self.conn.adopt(&before, after, &[]))?;
-        }
+        self.before = None;
+        kept?;
         result
+    }
+
+    /// Write to the mirror what has changed in the private copy since it was last written, and remove `drop`.
+    fn publish(&mut self, drop: &[SymId]) -> KResult<()> {
+        let Some(before) = &self.before else { return Ok(()) };
+        let now = self.conn.server().read_workspace(Workspace::snapshot);
+        self.inner.mirror.connect_internal().adopt(before, &now, drop)?;
+        self.before = Some(now);
+        Ok(())
+    }
+
+    /// What `publish` would write.
+    fn unpublished(&self) -> Vec<LogOp> {
+        let Some(before) = &self.before else { return vec![] };
+        let now = self.conn.server().read_workspace(Workspace::snapshot);
+        self.inner.mirror.read_workspace(|mirror| changes(mirror, before, &now))
     }
 
     fn exclusive(&mut self, e: &Expr) -> KResult<K> {
@@ -528,15 +592,48 @@ impl ClusterSession {
         }
         let done = match first_error {
             Some(e) => Err(e),
-            None => self.commit().map(|_| ()),
+            None => self.commit(false, |_, _| Ok(())).map(|_| ())
         };
         self.unless_refused(done)
     }
 
-    /// Commit the operations gathered.
-    fn commit(&mut self) -> KResult<Vec<K>> {
-        let changes = std::mem::take(&mut self.changes);
-        self.inner.commit(changes)
+    /// Commit the operations gathered. `learned` then makes in the copy of the mirror what the change makes of the
+    /// control node's state, from the shards' answers; `alters`: it will.
+    ///
+    /// In a group of control nodes such a change is noted before the shards are told to make it, so that a master that
+    /// takes over finishes it, and written to the mirror as soon as it is made.
+    fn commit(&mut self, alters: bool, learned: impl FnOnce(&mut Self, &[K]) -> KResult<()>) -> KResult<Vec<K>> {
+        let ops = std::mem::take(&mut self.changes);
+        let inner = self.inner.clone();
+        let grouped = inner.group.get().is_some() && !ops.is_empty() && self.before.is_some();
+        if !(grouped && (alters || !self.unpublished().is_empty())) {
+            let answers = inner.commit(ops)?;
+            learned(self, &answers)?;
+            return Ok(answers);
+        }
+        let (mut learned, mut noted) = (Some(learned), false);
+        let done = inner.commit_noting(
+            ops,
+            Some(&mut |txid, primary, answers| {
+                learned.take().map_or(Ok(()), |learned| learned(self, answers))?;
+                let ops = self.unpublished();
+                noted = !ops.is_empty();
+                match noted {
+                    true => self.inner.note_pending(txid, primary, &ops),
+                    false => Ok(()),
+                }
+            }),
+        );
+        match done {
+            Ok(answers) if !noted => Ok(answers),
+            done => done.and_then(|answers| self.publish(&[Inner::pending_name()]).map(|_| answers)).inspect_err(|_| {
+                // whether it was made, and written, is seen to before anything else is done
+                if noted {
+                    inner.doubt();
+                    self.refused = true;
+                }
+            }),
+        }
     }
 
     /// Note a change that the shards did not take: what the statement made on the control node is then thrown away.
@@ -682,7 +779,7 @@ impl ClusterSession {
 
     /// Distribute a table's rows as `mode` says, on every shard or none.
     fn place_rows(&mut self, name: SymId, rows: &K, mode: DistMode) -> KResult<()> {
-        let done = self.distribute(name, rows, Some(mode)).and_then(|_| self.commit().map(|_| ()));
+        let done = self.distribute(name, rows, Some(mode)).and_then(|_| self.commit(false, |_, _| Ok(())).map(|_| ()));
         self.unless_refused(done)
     }
 
@@ -748,13 +845,18 @@ impl ClusterSession {
             let load = |(s, (part, ords)): (usize, &(Flip, Option<Vec<i64>>))| (s, TxnOp::Load(LoadReq::new(resolve(t.name), mode, &K::Table(Arc::new(part.clone())), ords.clone())));
             self.changes.extend(some.map(load));
         }
-        self.commit()?;
+        // (the first rows may give columns of the schema their types)
+        let (name, now) = (t.name, rekey(schema, t.nkeys));
+        let alters = !same_table(&now, &t.schema_k());
+        self.commit(alters, move |session, _| match alters {
+            true => session.conn.set_vars(vec![(name, Some(now))]),
+            false => Ok(()),
+        })?;
         if verb == "insert" {
             // (an insert that is made adds every row)
             self.inner.rows.lock().unwrap_or_else(|e| e.into_inner()).insert(t.name, before as usize + coerced.nrows());
         }
         self.note(format!("{verb}: {} row(s) split over the shards", coerced.nrows()));
-        self.conn.set_vars(vec![(t.name, Some(rekey(schema, t.nkeys)))])?;
         Ok(match verb {
             "insert" => K::Vector(longs((before..before + coerced.nrows() as i64).collect())),
             _ => K::Sym(t.name),
@@ -836,8 +938,14 @@ impl ClusterSession {
         *query.from = augmented(t.name);
         let req = MutateReq { table: resolve(t.name), query: Expr::Query(Box::new(query)) };
         self.changes.extend((0..self.inner.shards().len()).map(|s| (s, TxnOp::Mutate(req.clone()))));
-        let results = self.commit()?;
+        let name = t.name;
+        self.commit(true, move |session, results| session.take_schema(&t, kind, &assigned, results))?;
         self.note("update / delete run on every shard");
+        Ok(K::Sym(name))
+    }
+
+    /// Give the mirror the columns that the shards answered an `update` / `delete` of `t` with.
+    fn take_schema(&mut self, t: &Table, kind: QSqlKind, assigned: &[SymId], results: &[K]) -> KResult<()> {
         let mut schemas = results.iter().filter_map(unkey);
         let (mut schema, nkeys) = schemas.next().ok_or_else(|| cluster_error("no shard answered"))?;
         for (other, _) in schemas {
@@ -857,8 +965,7 @@ impl ClusterSession {
                 }
             }
         }
-        self.conn.set_vars(vec![(t.name, Some(rekey(schema, nkeys)))])?;
-        Ok(K::Sym(t.name))
+        self.conn.set_vars(vec![(t.name, Some(rekey(schema, nkeys)))])
     }
 
     // ----- System commands ----------------------------------------------------
@@ -995,7 +1102,8 @@ impl Interceptor for ClusterSession {
         Some(self.eval(code))
     }
     fn eval_message(&mut self, msg: &K) -> Option<KResult<K>> {
-        Some(self.message(msg))
+        let passed = self.passed_on(|| Forwarded::Message(encode_k_payload(msg)));
+        Some(passed.unwrap_or_else(|| self.message(msg)))
     }
     fn explain_query(&mut self, code: &str) -> Option<KResult<Vec<String>>> {
         Some(self.explain(code))

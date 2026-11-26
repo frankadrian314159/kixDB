@@ -18,13 +18,16 @@ use std::time::{Duration, Instant};
 /// How long after a failed attempt to resolve before statements try again.
 const RETRY: Duration = Duration::from_secs(5);
 
+/// Called between the phases of a commit, with its name, its primary shard and the answers of the mutations.
+pub(crate) type Note<'a> = &'a mut dyn FnMut(u64, usize, &[K]) -> KResult<()>;
+
 fn answer(bytes: &[u8]) -> KResult<K> {
     decode_k_payload(bytes, 0).map(|(k, _)| k)
 }
 
 impl Inner {
     /// Note that some shard may hold a change waiting to be resolved.
-    fn doubt(&self) {
+    pub(crate) fn doubt(&self) {
         *self.unsettled.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
     }
 
@@ -90,6 +93,12 @@ impl Inner {
     /// Make the operations, each on its shard: all of them or none. Returns the answers of the mutations, in order. The
     /// caller has the cluster to itself.
     pub(crate) fn commit(&self, ops: Vec<(usize, TxnOp)>) -> KResult<Vec<K>> {
+        self.commit_noting(ops, None)
+    }
+
+    /// `commit`, calling `note` once every shard has prepared and before any commits. (A change with something to note is
+    /// made in two phases even on one shard, so that its primary can say later whether it was made.)
+    pub(crate) fn commit_noting(&self, ops: Vec<(usize, TxnOp)>, note: Option<Note>) -> KResult<Vec<K>> {
         if ops.is_empty() {
             return Ok(vec![]);
         }
@@ -103,7 +112,7 @@ impl Inner {
             shards.entry(shard).or_default().push((n, op));
         }
         // one change on one shard is all or nothing by itself
-        if shards.len() == 1 && changing <= 1 {
+        if note.is_none() && shards.len() == 1 && changing <= 1 {
             let mut answers = vec![];
             for (shard, ops) in shards {
                 for (_, op) in ops {
@@ -152,6 +161,13 @@ impl Inner {
             // whatever became of the request, no shard will commit
             return Err(KError::new(&e.signal, e.detail.replace(UNKNOWN, "; no shard made the change")));
         }
+        let answers = answers.values().map(|b| answer(b)).collect::<KResult<Vec<_>>>()?;
+        if let Some(note) = note {
+            if let Err(e) = note(txid, primary, &answers) {
+                abandon(0);
+                return Err(e);
+            }
+        }
         // phase two: the primary decides
         let forget: Vec<u64> = self.finished.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|f| f.0 == primary).map(|f| f.1).collect();
         if let Err(e) = self.txn(primary, &TxnReq::Commit { txid, primary: true, forget: forget.clone() }) {
@@ -176,6 +192,6 @@ impl Inner {
             // the change is made: the shards that have not heard are told when they can be
             self.doubt();
         }
-        answers.values().map(|b| answer(b)).collect()
+        Ok(answers)
     }
 }

@@ -59,7 +59,8 @@ From Rust: `Cluster::connect_with(&config, tls)` or `Cluster::open_with(state_fi
 
 **Keep the state file.** It is checksummed (`KXC2` + CRC32), locked against concurrent processes (`cluster.state.lock`),
 and records the shards, table schemas, distribution, and the variables, functions and views of the control node. A control
-node started without it does not know about data already on the shards.
+node started without it does not know about data already on the shards. (A node of a [group](#several-control-nodes)
+keeps its state in `--data` instead.)
 
 ## Security
 
@@ -89,6 +90,55 @@ Clients reach the control node over kdb+ IPC, whose TLS and passwords are set se
 for them on an address other machines can reach (`--bind`), `kix-cluster` needs `-u` and `--force-tls`, or
 `--insecure-clients`. The
 `--metrics-listen` pages are plain HTTP without authentication.
+
+## Several control nodes
+
+Control nodes can form a group. One of them is the **master**, which runs every statement; the others pass their
+clients' statements to it and take over if it stops.
+
+```
+kix-cluster --make-certs certs c1 c2 c3
+# the first: it takes the shards from --config
+kix-cluster --config cluster.json --listen 5000 --control-id 1 --control-listen 10.0.0.1:50060 --data c1 \
+    --node-ca ca.pem --node-cert c1.pem --node-key c1.key
+# each further one names any node of the group, and no --config
+kix-cluster --join 10.0.0.1:50060 --listen 5000 --control-id 2 --control-listen 10.0.0.2:50060 --data c2 \
+    --node-ca ca.pem --node-cert c2.pem --node-key c2.key
+```
+
+```
+CONTROLS                          / number, address, voter, master
+REMOVE CONTROL 1                  / take a node out of the group (then stop it)
+```
+
+A new node asks the node `--join` names, gets the shard configuration, the schemas and all else from the master, and
+gets a vote once it has caught up. `--control-addr` gives the address the others use, if that is not the one it listens
+on. (From Rust: `Cluster::open_group(group, &config, tls)`, `shutdown` to hand over and leave, `halt` to just stop.)
+
+* **Run three** (or five). The group elects its master (Raft) and needs a majority: three survive the loss of one, five
+  of two. **Two survive none**, so that is worse than one. A node that is gone for good still counts until it is
+  removed: remove it, then join another.
+* **Clients may connect to any node,** with kdb+ IPC to one address. When that node stops they must connect to another
+  (a TCP load balancer does this for them).
+* **No more throughput:** the master does all planning, merging and gathering. A statement passed on costs about half a
+  millisecond more (on one machine: an insert took 0.8 ms at the master and 1.3 ms through another node). Its result
+  must fit in 256 MB.
+* **What the nodes share** is schemas, distribution, variables, functions, views and the record of the shards. Each
+  keeps a durable copy in `--data`. A change to any of it waits for a majority.
+* **When the master stops,** the others elect one (about two seconds from a killed master to the next answer, on one
+  machine). Before it takes a statement it has **every** shard refuse the masters before it, finishes or abandons
+  half-made changes and reads where the rows are; so it answers nothing while a shard cannot be reached. What a change
+  was acknowledged to have done is kept. A statement that was running fails with `'cluster`, and may or may not have
+  been made. Stopping a master with Ctrl-C hands over first.
+* **Restart a node with the command that started it.** It carries on from `--data`; `--join` is tried once.
+* **Give every node the same settings:** `-u`, TLS, `--request-timeout`, `--broadcast-limit` and the `--scale-` options
+  (only the master adds shards, so each node needs the program).
+* **Callbacks** run on the node a client is connected to. One that sets a global fails on a node that is not the master.
+* **An existing cluster:** start the first node with `--data` and `--state cluster.state`; it takes the state over, once.
+  (A state file of an earlier version must first be opened by a single control node.) Afterwards the shards refuse a
+  control node that is in no group.
+* **Security:** any holder of a node certificate, a shard's too, can join the group, which gives what it already has:
+  everything. With `--insecure`, so can anyone who reaches a `--control-listen` port.
 
 ## Distribution
 
@@ -310,7 +360,7 @@ statement tries at once after a failure, then every 5 seconds.
 
 ## Concurrency
 
-There is one control node. Pushed-down reads and selective partial gathers (`slice`) share the cluster concurrently
+One control node (the master of a group) runs all statements. Pushed-down reads and selective partial gathers (`slice`) share the cluster concurrently
 (and temporary `.kix.tmp.*` broadcast/shuffle join tables stay in shard RAM without writing to the WAL or Raft log);
 writes and full-table mirror gathers take exclusive cluster access.
 
@@ -405,10 +455,11 @@ shards must match.
 
 ## Limits
 
-* **Upgrade the control node and all shards together:** the messages between them change from version to version.
+* **Upgrade the control nodes and all shards together:** the messages between them change from version to version.
 * **Every node is trusted fully.** A certificate of the cluster's authority gives full access to every shard, and
   certificates cannot be revoked one by one (see [Security](#security)).
-* **The control node is a single point of failure**, and gathering needs memory there for the whole table.
+* **A single control node is a single point of failure** ([several](#several-control-nodes) are not), and gathering
+  needs memory on the control node for the whole table. More control nodes add no throughput.
 * **Statements wait while shards are added or removed** ([Changing the number of shards](#changing-the-number-of-shards)).
   Shards can be [added by themselves](#adding-shards-by-itself) when memory calls for it; none is removed so.
 * Slots move to even out their number, not the rows in them: one symbol or day with most of the rows stays whole.

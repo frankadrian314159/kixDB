@@ -178,10 +178,19 @@ impl Replica {
 
     /// Stop taking part in the group.
     pub fn stop(&self) {
+        self.end(None);
+    }
+
+    /// `stop`, and have the engine refuse every change from then on: one made now would be its alone.
+    pub fn leave(&self) {
+        self.end(Some(Arc::new(Left)));
+    }
+
+    fn end(&self, then: Option<Arc<dyn Replicator>>) {
         lock(&self.apply).take();
         let _ = self.inbox.send(Input::Wake);
         self.cv.notify_all();
-        self.server.set_replicator(None);
+        self.server.set_replicator(then);
     }
 
     fn stopped(&self) -> bool {
@@ -401,6 +410,15 @@ impl Replica {
             return Ok(());
         }
         self.change_conf(Instant::now() + self.commit_timeout, |c| c.without(id))
+    }
+}
+
+/// What the engine of a node that has left its group calls before it makes a change.
+struct Left;
+
+impl Replicator for Left {
+    fn propose(&self, _rec: &WalRecord) -> KResult<()> {
+        Err(KError::new("cluster", "this node has left its group"))
     }
 }
 

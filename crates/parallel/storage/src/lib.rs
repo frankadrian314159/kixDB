@@ -28,7 +28,7 @@ use kixdb::{Attr, ColVec, Connection, Flip, KError, KResult, KeyedTable, Server,
 use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tonic::{Request, Response, Status, Streaming};
 
@@ -40,6 +40,30 @@ use transport::MAX_MESSAGE;
 
 /// Rows per Arrow batch.
 const BATCH_ROWS: usize = 8192;
+
+/// Answers actions of its host's own (a control node's); `None`: not one of them.
+pub type Extension = Box<dyn Fn(&str, &[u8]) -> Option<Result<Vec<u8>, Status>> + Send + Sync>;
+
+/// The term the caller was elected for, if it is the master of a group of control nodes (0: it is not).
+fn term_of<T>(request: &Request<T>) -> u64 {
+    request.metadata().get(wire::TERM_HEADER).and_then(|v| v.to_str().ok()?.parse().ok()).unwrap_or(0)
+}
+
+/// The latest term a master has fenced the shard with.
+fn fenced(server: &Server) -> u64 {
+    server.read_workspace(|ws| match ws.vars.get(&intern(wire::TERM_VAR)) {
+        Some(K::Long(term)) => *term as u64,
+        _ => 0,
+    })
+}
+
+/// Refuse a control node that another has replaced.
+fn check_term(server: &Server, term: u64) -> KResult<()> {
+    match term < fenced(server) {
+        true => Err(KError::new("cluster", "another control node has become the master")),
+        false => Ok(()),
+    }
+}
 
 /// What a node's requests and its operator share.
 struct Core {
@@ -61,6 +85,8 @@ struct Core {
     /// When each piece of engine work now running began, oldest first.
     running: Mutex<BTreeMap<u64, Instant>>,
     next_work: AtomicU64,
+    /// Set on a control node, which takes only its group's requests and its own.
+    extension: OnceLock<Extension>,
 }
 
 /// A piece of engine work, listed in `Core::running` while it runs.
@@ -311,6 +337,9 @@ impl Core {
         if self.draining.load(Ordering::SeqCst) {
             return Err(Status::unavailable(format!("{}shard {} takes no new work", wire::SHUTTING_DOWN_PREFIX, self.shard_id)));
         }
+        if self.extension.get().is_some() {
+            return Err(Status::unimplemented("a control node takes no queries or changes"));
+        }
         self.check_leader()?;
         self.statements.fetch_add(1, Ordering::SeqCst);
         self.in_flight.fetch_add(1, Ordering::SeqCst);
@@ -338,9 +367,13 @@ impl Core {
             .map_err(|e| wire::status_of(&e))
     }
 
-    async fn load(self: &Arc<Self>, req: LoadReq) -> Result<(), Status> {
+    async fn load(self: &Arc<Self>, req: LoadReq, term: u64) -> Result<(), Status> {
         self.blocking(move |core, conn| {
             let _one = core.writes.lock().unwrap_or_else(|e| e.into_inner());
+            // (temporary tables come from other shards too, which give no term, and change nothing that is kept)
+            if !req.table.starts_with(".kix.tmp.") {
+                check_term(&core.server, term)?;
+            }
             txn::check_free(&core.server, &req.table)?;
             let changes = load_changes(conn, &vec![], &req)?;
             conn.write_vars(changes)
@@ -349,9 +382,9 @@ impl Core {
     }
 
     /// Run the scan and send every row to the shard that owns it (or to all of them), straight to that shard.
-    async fn shuffle(self: &Arc<Self>, req: ShuffleReq) -> Result<u64, Status> {
+    async fn shuffle(self: &Arc<Self>, req: ShuffleReq, term: u64) -> Result<u64, Status> {
         let ShuffleReq { scan, key_cols, target_table, slots, peers, me } = req;
-        let rows = self.blocking(move |_, conn| unkeyed(&conn.eval_expr(&scan)?)).await?;
+        let rows = self.blocking(move |core, conn| check_term(&core.server, term).and_then(|_| unkeyed(&conn.eval_expr(&scan)?))).await?;
         let total = rows.nrows() as u64;
         let parts: Vec<Flip> = if key_cols.is_empty() {
             vec![rows; peers.len()]
@@ -373,7 +406,7 @@ impl Core {
             let addr = peers[i].clone();
             async move {
                 if i == me {
-                    self.load(req).await
+                    self.load(req, term).await
                 } else {
                     self.peers.send_load(&addr, &req).await
                 }
@@ -492,8 +525,16 @@ impl ShardNode {
             draining: AtomicBool::new(false),
             running: Mutex::default(),
             next_work: AtomicU64::new(0),
+            extension: OnceLock::new(),
         };
         ShardNode { core: Arc::new(core) }
+    }
+
+    /// Serve a control node's engine, not a shard's: no queries or changes are taken, only the actions of its group
+    /// and those that `extension` answers. Call before the node serves.
+    pub fn with_extension(self, extension: Extension) -> ShardNode {
+        let _ = self.core.extension.set(extension);
+        self
     }
 
     pub fn control(&self) -> NodeControl {
@@ -518,11 +559,13 @@ impl FlightService for ShardNode {
     type DoExchangeStream = FlightStream<FlightData>;
 
     async fn do_get(&self, request: Request<Ticket>) -> Result<Response<Self::DoGetStream>, Status> {
+        let term = term_of(&request);
         let frag: Fragment = decode(&request.into_inner().ticket)?;
         let _busy = self.core.admit()?;
         let (schema, batches) = self
             .core
-            .blocking(move |_, conn| {
+            .blocking(move |core, conn| {
+                check_term(&core.server, term)?;
                 let value = evaluate(conn, &frag.work)?;
                 arrowconv::k_to_batches(&value, BATCH_ROWS).map_err(|e| KError::new("cluster", e))
             })
@@ -535,6 +578,7 @@ impl FlightService for ShardNode {
     }
 
     async fn do_action(&self, request: Request<Action>) -> Result<Response<Self::DoActionStream>, Status> {
+        let term = term_of(&request);
         let mut action = request.into_inner();
         let core = &self.core;
         let reply = |body: Vec<u8>| Response::new(stream::iter(vec![Ok(arrow_flight::Result { body: body.into() })]).boxed());
@@ -547,7 +591,7 @@ impl FlightService for ShardNode {
             wire::ACTION_LOAD => {
                 let req: LoadReq = decode(&action.body)?;
                 let _busy = core.admit()?;
-                core.load(req).await?;
+                core.load(req, term).await?;
                 vec![]
             }
             wire::ACTION_MUTATE => {
@@ -555,6 +599,7 @@ impl FlightService for ShardNode {
                 let _busy = core.admit()?;
                 core.blocking(move |core, conn| {
                     let _one = core.writes.lock().unwrap_or_else(|e| e.into_inner());
+                    check_term(&core.server, term)?;
                     txn::check_free(&core.server, &req.table)?;
                     let (schema, changes) = mutation_changes(conn, &req)?;
                     conn.write_vars(changes)?;
@@ -569,6 +614,7 @@ impl FlightService for ShardNode {
                 let commits = matches!(req, TxnReq::Commit { .. });
                 let work = move |core: &Core, conn: &mut Connection| {
                     let _one = core.writes.lock().unwrap_or_else(|e| e.into_inner());
+                    check_term(&core.server, term)?;
                     txn::run(&core.server, conn, &core.prepared, req)
                 };
                 let reply = match commits {
@@ -580,7 +626,7 @@ impl FlightService for ShardNode {
             wire::ACTION_SHUFFLE => {
                 let req: ShuffleReq = decode(&action.body)?;
                 let _busy = core.admit()?;
-                let sent = core.shuffle(req).await?;
+                let sent = core.shuffle(req, term).await?;
                 encode(postcard::to_allocvec(&sent))?
             }
             wire::ACTION_STATUS => encode(postcard::to_allocvec(&core.status()))?,
@@ -597,7 +643,8 @@ impl FlightService for ShardNode {
                 // listing too: a follower may be an entry behind
                 core.check_leader()?;
                 let members = core
-                    .blocking(move |_, _| {
+                    .blocking(move |core, _| {
+                        check_term(&core.server, term)?;
                         if let Some((id, addr)) = &req.add {
                             r.add_replica(*id, addr).map_err(|e| KError::new("cluster", e))?;
                         }
@@ -609,6 +656,20 @@ impl FlightService for ShardNode {
                     .await?;
                 encode(postcard::to_allocvec(&members))?
             }
+            wire::ACTION_FENCE => {
+                let _busy = core.admit()?;
+                core.blocking(move |core, conn| {
+                    // (after any change in progress, so that none of an earlier master's follows)
+                    let _one = core.writes.lock().unwrap_or_else(|e| e.into_inner());
+                    check_term(&core.server, term)?;
+                    match term > fenced(&core.server) {
+                        true => conn.set_vars(vec![(intern(wire::TERM_VAR), Some(K::Long(term as i64)))]),
+                        false => Ok(()),
+                    }
+                })
+                .await?;
+                vec![]
+            }
             wire::ACTION_RAFT => {
                 let env: replica::Envelope = decode(&action.body)?;
                 if let Some(r) = &core.replica {
@@ -616,7 +677,16 @@ impl FlightService for ShardNode {
                 }
                 vec![]
             }
-            other => return Err(Status::unimplemented(format!("unknown action {other}"))),
+            other => {
+                // (on a thread of its own: it may take long, and may wait for the work of a runtime)
+                let (core, kind, body) = (core.clone(), other.to_string(), action.body.clone());
+                let (done, answer) = tokio::sync::oneshot::channel();
+                std::thread::spawn(move || {
+                    let _ = done.send(core.extension.get().and_then(|answers| answers(&kind, &body)));
+                });
+                let unknown = || Status::unimplemented(format!("unknown action {other}"));
+                answer.await.map_err(internal)?.ok_or_else(unknown)??
+            }
         };
         Ok(reply(body))
     }

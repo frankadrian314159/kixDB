@@ -310,6 +310,12 @@ impl Connection {
         Engine::new(&mut ws, &mut self.session).adopt(before, after, drop)
     }
 
+    /// Make the changes of `ops` (see `engine::changes`), logged as one record.
+    pub fn replay(&mut self, ops: Vec<persist::LogOp>) -> KResult<()> {
+        let mut ws = self.server.shared.ws.write().unwrap_or_else(|e| e.into_inner());
+        Engine::new(&mut ws, &mut self.session).replay(ops)
+    }
+
     /// A flag that, once set, stops this connection's evaluation before its next step (`'stop`), for good.
     pub fn cancel_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
         self.session.cancel.clone()

@@ -10,18 +10,20 @@
 //!   there, and the tables it changed are distributed again; what else it changed is then written to the mirror.
 //!
 //! The number of shards can be changed while the cluster runs ([`resize`]), by command or as memory calls for it
-//! ([`autoscale`]).
+//! ([`autoscale`]). There can be several control nodes, one of them the master ([`group`]).
 mod autoscale;
 mod catalog;
 pub mod client;
 mod commit;
 mod exec;
+mod group;
 mod merge;
 mod plan;
 mod resize;
 mod session;
 
 pub use autoscale::{Autoscale, Autoscaler};
+pub use group::GroupConfig;
 pub use session::ClusterSession;
 
 use client::ShardClient;
@@ -39,7 +41,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 /// A table with at most this many rows is copied to every shard for a join, rather than shuffled.
@@ -51,7 +53,7 @@ const OLD_STATE_MAGIC: [u8; 4] = *b"KXCS";
 const MOVE_BATCH: usize = 100_000;
 
 /// What `cluster.state` holds.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct State {
     shards: Vec<ShardInfo>,
     slots: Vec<u32>,
@@ -77,6 +79,12 @@ impl Topology {
 }
 
 struct Inner {
+    /// Set on a control node of a group. (First, so that it stops before the runtime goes.)
+    group: OnceLock<group::Group>,
+    /// The term this node was elected master for (0: it is alone), which its requests to shards carry.
+    term: Arc<AtomicU64>,
+    /// How long a shard may take over a request.
+    request_limit: Mutex<Duration>,
     runtime: tokio::runtime::Runtime,
     topology: RwLock<Topology>,
     /// Shard 0 may hold a newer layout than this node knows.
@@ -107,6 +115,53 @@ impl Inner {
         self.runtime.block_on(f)
     }
 
+    fn request_limit(&self) -> Duration {
+        *self.request_limit.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The shards that `shards` names, with the connections there are to those already known.
+    fn topology_of(&self, shards: &[ShardInfo], slots: Vec<u32>, resizes: u64) -> KResult<Topology> {
+        let old = self.topology();
+        let shards = shards.iter().enumerate().map(|(i, info)| match old.shards.get(i).filter(|s| s.shares(&info.addr)) {
+            Some(known) => {
+                info.endpoints().iter().for_each(|a| {
+                    known.learn(a);
+                });
+                Ok(known.clone())
+            }
+            None => self.new_shard(info.id, &info.addr),
+        });
+        Ok(Topology { shards: shards.collect::<KResult<_>>()?, slots: Arc::new(slots), resizes })
+    }
+
+    /// Forget what is remembered of the shards' tables and of changes they made.
+    fn forget_all(&self) {
+        self.rows.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.finished.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    /// Continue numbering rows after the largest ordinal any shard holds.
+    fn recover_ordinals(&self) -> KResult<()> {
+        let partitioned: Vec<String> = self.mirror.read_workspace(|ws| {
+            ws.dist
+                .iter()
+                .filter(|(name, mode)| !matches!(mode, DistMode::Replicated) && ws.vars.contains_key(name))
+                .map(|(&name, _)| resolve(name))
+                .collect()
+        });
+        let shards = self.shards();
+        for table in partitioned {
+            let query = Work::Q(format!("max {}", ord_var(&table)));
+            let answers = self.wait(try_join_all(shards.iter().map(|s| s.query(query.clone()))))?;
+            for a in answers {
+                if let K::Long(max) = a {
+                    self.next_ord.fetch_max(max.saturating_add(1).max(0), Ordering::SeqCst);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn topology(&self) -> Topology {
         self.topology.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
@@ -128,6 +183,7 @@ impl Inner {
     }
 
     fn members(&self, shard: usize, req: &MemberReq) -> KResult<Vec<MemberInfo>> {
+        self.settle()?;
         let s = self.shard(shard)?;
         let _alone = self.gate.write().unwrap_or_else(|e| e.into_inner());
         let members = self.wait(s.members(req))?;
@@ -136,6 +192,9 @@ impl Inner {
     }
 
     fn save_state(&self) -> KResult<()> {
+        if self.group.get().is_some() {
+            return self.record();
+        }
         let Some(path) = &self.state_path else { return Ok(()) };
         let held = self.topology();
         let state = State { shards: held.info(), slots: (*held.slots).clone(), mirror: self.mirror.export_state()?, resizes: held.resizes };
@@ -166,7 +225,14 @@ impl Cluster {
 
     /// `connect`, proving who the control node is with `tls` and accepting only shards that can do the same.
     pub fn connect_with(config: &ClusterConfig, tls: Option<NodeTls>) -> KResult<Cluster> {
-        Self::build(Self::new_state(config), tls, None, None)
+        Self::build(Self::with_shards(Self::new_state(config))?, Server::new(), tls, None, None)
+    }
+
+    fn with_shards(state: State) -> KResult<State> {
+        match state.shards.is_empty() {
+            true => Err(KError::new("cluster", "the cluster has no shards")),
+            false => Ok(state),
+        }
     }
 
     /// The state of a cluster that has none yet.
@@ -196,27 +262,11 @@ impl Cluster {
             return Err(KError::io(format!("cluster state '{}' is in use by another process", path.display())));
         }
         if !path.exists() {
-            let c = Self::build(Self::new_state(config), tls, Some(path), Some(lock_file))?;
+            let c = Self::build(Self::with_shards(Self::new_state(config))?, Server::new(), tls, Some(path), Some(lock_file))?;
             c.inner.save_state()?;
             return Ok(c);
         }
-        let raw = std::fs::read(&path)?;
-        let old = raw.starts_with(&OLD_STATE_MAGIC);
-        let payload: &[u8] = if raw.len() >= 8 && (old || raw[..4] == STATE_MAGIC) {
-            let expected = u32::from_le_bytes(raw[4..8].try_into().unwrap());
-            let actual = crc32fast::hash(&raw[8..]);
-            if expected != actual {
-                return Err(KError::io(format!("{}: state checksum mismatch", path.display())));
-            }
-            &raw[8..]
-        } else {
-            return Err(KError::io(format!("{}: invalid or corrupt cluster state header", path.display())));
-        };
-        let state: postcard::Result<State> = match old {
-            true => postcard::from_bytes::<(Vec<ShardInfo>, Vec<u32>, Vec<u8>)>(payload).map(|(shards, slots, mirror)| State { shards, slots, mirror, resizes: 0 }),
-            false => postcard::from_bytes(payload),
-        };
-        let mut state = state.map_err(|e| KError::io(format!("{}: {e}", path.display())))?;
+        let (mut state, old) = read_state(&path)?;
         let shards = &mut state.shards;
         if !config.shards.is_empty() {
             if state.resizes == 0 && config.shards.len() != shards.len() {
@@ -233,7 +283,7 @@ impl Cluster {
                 }
             }
         }
-        let cluster = Self::build(state, tls, Some(path), Some(lock_file))?;
+        let cluster = Self::build(Self::with_shards(state)?, Server::new(), tls, Some(path), Some(lock_file))?;
         if old {
             cluster.place_partitioned_tables_again()?;
             cluster.inner.save_state()?;
@@ -254,22 +304,23 @@ impl Cluster {
         partitioned.into_iter().try_for_each(|table| session.place_again(table))
     }
 
-    fn build(state: State, tls: Option<NodeTls>, state_path: Option<PathBuf>, state_lock: Option<std::fs::File>) -> KResult<Cluster> {
+    fn build(state: State, mirror: Server, tls: Option<NodeTls>, state_path: Option<PathBuf>, state_lock: Option<std::fs::File>) -> KResult<Cluster> {
         let info = state.shards;
-        if info.is_empty() {
-            return Err(KError::new("cluster", "the cluster has no shards"));
-        }
+        let term = Arc::new(AtomicU64::new(0));
         let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?;
         let shards = {
             let _in_runtime = runtime.enter();
-            info.iter().map(|s| ShardClient::new(s.id, &s.addr, tls.clone()).map(Arc::new)).collect::<KResult<Vec<_>>>()?
+            let connect = |s: &ShardInfo| ShardClient::new(s.id, &s.addr, tls.clone()).map(|c| Arc::new(c.fenced_by(term.clone())));
+            info.iter().map(connect).collect::<KResult<Vec<_>>>()?
         };
-        let mirror = Server::new();
         let known = !state.mirror.is_empty();
         if known {
             mirror.install_state(&state.mirror)?;
         }
         let inner = Inner {
+            group: OnceLock::new(),
+            term,
+            request_limit: Mutex::new(client::REQUEST_LIMIT),
             runtime,
             topology: RwLock::new(Topology { shards, slots: Arc::new(state.slots), resizes: state.resizes }),
             layout_unsure: AtomicBool::new(true),
@@ -291,31 +342,11 @@ impl Cluster {
         let cluster = Cluster { inner: Arc::new(inner) };
         if known {
             cluster.inner.adopt_layout()?;
-            cluster.recover_ordinals()?;
+            // (what was left half made is finished first: it may hold the latest ordinals)
+            cluster.inner.resolve();
+            cluster.inner.recover_ordinals()?;
         }
         Ok(cluster)
-    }
-
-    /// Continue numbering rows after the largest ordinal any shard holds.
-    fn recover_ordinals(&self) -> KResult<()> {
-        let partitioned: Vec<String> = self.inner.mirror.read_workspace(|ws| {
-            ws.dist
-                .iter()
-                .filter(|(name, mode)| !matches!(mode, DistMode::Replicated) && ws.vars.contains_key(name))
-                .map(|(&name, _)| resolve(name))
-                .collect()
-        });
-        let shards = self.inner.shards();
-        for table in partitioned {
-            let query = Work::Q(format!("max {}", ord_var(&table)));
-            let answers = self.inner.wait(try_join_all(shards.iter().map(|s| s.query(query.clone()))))?;
-            for a in answers {
-                if let K::Long(max) = a {
-                    self.inner.next_ord.fetch_max(max.saturating_add(1).max(0), Ordering::SeqCst);
-                }
-            }
-        }
-        Ok(())
     }
 
     pub fn session(&self) -> ClusterSession {
@@ -323,6 +354,7 @@ impl Cluster {
     }
 
     pub fn shard_count(&self) -> usize {
+        self.inner.follow();
         self.inner.shards().len()
     }
 
@@ -350,6 +382,7 @@ impl Cluster {
     /// Fail a request that a shard has not answered after `limit` (300 s to begin with; zero: never). A change that times
     /// out may still be made.
     pub fn set_request_timeout(&self, limit: Duration) {
+        *self.inner.request_limit.lock().unwrap_or_else(|e| e.into_inner()) = limit;
         self.inner.shards().iter().for_each(|s| s.set_limit(limit));
     }
 
@@ -373,6 +406,7 @@ impl Cluster {
     }
 
     pub fn status(&self) -> Vec<KResult<ShardStatus>> {
+        self.inner.follow();
         let shards = self.inner.shards();
         self.inner.wait(join_all(shards.iter().map(|s| s.status())))
     }
@@ -384,6 +418,7 @@ impl Cluster {
 
     /// Prometheus text for every shard that answers.
     pub fn prometheus(&self) -> String {
+        self.inner.follow();
         let shards = self.inner.shards();
         let answers = self.inner.wait(join_all(shards.iter().map(|s| s.metrics())));
         let up: Vec<NodeMetrics> = answers.into_iter().filter_map(Result::ok).collect();
@@ -413,11 +448,36 @@ impl Cluster {
         self.inner.mirror.clone()
     }
 
-    /// Stop serving new gateway connections and write the state.
+    /// Stop serving new gateway connections and write the state; a node of a group hands over and leaves.
     pub fn shutdown(&self) -> KResult<()> {
         self.inner.mirror.set_interceptor(None);
+        if self.inner.group.get().is_some() {
+            self.leave_group();
+            return Ok(());
+        }
         self.inner.save_state()
     }
+}
+
+fn cluster_error(message: impl Into<String>) -> KError {
+    KError::new("cluster", message)
+}
+
+/// What the state file at `path` holds, and whether it is of the old kind.
+fn read_state(path: &Path) -> KResult<(State, bool)> {
+    let raw = std::fs::read(path)?;
+    let old = raw.starts_with(&OLD_STATE_MAGIC);
+    if raw.len() < 8 || !(old || raw[..4] == STATE_MAGIC) {
+        return Err(KError::io(format!("{}: invalid or corrupt cluster state header", path.display())));
+    }
+    if u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]) != crc32fast::hash(&raw[8..]) {
+        return Err(KError::io(format!("{}: state checksum mismatch", path.display())));
+    }
+    let state: postcard::Result<State> = match old {
+        true => postcard::from_bytes::<(Vec<ShardInfo>, Vec<u32>, Vec<u8>)>(&raw[8..]).map(|(shards, slots, mirror)| State { shards, slots, mirror, resizes: 0 }),
+        false => postcard::from_bytes(&raw[8..]),
+    };
+    Ok((state.map_err(|e| KError::io(format!("{}: {e}", path.display())))?, old))
 }
 
 /// What a gateway connection gets once the cluster has been dropped.

@@ -16,6 +16,37 @@ pub const ACTION_METRICS: &str = "metrics";
 pub const ACTION_MEMBERS: &str = "members";
 pub const ACTION_RAFT: &str = "raft";
 pub const ACTION_TXN: &str = "txn";
+/// Have a shard refuse, from now on, any control node elected before the one that asks.
+pub const ACTION_FENCE: &str = "fence";
+/// A statement that a control node passes to the master of its group.
+pub const ACTION_FORWARD: &str = "forward";
+
+/// The request header in which the master of a group of control nodes gives the term it was elected for.
+pub const TERM_HEADER: &str = "kix-term";
+/// The shard variable that holds the latest term the shard was fenced with.
+pub const TERM_VAR: &str = ".kix.term";
+
+/// A statement that a control node that is not the master passes to the one that is, with its session's namespace.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ForwardReq {
+    pub namespace: String,
+    pub what: Forwarded,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum Forwarded {
+    Eval(String),
+    /// A functional IPC message, IPC-encoded.
+    Message(Vec<u8>),
+    Explain(String),
+}
+
+/// What the master answers: the namespace the session is then in, and the value (IPC-encoded) or the signal.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ForwardReply {
+    pub namespace: String,
+    pub answer: Result<Vec<u8>, (String, String)>,
+}
 
 /// Message prefix of the status with which a Raft follower redirects to the current leader (followed by its address).
 pub const NOT_LEADER_PREFIX: &str = "NOTLEADER|";

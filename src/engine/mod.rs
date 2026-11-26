@@ -480,24 +480,19 @@ impl<'a> Engine<'a> {
     }
 
     /// Make here, as one record, what became of a copy of this workspace, `before` being the copy as it was and `after`
-    /// as it is: the globals, views and distributions that differ are written, and the globals of `drop` removed. The
-    /// tables mounted in the copy are taken over. With nothing to write, nothing is logged.
+    /// as it is (see `changes`), and remove the globals of `drop`. The tables mounted in the copy are taken over.
     pub(crate) fn adopt(&mut self, before: &Workspace, after: &Workspace, drop: &[SymId]) -> KResult<()> {
-        self.ws.writable()?;
-        let moved = after.dist.iter().filter(|(table, mode)| before.dist.get(table) != Some(mode));
-        let mut ops: Vec<LogOp> = moved.map(|(&table, mode)| LogOp::SetDist { table, mode: mode.clone() }).collect();
-        for (&name, val) in after.vars.iter() {
-            if before.vars.get(&name).is_none_or(|old| !crate::delta::unchanged(old, val)) {
-                ops.push(log_of_value(self.ws.vars.get(&name).filter(|_| !self.ws.unlogged.contains(&name)), name, val));
-            }
-        }
-        let gone = before.vars.keys().chain(before.views.keys()).filter(|n| !after.vars.contains_key(n) && !after.views.contains_key(n));
-        ops.extend(gone.chain(drop).map(|&name| LogOp::DropVar { name }));
-        let defined = after.views.values().filter(|v| before.views.get(&v.name).map(|old| &old.expr) != Some(&v.expr));
-        ops.extend(defined.map(|def| LogOp::SetView { def: def.clone() }));
+        let mut ops = changes(self.ws, before, after);
+        ops.extend(drop.iter().map(|&name| LogOp::DropVar { name }));
         if !Arc::ptr_eq(&before.partitioned.0, &after.partitioned.0) {
             self.ws.partitioned = after.partitioned.clone();
         }
+        self.replay(ops)
+    }
+
+    /// Make the changes of `ops`, logged as one record. With nothing to change, nothing is logged.
+    pub(crate) fn replay(&mut self, ops: Vec<LogOp>) -> KResult<()> {
+        self.ws.writable()?;
         if ops.is_empty() {
             return Ok(());
         }
@@ -2272,6 +2267,23 @@ impl<'a> Engine<'a> {
             _ => Err(KError::nyi(format!("unknown system command \\{cmd}"))),
         }
     }
+}
+
+/// What would make `current` hold what became of a copy of it, `before` being the copy as it was and `after` as it is:
+/// the distributions, globals and views that differ.
+pub fn changes(current: &Workspace, before: &Workspace, after: &Workspace) -> Vec<LogOp> {
+    let moved = after.dist.iter().filter(|(table, mode)| before.dist.get(table) != Some(mode));
+    let mut ops: Vec<LogOp> = moved.map(|(&table, mode)| LogOp::SetDist { table, mode: mode.clone() }).collect();
+    for (&name, val) in after.vars.iter() {
+        if before.vars.get(&name).is_none_or(|old| !crate::delta::unchanged(old, val)) {
+            ops.push(log_of_value(current.vars.get(&name).filter(|_| !current.unlogged.contains(&name)), name, val));
+        }
+    }
+    let gone = before.vars.keys().chain(before.views.keys()).filter(|n| !after.vars.contains_key(n) && !after.views.contains_key(n));
+    ops.extend(gone.map(|&name| LogOp::DropVar { name }));
+    let defined = after.views.values().filter(|v| before.views.get(&v.name).map(|old| &old.expr) != Some(&v.expr));
+    ops.extend(defined.map(|def| LogOp::SetView { def: def.clone() }));
+    ops
 }
 
 /// The record of a global's new value: only what changed in it, where `old` is the value that the log's readers have.
