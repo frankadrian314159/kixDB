@@ -4,7 +4,7 @@ mod common;
 use common::{same, Shards, MARKET};
 use kix_control::client::ShardClient;
 use kix_control::{Cluster, ClusterSession, GroupConfig};
-use kix_shared_ces::wire::{LoadMode, LoadReq, TxnOp, TxnReq, Work};
+use kix_shared_ces::wire::{LoadMode, LoadReq, PermitReq, TxnOp, TxnReq, Work};
 use kix_shared_ces::ClusterConfig;
 use kixdb::ipc::{IpcClient, IpcConfig, Listener};
 use kixdb::persist::LogOp;
@@ -12,7 +12,7 @@ use kixdb::sym::intern;
 use kixdb::{Connection, Server, K};
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -414,4 +414,149 @@ fn a_master_cut_off_while_it_changes_rows_on_the_shards_cannot_commit() {
     s.eval("`events insert (7; `a)").unwrap();
     g.nodes[&old].cut_off(false);
     wait("the old master to follow", || g.session(old).eval("count events").ok().filter(|n| *n == K::Long(7)));
+}
+
+#[test]
+fn a_node_that_is_not_the_master_answers_reads_itself() {
+    let mut g = Group::start(2, 3);
+    g.load();
+    let master = g.master();
+    let others: Vec<u64> = g.nodes.keys().copied().filter(|&id| id != master).collect();
+    let mut asked = g.session(others[0]);
+    for query in ["select from trade", "select sum size by sym from trade", "count trade", "select from trade where sym = `IBM", "aj[`sym`time; trade; quote]", "select med price from trade"] {
+        let (expected, answer) = (g.single.eval(query).unwrap(), asked.eval(query).unwrap());
+        assert!(same(&expected, &answer), "{query}: {expected} and {answer}");
+        assert!(!asked.last_plan().is_empty(), "{query} was not run here");
+    }
+    // what changes something, or names no table, is the master's to run
+    for statement in ["x: 5", "x", "`trade insert (16:00:00.000; `IBM; 1.5; 3; `N; `ann)", "y: exec max price from trade"] {
+        let (expected, answer) = (g.single.eval(statement), asked.eval(statement));
+        assert_eq!(expected.map_err(|e| e.signal), answer.map_err(|e| e.signal), "{statement}");
+        assert!(asked.last_plan().is_empty(), "{statement} was run here");
+    }
+    // errors are the same, and what one node was told is done, every node sees
+    g.check(others[1], "select nothing from trade");
+    for n in 0..40 {
+        g.check(others[n % 2], &format!("`trade insert (16:00:01.000; `AMD; 2.5; {n}; `N; `bob)"));
+        g.check(others[(n + 1) % 2], "exec (count i; sum size) from trade");
+        g.check(master, "count trade");
+    }
+    g.check(others[0], "filtered: 1; t: ([] a: 1 2 3)");
+    g.check(others[1], "select sum a from t");
+    // a node that is cut off answers nothing, rather than what may be out of date
+    g.nodes[&others[0]].cut_off(true);
+    g.check(master, "`trade insert (16:00:02.000; `AMD; 2.5; 1; `N; `bob)");
+    let e = asked.eval("count trade").unwrap_err();
+    assert!(e.detail.contains("no control node is the master"), "{e}");
+    g.nodes[&others[0]].cut_off(false);
+    wait("the node to be back", || asked.eval("count trade").ok());
+    g.check(others[0], "count trade");
+}
+
+#[test]
+fn reads_on_every_node_see_each_change_whole() {
+    let mut g = Group::start(2, 3);
+    let third = g.shards.add(2);
+    let master = g.master();
+    g.session(master).eval("ledger: ([] batch: `long$(); sym: `symbol$(); amount: `long$())").unwrap();
+    let others: Vec<u64> = g.nodes.keys().copied().filter(|&id| id != master).collect();
+    let stop = Arc::new(AtomicBool::new(false));
+    // batches of rows over the shards that sum to nothing, some changed and removed again
+    let mut writing = g.session(others[0]);
+    let stopping = stop.clone();
+    let writer = std::thread::spawn(move || {
+        let mut acknowledged = 0;
+        for n in 1.. {
+            if stopping.load(Ordering::SeqCst) {
+                break;
+            }
+            let statement = match n % 5 {
+                3 => format!("update amount: 2 * amount from `ledger where batch > {}", n - 4),
+                4 => format!("delete from `ledger where batch < {}", n - 12),
+                _ => format!("`ledger insert (6#{n}; `a`b`c`d`e`f; {n} * 1 -1 2 -2 3 -3)"),
+            };
+            acknowledged += usize::from(writing.eval(&statement).is_ok());
+        }
+        acknowledged
+    });
+    let readers: Vec<_> = others
+        .iter()
+        .map(|&id| {
+            let (mut session, stopping) = (g.session(id), stop.clone());
+            std::thread::spawn(move || {
+                let (mut here, mut failed) = (0, 0);
+                while !stopping.load(Ordering::SeqCst) {
+                    // each of these would be wrong of rows seen part way through a change, or twice as they move
+                    for (query, right) in [
+                        ("exec sum amount from ledger", "0"),
+                        ("(count ledger) mod 6", "0"),
+                        ("all 0 = exec s from select s: sum amount by batch from ledger", "1b"),
+                        ("all 6 = exec c from select c: count i by batch from ledger", "1b"),
+                    ] {
+                        match session.eval(query) {
+                            Ok(answer) => {
+                                assert_eq!(answer.to_string(), right, "node {id}: {query}");
+                                here += usize::from(!session.last_plan().is_empty());
+                            }
+                            Err(e) => {
+                                assert_eq!(e.signal, "cluster", "node {id}: {query}: {e}");
+                                failed += 1;
+                            }
+                        }
+                    }
+                }
+                (here, failed)
+            })
+        })
+        .collect();
+    let a_while = || std::thread::sleep(Duration::from_millis(1500));
+    a_while();
+    g.session(g.master()).eval(&format!("ADD SHARD {third}")).unwrap();
+    a_while();
+    g.session(g.master()).eval("REMOVE SHARD").unwrap();
+    a_while();
+    g.stop(master);
+    g.master();
+    a_while();
+    stop.store(true, Ordering::SeqCst);
+    let acknowledged = writer.join().unwrap();
+    assert!(acknowledged > 30, "{acknowledged}");
+    for (reader, id) in readers.into_iter().zip(&others) {
+        let (here, failed) = reader.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+        eprintln!("node {id}: {here} reads answered here, {failed} failed; {acknowledged} changes made");
+        assert!(here > 50, "node {id} answered {here} reads itself");
+    }
+    let mut s = g.session(g.master());
+    assert_eq!(s.eval("exec (sum amount; (count i) mod 6) from ledger").unwrap().to_string(), "0 0");
+}
+
+#[test]
+fn a_permit_to_read_holds_changes_back_until_it_lapses() {
+    let g = Group::start(2, 3);
+    let master = g.master();
+    let mut s = g.session(master);
+    s.eval("t: ([] a: til 10)").unwrap();
+    let address = g.addresses[&master].clone();
+    let node = g.shards.runtime.block_on(async { ShardClient::new(0, &address, None).unwrap() });
+    let ask = |req: PermitReq| g.shards.runtime.block_on(node.permit(&req));
+    let permit = ask(PermitReq::Take).unwrap().permit;
+    // reads go on beside it; a change waits, for as long as the permit is renewed and then until it lapses
+    assert_eq!(s.eval("count t").unwrap(), K::Long(10));
+    let mut writing = g.session(master);
+    let began = Instant::now();
+    let writer = std::thread::spawn(move || writing.eval("`t insert enlist 10").map(|_| Instant::now()));
+    for _ in 0..3 {
+        std::thread::sleep(Duration::from_secs(2));
+        ask(PermitReq::Renew(permit)).unwrap();
+        assert!(!writer.is_finished());
+    }
+    let made = writer.join().unwrap().unwrap() - began;
+    assert!(made > Duration::from_secs(10) && made < Duration::from_secs(15), "{made:?}");
+    assert!(ask(PermitReq::Renew(permit)).unwrap_err().detail.contains("lapsed"));
+    // one that is released holds nothing back
+    let permit = ask(PermitReq::Take).unwrap().permit;
+    ask(PermitReq::Release(permit)).unwrap();
+    let began = Instant::now();
+    g.session(master).eval("`t insert enlist 11").unwrap();
+    assert!(began.elapsed() < Duration::from_secs(2), "{:?}", began.elapsed());
 }

@@ -85,6 +85,10 @@ impl Inner {
         if self.unsettled() {
             self.resolve();
         }
+        // (nodes that read under a permit learn where the rows are from the record)
+        if self.group.get().is_some() {
+            self.record()?;
+        }
         Ok(())
     }
 

@@ -6,6 +6,7 @@ use kixdb::ast::Expr;
 use kixdb::ipc::{decode_k_payload, encode_k_payload};
 use kixdb::{KError, K};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tonic::{Code, Status};
 
 pub const ACTION_LOAD: &str = "load";
@@ -20,6 +21,33 @@ pub const ACTION_TXN: &str = "txn";
 pub const ACTION_FENCE: &str = "fence";
 /// A statement that a control node passes to the master of its group.
 pub const ACTION_FORWARD: &str = "forward";
+
+/// A control node of a group asks the master to let it read, or ends that.
+pub const ACTION_PERMIT: &str = "permit";
+/// How long a permit to read lasts unless it is renewed.
+pub const PERMIT_LIMIT: Duration = Duration::from_secs(5);
+
+/// The master's leave to read: while it lasts, no statement changes anything.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Permit {
+    /// The term the master that gave it was elected for.
+    pub term: u64,
+    pub id: u64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub enum PermitReq {
+    Take,
+    Renew(Permit),
+    Release(Permit),
+}
+
+/// The permit asked about and, for one taken, how far the master's mirror had come: the reader's must be no older.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct PermitReply {
+    pub permit: Permit,
+    pub position: u64,
+}
 
 /// The request header in which the master of a group of control nodes gives the term it was elected for.
 pub const TERM_HEADER: &str = "kix-term";

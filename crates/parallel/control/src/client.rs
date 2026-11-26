@@ -8,7 +8,7 @@ use kix_shared_ces::arrowconv;
 use kix_shared_ces::metrics::NodeMetrics;
 use kix_shared_ces::pieces::pieces;
 use kix_shared_ces::tls::{self, NodeTls};
-use kix_shared_ces::wire::{self, ForwardReply, ForwardReq, Fragment, LoadReq, MemberInfo, MemberReq, MutateReq, ShardStatus, ShuffleReq, TxnReply, TxnReq, Work};
+use kix_shared_ces::wire::{self, ForwardReply, ForwardReq, Fragment, LoadReq, PermitReply, PermitReq, MemberInfo, MemberReq, MutateReq, ShardStatus, ShuffleReq, TxnReply, TxnReq, Work};
 use kixdb::ipc::decode_k_payload;
 use kixdb::{KError, KResult, K};
 use std::future::Future;
@@ -111,6 +111,11 @@ impl ShardClient {
     /// Have the shard refuse control nodes elected before this one.
     pub async fn fence(&self) -> KResult<()> {
         self.send(true, wire::ACTION_FENCE, vec![]).await.map(|_| ())
+    }
+
+    /// Take, renew or release a permit to read, at the control node, which must be the master of its group.
+    pub async fn permit(&self, req: &PermitReq) -> KResult<PermitReply> {
+        reply(&self.send(false, wire::ACTION_PERMIT, body(req)?).await?)
     }
 
     /// Pass a statement to the control node, which must be the master of its group.

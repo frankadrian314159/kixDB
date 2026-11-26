@@ -93,8 +93,8 @@ for them on an address other machines can reach (`--bind`), `kix-cluster` needs 
 
 ## Several control nodes
 
-Control nodes can form a group. One of them is the **master**, which runs every statement; the others pass their
-clients' statements to it and take over if it stops.
+Control nodes can form a group. One of them is the **master**, which alone changes anything; every node answers reads
+itself and passes the other statements of its clients to the master. If the master stops, another takes over.
 
 ```
 kix-cluster --make-certs certs c1 c2 c3
@@ -120,9 +120,15 @@ on. (From Rust: `Cluster::open_group(group, &config, tls)`, `shutdown` to hand o
   removed: remove it, then join another.
 * **Clients may connect to any node,** with kdb+ IPC to one address. When that node stops they must connect to another
   (a TCP load balancer does this for them).
-* **No more throughput:** the master does all planning, merging and gathering. A statement passed on costs about half a
-  millisecond more (on one machine: an insert took 0.8 ms at the master and 1.3 ms through another node). Its result
-  must fit in 256 MB.
+* **Reads are spread, changes are not.** A node that is not the master answers a statement itself if it reads tables and
+  changes nothing: it takes a **permit** from the master, waits until its copy of the schemas is as new as the
+  master's, plans the query, merges what the shards send and gives the permit back. While a permit is out no change is
+  made, so a read sees each change whole. A permit lasts 5 s and is renewed for as long as the read goes on: a node
+  that stops while it reads holds changes up for that long at most.
+* **Passed to the master:** whatever changes something, statements that name no table (such as `x`), functional
+  messages, `EXPLAIN`, the cluster commands, and a query that only the master can run, as one that needs a whole table
+  gathered and put to a user's function. A statement passed on must have a result that fits in 256 MB, and costs
+  another round trip (on one machine, 0.5 to 1 ms).
 * **What the nodes share** is schemas, distribution, variables, functions, views and the record of the shards. Each
   keeps a durable copy in `--data`. A change to any of it waits for a majority.
 * **When the master stops,** the others elect one (about two seconds from a killed master to the next answer, on one
@@ -364,7 +370,8 @@ statement tries at once after a failure, then every 5 seconds.
 
 ## Concurrency
 
-One control node (the master of a group) runs all statements. Pushed-down reads and selective partial gathers (`slice`) share the cluster concurrently
+Changes run on one control node (the master of a [group](#several-control-nodes), whose other nodes can answer reads).
+Pushed-down reads and selective partial gathers (`slice`) share the cluster concurrently
 (and temporary `.kix.tmp.*` broadcast/shuffle join tables stay in shard RAM without writing to the WAL or Raft log);
 writes and full-table mirror gathers take exclusive cluster access.
 
@@ -463,7 +470,7 @@ shards must match.
 * **Every node is trusted fully.** A certificate of the cluster's authority gives full access to every shard, and
   certificates cannot be revoked one by one (see [Security](#security)).
 * **A single control node is a single point of failure** ([several](#several-control-nodes) are not), and gathering
-  needs memory on the control node for the whole table. More control nodes add no throughput.
+  needs memory on the control node for the whole table. More control nodes add capacity for reads only.
 * **Statements wait while shards are added or removed** ([Changing the number of shards](#changing-the-number-of-shards)).
   Shards can be [added by themselves](#adding-shards-by-itself) when memory calls for it; none is removed so.
 * Slots move to even out their number, not the rows in them: one symbol or day with most of the rows stays whole.

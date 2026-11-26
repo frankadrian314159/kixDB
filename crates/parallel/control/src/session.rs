@@ -114,6 +114,41 @@ impl ClusterSession {
         &self.plan
     }
 
+    /// Run `code` here, under a permit of the master's, if another node of this node's group is the master and every
+    /// statement reads tables and changes nothing. `None`: it is to be run some other way.
+    fn read_here(&mut self, code: &str) -> Option<KResult<K>> {
+        if self.inner.is_master() {
+            return None;
+        }
+        let statements = parse_script(code).ok()?;
+        let names = self.names();
+        if statements.is_empty() || !statements.iter().all(|e| !names.refs(e).none() && names.is_pure(e)) {
+            return None;
+        }
+        let inner = self.inner.clone();
+        inner.with_permit(|| {
+            let mut last = K::Null;
+            for e in &statements {
+                match self.read(e) {
+                    Ok(Some(value)) => last = value,
+                    // one that only the master can run, or a shard that would not answer this node: the master's part
+                    Ok(None) => return None,
+                    Err(e) if e.signal == "cluster" => return None,
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+            Some(Ok(last))
+        })?
+    }
+
+    /// The answer to `code` if this node does not run it as master: read here, or given by the master.
+    fn elsewhere(&mut self, code: &str) -> Option<KResult<K>> {
+        self.read_here(code).or_else(|| {
+            self.plan.clear();
+            self.passed_on(|| Forwarded::Eval(code.to_string()))
+        })
+    }
+
     /// What the master of this node's group answers to `what`, if another node is the master.
     fn passed_on(&mut self, what: impl FnOnce() -> Forwarded) -> Option<KResult<K>> {
         let reply = self.inner.pass_on(self.conn.current_namespace(), what)?;
@@ -140,7 +175,7 @@ impl ClusterSession {
     /// Run `q` source (or a cluster command) and return the value of the last statement.
     pub fn eval(&mut self, code: &str) -> KResult<K> {
         self.plan.clear();
-        if let Some(r) = self.passed_on(|| Forwarded::Eval(code.to_string())) {
+        if let Some(r) = self.elsewhere(code) {
             return r;
         }
         if let Some(r) = self.command(code) {
@@ -160,8 +195,8 @@ impl ClusterSession {
             Some(rs) => Event::Rows(rs),
             None => Event::Value(v),
         };
-        // (a node that passes statements on gives the value of the last one)
-        if let Some(r) = self.passed_on(|| Forwarded::Eval(code.to_string())).or_else(|| self.command(code)) {
+        // (a node that is not the master gives the value of the last statement)
+        if let Some(r) = self.elsewhere(code).or_else(|| self.command(code)) {
             return BatchResult { events: vec![r.map(show).unwrap_or_else(Event::Error)] };
         }
         let mut events = vec![];

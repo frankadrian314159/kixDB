@@ -1,21 +1,23 @@
 //! Several control nodes. They form a group that elects one of them the **master** (Raft, with the replicas of a
-//! replicated shard): what is replicated is the mirror, with a record of the shards. The master alone runs statements;
-//! the others pass their clients' statements to it. A new master first has every shard refuse the masters before it
-//! (they send the term they were elected for), then finishes what was left half done.
+//! replicated shard): what is replicated is the mirror, with a record of the shards. The master alone changes anything.
+//! The others answer reads themselves, each under a **permit** of the master's, and pass the other statements of their
+//! clients to it. A new master first has every shard refuse the masters before it (they send the term they were elected
+//! for), then finishes what was left half done.
 use crate::client::ShardClient;
 use crate::{cluster_error, read_state, Cluster, ClusterSession, Inner, State};
 use futures::future::try_join_all;
-use kix_shared_ces::wire::{self, ForwardReply, ForwardReq, Forwarded, MemberInfo, MemberReq, TxnReply, TxnReq};
+use kix_shared_ces::wire::{self, ForwardReply, ForwardReq, Forwarded, MemberInfo, MemberReq, Permit, PermitReply, PermitReq, TxnReply, TxnReq, PERMIT_LIMIT};
 use kix_shared_ces::{ClusterConfig, NodeTls};
 use kix_raft::Role;
 use kix_storage::{spawn_on, Replica, ReplicaConfig, RunningShard, ShardNode};
 use kixdb::persist::LogOp;
 use kixdb::sym::intern;
 use kixdb::{Attr, ColVec, KError, KResult, Server, K};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tonic::Status;
 
@@ -62,6 +64,9 @@ pub(crate) struct Group {
     settled: AtomicU64,
     /// The connection to the master, for the statements passed to it.
     master: Mutex<Option<(String, Arc<ShardClient>)>>,
+    /// The permits to read that this node, as master, has out: each is held while its sender is here.
+    permits: Mutex<HashMap<u64, mpsc::Sender<()>>>,
+    next_permit: AtomicU64,
     halted: AtomicBool,
 }
 
@@ -72,6 +77,10 @@ impl Drop for Group {
 }
 
 impl Group {
+    pub(crate) fn leads(&self) -> bool {
+        self.term().is_some()
+    }
+
     /// The term for which this node is the master now. A leader that is not ready to serve this moment (it has a change
     /// to apply, or has not heard from a majority lately) is waited for.
     fn term(&self) -> Option<u64> {
@@ -154,8 +163,10 @@ impl Cluster {
         };
         let weak = Arc::downgrade(inner);
         let node = node.with_extension(Box::new(move |kind, body| {
-            (kind == wire::ACTION_FORWARD).then(|| weak.upgrade().ok_or_else(|| Status::unavailable("the control node is gone"))?.answer_forwarded(body))
+            [wire::ACTION_FORWARD, wire::ACTION_PERMIT].contains(&kind).then(|| weak.upgrade().ok_or_else(|| Status::unavailable("the control node is gone"))?.answer(kind, body))
         }));
+        // (the temporary tables of each node's reads have names of their own on the shards)
+        inner.next_temp.store(group.id << 40, Ordering::SeqCst);
         let replica = node.replica().ok_or_else(|| cluster_error("the control node has no replica"))?;
         // a new group's first node writes the shards it was given, and what it takes over, before any node can join
         if first.exists() && inner.held::<State>(RECORD)?.is_none() {
@@ -170,7 +181,16 @@ impl Cluster {
             inner.record()?;
         }
         let running = inner.wait(spawn_on(node, listener))?;
-        let joined = Group { replica, node: Mutex::new(Some(running)), address: address.clone(), settled: AtomicU64::new(0), master: Mutex::default(), halted: AtomicBool::new(false) };
+        let joined = Group {
+            replica,
+            node: Mutex::new(Some(running)),
+            address: address.clone(),
+            settled: AtomicU64::new(0),
+            master: Mutex::default(),
+            permits: Mutex::default(),
+            next_permit: AtomicU64::new(0),
+            halted: AtomicBool::new(false),
+        };
         let _ = inner.group.set(joined);
         if let Some(master) = &master {
             // (a node that has run before is in the group, unless an earlier join was cut short: it asks once)
@@ -200,7 +220,7 @@ impl Cluster {
 
     /// Whether this node answers statements itself: it is alone, or the master of its group.
     pub fn is_master(&self) -> bool {
-        self.inner.group.get().is_none_or(|g| g.term().is_some())
+        self.inner.is_master()
     }
 
     /// The address of this node in its group.
@@ -358,8 +378,7 @@ impl Inner {
             }
             // (the node taken to be the master is first asked whether it is, which is safe to ask of one that has just
             // died: a statement sent to such a node could not safely be sent again)
-            let known = group.replica.leader_addr().filter(|_| !group.replica.is_cut_off());
-            if let Some(client) = known.and_then(|address| self.client_of(group, address).ok()) {
+            if let Some(client) = self.known_master(group) {
                 if self.wait(client.status()).is_ok_and(|s| s.role == "leader") {
                     break client;
                 }
@@ -371,6 +390,103 @@ impl Inner {
         };
         let answer = self.wait(master.forward(&ForwardReq { namespace, what: what() }));
         Some(answer.map_err(|e| cluster_error(format!("the master did not answer; {}", e.detail.replacen("shard 0", "control node", 1)))))
+    }
+
+    /// A connection to the node this one takes to be the master, if it knows one and can reach it.
+    fn known_master(&self, group: &Group) -> Option<Arc<ShardClient>> {
+        let address = group.replica.leader_addr().filter(|_| !group.replica.is_cut_off())?;
+        self.client_of(group, address).ok()
+    }
+
+    /// Run `read` under a permit of the master's, if another node is the master: with the mirror as new as the master's
+    /// was when it gave the permit, the shards told for which term, and the permit renewed for as long as it takes.
+    /// `None`: it could not be done so, or the permit may have lapsed meanwhile, and what was read is not to be used.
+    pub(crate) fn with_permit<T>(&self, read: impl FnOnce() -> T) -> Option<T> {
+        let group = self.group.get().filter(|g| g.term().is_none())?;
+        let master = self.known_master(group)?;
+        let asked = Instant::now();
+        let given = self.wait(master.permit(&PermitReq::Take)).ok()?;
+        let permit = given.permit;
+        // when the latest request that kept the permit was sent: it lasts at least its limit from then
+        let kept = Mutex::new(asked);
+        let value = loop {
+            // all that this node asks of shards at one time carries one term, which changes only while nothing does
+            let shared = self.gate.read().unwrap_or_else(|e| e.into_inner());
+            if self.term.load(Ordering::SeqCst) != permit.term {
+                drop(shared);
+                let _alone = self.gate.write().unwrap_or_else(|e| e.into_inner());
+                if self.term.fetch_max(permit.term, Ordering::SeqCst) > permit.term {
+                    break None;
+                }
+                continue;
+            }
+            while self.mirror.applied_ts() < given.position && asked.elapsed() < PERMIT_LIMIT / 2 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if self.mirror.applied_ts() < given.position {
+                break None;
+            }
+            self.follow();
+            break std::thread::scope(|scope| {
+                let (done, finished) = mpsc::channel::<()>();
+                let (kept, master) = (&kept, &master);
+                scope.spawn(move || {
+                    while finished.recv_timeout(PERMIT_LIMIT / 3) == Err(mpsc::RecvTimeoutError::Timeout) {
+                        let sent = Instant::now();
+                        if self.wait(master.permit(&PermitReq::Renew(permit))).is_err() {
+                            break;
+                        }
+                        *kept.lock().unwrap_or_else(|e| e.into_inner()) = sent;
+                    }
+                });
+                let value = read();
+                let lasted = kept.lock().unwrap_or_else(|e| e.into_inner()).elapsed() < PERMIT_LIMIT;
+                drop(done);
+                lasted.then_some(value)
+            });
+        };
+        // (without waiting: a permit not released lapses)
+        self.runtime.spawn(async move {
+            let _ = master.permit(&PermitReq::Release(permit)).await;
+        });
+        value
+    }
+
+    /// The master's side of a permit to read: the shared side of the cluster's lock, held by a thread of its own until
+    /// the permit is released or goes `PERMIT_LIMIT` without being renewed.
+    fn permit(self: Arc<Self>, req: PermitReq) -> KResult<PermitReply> {
+        let group = self.group.get().ok_or_else(not_master)?;
+        let gone = || cluster_error("the permit to read has lapsed");
+        match req {
+            PermitReq::Take => {
+                self.settle()?;
+                let permit = Permit { term: group.term().ok_or_else(not_master)?, id: group.next_permit.fetch_add(1, Ordering::SeqCst) };
+                let ((keep, renewed), (given, position)) = (mpsc::channel(), mpsc::channel());
+                group.permits.lock().unwrap_or_else(|e| e.into_inner()).insert(permit.id, keep);
+                let inner = self.clone();
+                std::thread::spawn(move || {
+                    let _shared = inner.gate.read().unwrap_or_else(|e| e.into_inner());
+                    let _ = given.send(inner.mirror.applied_ts());
+                    while renewed.recv_timeout(PERMIT_LIMIT).is_ok() {}
+                    if let Some(group) = inner.group.get() {
+                        group.permits.lock().unwrap_or_else(|e| e.into_inner()).remove(&permit.id);
+                    }
+                });
+                Ok(PermitReply { permit, position: position.recv().map_err(|_| gone())? })
+            }
+            PermitReq::Renew(permit) | PermitReq::Release(permit) => {
+                // (a permit of another term is none of this master's)
+                if group.term() != Some(permit.term) {
+                    return Err(gone());
+                }
+                let mut permits = group.permits.lock().unwrap_or_else(|e| e.into_inner());
+                match req {
+                    PermitReq::Release(_) => drop(permits.remove(&permit.id)),
+                    _ => permits.get(&permit.id).and_then(|keep| keep.send(()).ok()).ok_or_else(gone)?,
+                }
+                Ok(PermitReply { permit, position: 0 })
+            }
+        }
     }
 
     /// The connection to the control node at `address`, made once while it is the one asked for.
@@ -386,8 +502,8 @@ impl Inner {
         Ok(client)
     }
 
-    /// Run what another control node passed on.
-    fn answer_forwarded(self: Arc<Self>, body: &[u8]) -> Result<Vec<u8>, Status> {
+    /// Answer another control node: run what it passed on, or see to a permit of its to read.
+    fn answer(self: Arc<Self>, kind: &str, body: &[u8]) -> Result<Vec<u8>, Status> {
         if self.group.get().is_some_and(|g| g.replica.is_cut_off()) {
             return Err(Status::unavailable("the control node cannot be reached"));
         }
@@ -395,9 +511,18 @@ impl Inner {
             let master = group.replica.leader_addr().unwrap_or_default();
             return Err(Status::unavailable(format!("{}{master}", wire::NOT_LEADER_PREFIX)));
         }
-        let req: ForwardReq = postcard::from_bytes(body).map_err(|e| Status::invalid_argument(format!("bad request: {e}")))?;
-        let reply = ClusterSession::new(self).run_passed_on(req);
-        postcard::to_allocvec(&reply).map_err(|e| Status::internal(e.to_string()))
+        let bad = |e: postcard::Error| Status::invalid_argument(format!("bad request: {e}"));
+        let reply = match kind {
+            wire::ACTION_PERMIT => {
+                let req = postcard::from_bytes(body).map_err(bad)?;
+                postcard::to_allocvec(&self.permit(req).map_err(|e| wire::status_of(&e))?)
+            }
+            _ => {
+                let req: ForwardReq = postcard::from_bytes(body).map_err(bad)?;
+                postcard::to_allocvec(&ClusterSession::new(self).run_passed_on(req))
+            }
+        };
+        reply.map_err(|e| Status::internal(e.to_string()))
     }
 
     /// The members of the group of control nodes, after removing `remove`, and which of them is the master.

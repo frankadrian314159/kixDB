@@ -170,6 +170,11 @@ impl Inner {
         *self.topology.write().unwrap_or_else(|e| e.into_inner()) = topology;
     }
 
+    /// Whether this node runs every statement itself: it is alone, or the master of its group.
+    fn is_master(&self) -> bool {
+        self.group.get().is_none_or(group::Group::leads)
+    }
+
     fn shards(&self) -> Vec<Arc<ShardClient>> {
         self.topology().shards
     }

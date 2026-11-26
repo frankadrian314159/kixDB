@@ -384,7 +384,13 @@ impl Core {
     /// Run the scan and send every row to the shard that owns it (or to all of them), straight to that shard.
     async fn shuffle(self: &Arc<Self>, req: ShuffleReq, term: u64) -> Result<u64, Status> {
         let ShuffleReq { scan, key_cols, target_table, slots, peers, me } = req;
-        let rows = self.blocking(move |core, conn| check_term(&core.server, term).and_then(|_| unkeyed(&conn.eval_expr(&scan)?))).await?;
+        let rows = self
+            .blocking(move |core, conn| {
+                check_term(&core.server, term)?;
+                let rows = unkeyed(&conn.eval_expr(&scan)?)?;
+                check_term(&core.server, term).map(|_| rows)
+            })
+            .await?;
         let total = rows.nrows() as u64;
         let parts: Vec<Flip> = if key_cols.is_empty() {
             vec![rows; peers.len()]
@@ -572,6 +578,8 @@ impl FlightService for ShardNode {
             .blocking(move |core, conn| {
                 check_term(&core.server, term)?;
                 let value = evaluate(conn, &frag.work)?;
+                // (and again: a later master fences before it changes anything, so what was read is from before then)
+                check_term(&core.server, term)?;
                 arrowconv::k_to_batches(&value, BATCH_ROWS).map_err(|e| KError::new("cluster", e))
             })
             .await?;
