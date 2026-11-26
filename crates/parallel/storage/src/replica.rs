@@ -12,7 +12,11 @@
 //! replica that fell behind the log is sent the snapshot). **Membership** can change while serving: a new replica joins
 //! as a learner, is caught up, then promoted.
 //!
-//! The leader serves requests only while a majority has recently heard from it and it has applied everything committed.
+//! The leader serves requests only while it has applied everything committed and holds a lease. A leader cut off from the
+//! others does not know it, so a lease also runs by the clock: a leader serves only while a majority of the replicas has
+//! answered it within one and a half election timeouts, and a new leader waits two before it serves. An old leader was
+//! last answered before the others began to wait for its successor's election, at least one timeout long, so its lease
+//! has run out when the successor starts, as long as an answer is less than one and a half timeouts on its way.
 use crate::transport::{self, AddressBook};
 use kix_raft::{Conf, Config, Entry, FileStorage, Member, Msg, NodeId, Raft, Role, Snapshot, Storage};
 use kix_shared_ces::wire::MemberInfo;
@@ -128,6 +132,9 @@ pub struct Replica {
     cut_off: AtomicBool,
     /// When each other replica last answered this one as its leader.
     heard: Mutex<HashMap<NodeId, Instant>>,
+    /// The term this replica was last seen to lead, and since when.
+    leading: Mutex<(u64, Instant)>,
+    election: Duration,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -174,6 +181,8 @@ impl Replica {
             commit_timeout: cfg.commit_timeout,
             cut_off: AtomicBool::new(false),
             heard: Mutex::default(),
+            leading: Mutex::new((0, Instant::now())),
+            election: Duration::from_millis(cfg.tick_ms.max(1)) * cfg.election_ticks,
         });
         server.set_replicator(Some(Arc::new(Handle(replica.clone()))));
         transport::spawn_sender(cfg.node_id, book, cfg.tls.clone(), orx, replica.inbox.clone());
@@ -246,26 +255,29 @@ impl Replica {
         conf.voters.iter().map(info(true)).chain(conf.learners.iter().map(info(false))).collect()
     }
 
-    /// Whether a majority of the voters, this one among them, has answered it as leader within `window`, by the clock.
-    /// (The leader's own lease is counted in ticks, which a successor's election does not wait out.)
-    pub fn heard_lately(&self, window: Duration) -> bool {
-        let raft = lock(&self.raft);
-        let heard = lock(&self.heard);
-        let answers = |m: &&Member| m.id == self.node_id || heard.get(&m.id).is_some_and(|at| at.elapsed() < window);
-        raft.conf.voters.iter().filter(answers).count() >= raft.conf.quorum()
-    }
-
     /// The index of the last snapshot (0: none).
     pub fn snapshot_index(&self) -> u64 {
         lock(&self.raft).snapshot_index()
     }
 
-    /// Whether requests can be served: this is the leader, a majority has answered it recently, and it has applied
-    /// everything the group has committed, including an entry of its own term.
+    /// Whether this leader's lease by the clock lets it serve (see the module). A group of one has no other leader to
+    /// give way to or to wait for. (The lease that `Raft` keeps is counted in ticks, which an election does not wait out.)
+    fn leased(&self, raft: &Raft<FileStorage>) -> bool {
+        if raft.conf.voters.len() <= 1 {
+            return true;
+        }
+        let (term, since) = *lock(&self.leading);
+        let heard = lock(&self.heard);
+        let answers = |m: &&Member| m.id == self.node_id || heard.get(&m.id).is_some_and(|at| at.elapsed() < self.election * 3 / 2);
+        term == raft.term && since.elapsed() >= self.election * 2 && raft.conf.voters.iter().filter(answers).count() >= raft.conf.quorum()
+    }
+
+    /// Whether requests can be served: this is the leader, it holds its lease, and it has applied everything the group
+    /// has committed, including an entry of its own term.
     pub fn can_serve(&self) -> bool {
         let r = lock(&self.raft);
         let commit = r.commit_index;
-        if r.role != Role::Leader || !r.has_lease() || r.term_at(commit) != Some(r.term) {
+        if r.role != Role::Leader || !r.has_lease() || r.term_at(commit) != Some(r.term) || !self.leased(&r) {
             return false;
         }
         drop(r);
@@ -333,6 +345,12 @@ impl Replica {
             if last_tick.elapsed() >= tick {
                 last_tick = Instant::now();
                 raft.tick();
+            }
+            if raft.role == Role::Leader {
+                let mut leading = lock(&self.leading);
+                if leading.0 != raft.term {
+                    *leading = (raft.term, Instant::now());
+                }
             }
             self.pump(&mut raft);
         }

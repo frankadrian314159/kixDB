@@ -136,10 +136,10 @@ on. (From Rust: `Cluster::open_group(group, &config, tls)`, `shutdown` to hand o
   half-made changes and reads where the rows are; so it answers nothing while a shard cannot be reached. What a change
   was acknowledged to have done is kept. A statement that was running fails with `'cluster`, and may or may not have
   been made. Stopping a master with Ctrl-C hands over first.
-* **A master that is cut off** from the other control nodes, but still runs, stops answering within about 0.3 s, and
-  its successor waits 0.4 s before it serves, so that it never answers with what the successor has since changed. The
-  shards refuse its changes. This assumes a reply between control nodes takes less than 0.3 s; a master whose majority
-  answers slowly makes statements wait, for up to a second.
+* **A master that is cut off** from the other control nodes, but still runs, stops answering before its successor
+  serves, as a [replicated shard's leader](#replication) does, so that it never answers with what the successor has
+  since changed. The shards refuse its changes. A master whose majority answers slowly makes statements wait, for up to
+  a second.
 * **Restart a node with the command that started it.** It carries on from `--data`; `--join` is tried once.
 * **Give every node the same settings:** `-u`, TLS, `--request-timeout`, `--broadcast-limit` and the `--scale-` options
   (only the master adds shards, so each node needs the program).
@@ -391,6 +391,12 @@ replica stops can fail. Replicas cut their Raft
 log with snapshots (`--snapshot-every`, 5,000 entries, or sooner when the entries since the last reach `--log-limit-mb`,
 256, as the log is held in memory). A cut keeps up to a quarter of `--snapshot-every` entries (at most 1,000, and 4 MB)
 behind it, so that a replica a little way behind is sent entries; one further behind is sent the snapshot.
+
+A leader that is cut off from the others does not know it, so its lease runs by the clock too: it serves only while a
+majority of the replicas has answered it within 0.3 s, and a new leader waits 0.4 s before it serves. So a cut-off leader
+does not answer reads with what its successor has since changed. This assumes that a reply between replicas takes less
+than 0.3 s. While a majority is slower than that, as when each takes in a large change, the leader refuses requests and
+the control node tries again, for up to 8 s.
 
 The leader has one thing on its way to each replica at a time, a snapshot or a batch of log records (a batch takes no
 further record once it holds 4 MB), over a connection of its own; heartbeats go on meanwhile. It is given 2 seconds and

@@ -1,13 +1,14 @@
 //! A replicated shard behind the control node: replicas hold the same data, a new leader takes over when one dies, a
 //! replica can be added and removed while serving, one that fell behind is sent a snapshot, and a shard drains.
+use kix_control::client::ShardClient;
 use kix_control::Cluster;
 use kix_raft::Role;
-use kix_shared_ces::{ClusterConfig, LoadMode, LoadReq, ShardInfo};
+use kix_shared_ces::{ClusterConfig, LoadMode, LoadReq, ShardInfo, Work};
 use kix_storage::{spawn, spawn_on, ReplicaConfig, RunningShard, ShardNode};
 use kixdb::{Server, K};
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -351,4 +352,42 @@ fn a_draining_shard_finishes_and_refuses_new_work() {
     drop(cluster);
     let reopened = wait("the directory to be released", || Server::open(dir.path()).ok());
     assert_eq!(reopened.connect().eval("count t").unwrap(), K::Long(2));
+}
+
+#[test]
+fn a_shard_leader_cut_off_from_its_replicas_does_not_answer_out_of_date() {
+    let group = Group::start(0);
+    let client = |address: &str| group.runtime.block_on(async { Arc::new(ShardClient::new(0, address, None).unwrap()) });
+    let rows = |n: i64| Server::new().connect().eval(&format!("([] a: (),{n})")).unwrap();
+    group.leader();
+    group.runtime.block_on(client(&group.address()).load(&LoadReq::new("t", LoadMode::Replace, &rows(0), None))).unwrap();
+    for round in 1..=8i64 {
+        let old = group.leader();
+        // someone asks the old leader all the while (as a control node does that has not heard of another)
+        let asking = client(&group.addrs[old]);
+        let (answered, answers) = std::sync::mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (stopping, handle) = (stop.clone(), group.runtime.handle().clone());
+        let asker = std::thread::spawn(move || {
+            while !stopping.load(Relaxed) {
+                let asked = Instant::now();
+                if let Ok(count) = handle.block_on(asking.query(Work::Q("count t".into()))) {
+                    let _ = answered.send((asked, count.as_i64().unwrap()));
+                }
+            }
+        });
+        std::thread::sleep(Duration::from_millis(17 * round as u64));
+        let replica = |i: usize| group.replicas[i].as_ref().unwrap().replica.clone().unwrap();
+        replica(old).cut_off(true);
+        let new = wait("another leader", || (0..3).find(|&i| i != old && replica(i).can_serve()));
+        group.runtime.block_on(client(&group.addrs[new]).load(&LoadReq::new("t", LoadMode::Append, &rows(round), None))).unwrap();
+        let changed = Instant::now();
+        std::thread::sleep(Duration::from_millis(500));
+        stop.store(true, Relaxed);
+        replica(old).cut_off(false);
+        let stale: Vec<(Instant, i64)> = answers.try_iter().filter(|a| a.0 > changed && a.1 != round + 1).collect();
+        assert!(stale.is_empty(), "round {round}: asked {:?} after the change, the old leader counted {}", stale[0].0 - changed, stale[0].1);
+        asker.join().unwrap();
+        group.all_hold("t", round + 1);
+    }
 }

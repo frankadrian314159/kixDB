@@ -25,14 +25,9 @@ use tonic::Status;
 const JOIN_LIMIT: Duration = Duration::from_secs(60);
 /// How long a statement waits for there to be a master.
 const NO_MASTER: Duration = Duration::from_secs(10);
-/// How long a statement waits for a leader that has not heard from a majority lately, as when a disk is slow.
+/// How long a statement waits for a leader that is not ready to serve: one that is new, or has not heard from a majority
+/// lately, as when a disk is slow.
 const HEARING: Duration = Duration::from_secs(1);
-/// A master answers only while a majority has answered it this recently, by the clock.
-const LEASE: Duration = Duration::from_millis(300);
-/// How long a new master waits before it takes over: longer than the lease of the one before it can still run, as that
-/// one was last answered before the others began to wait for it (at least `LEASE` under their election timeout), which
-/// leaves 300 ms for an answer to be on its way.
-const OUTLAST: Duration = Duration::from_millis(400);
 /// The mirror variable that records the shards and what each owns.
 const RECORD: &str = ".kix.cluster";
 /// The mirror variable that holds a change of the control node's that goes with a change on the shards which is not yet
@@ -82,7 +77,7 @@ impl Group {
     }
 
     /// The term for which this node is the master now. A leader that is not ready to serve this moment (it has a change
-    /// to apply, or has not heard from a majority lately) is waited for.
+    /// to apply, or does not hold its lease) is waited for.
     fn term(&self) -> Option<u64> {
         let deadline = Instant::now() + HEARING;
         loop {
@@ -90,7 +85,7 @@ impl Group {
             if self.halted.load(Ordering::SeqCst) || role != Role::Leader {
                 return None;
             }
-            if self.replica.can_serve() && self.replica.heard_lately(LEASE) {
+            if self.replica.can_serve() {
                 return Some(term);
             }
             if Instant::now() >= deadline {
@@ -320,8 +315,6 @@ impl Inner {
         if group.settled.load(Ordering::SeqCst) == term {
             return Ok(());
         }
-        // an earlier master, cut off, may still take itself to lead and answer from its copy of the mirror
-        std::thread::sleep(OUTLAST);
         self.term.store(term, Ordering::SeqCst);
         let state = self.held::<State>(RECORD)?.ok_or_else(|| cluster_error("the group has no record of its shards"))?;
         self.set_topology(self.topology_of(&state.shards, state.slots, state.resizes)?);
