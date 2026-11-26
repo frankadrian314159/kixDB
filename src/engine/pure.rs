@@ -3,13 +3,13 @@
 //! The answer errs towards "no": anything not known to be harmless runs as before, alone. Should a statement taken to
 //! read try to write after all, the copy refuses (`'snapshot`) and it is run again alone.
 use crate::ast::{Expr, QSqlKind};
-use crate::engine::Workspace;
+use crate::engine::{namespaces, Workspace};
 use crate::parser::is_builtin_verb;
 use crate::sym::{intern, resolve, SymId};
 use crate::types::{Func, K};
 
 /// Verbs that write, reach outside the engine, or run code that is only known when they run.
-const EFFECTS: [&str; 17] = ["insert", "upsert", "set", " set", "system", "value", "get", "eval", "reval", "parse", "hopen", "hclose", "show", "exit", "0:", "1:", "2:"];
+const EFFECTS: [&str; 22] = ["setenv", "insert", "upsert", "set", " set", "system", "value", "get", "eval", "reval", "parse", "hopen", "hclose", "show", "exit", "0:", "1:", "2:", "hdel", "save", "load", "rsave"];
 
 struct Reader<'a> {
     ws: &'a Workspace,
@@ -36,7 +36,7 @@ impl<'a> Reader<'a> {
             Some(None) => false,
             // a function may do anything
             Some(Some(value)) => !matches!(value, K::Func(_)),
-            None => !text.starts_with('.') || text.starts_with(".z.") || is_builtin_verb(&text),
+            None => !text.starts_with('.') || text.starts_with(".z.") || is_builtin_verb(&text) || namespaces::reads(&text),
         }
     }
 
@@ -46,6 +46,9 @@ impl<'a> Reader<'a> {
         match target {
             Expr::Lit(v) => number(v),
             Expr::Var(s) => self.global(*s).flatten().is_some_and(number),
+            // (`neg h`, whatever `h` is, sends or appends)
+            Expr::Unary { op, .. } => resolve(*op) == "neg",
+            Expr::Apply { target, .. } => matches!(&**target, Expr::Lit(K::Func(Func::Prim(s))) | Expr::Var(s) if resolve(*s) == "neg"),
             _ => false,
         }
     }
@@ -58,7 +61,12 @@ impl<'a> Reader<'a> {
             Expr::Var(s) => self.name(*s),
             Expr::Unary { op, .. } => self.name(*op),
             // (`-11!` replays a log)
-            Expr::Binary { op, lhs, .. } => self.name(*op) && !(resolve(*op) == "!" && matches!(&**lhs, Expr::Lit(K::Int(_) | K::Long(_)))),
+            Expr::Binary { op, lhs, .. } => match resolve(*op).as_str() {
+                "!" if matches!(&**lhs, Expr::Lit(K::Int(_) | K::Long(_))) => false,
+                // (`-1 each lines`)
+                "each" | "peach" if self.handle(lhs) => false,
+                _ => self.name(*op),
+            },
             Expr::Apply { target, args } => match &**target {
                 // protected evaluation and amends
                 Expr::Lit(K::Func(Func::Prim(s))) if args.len() >= 3 && matches!(resolve(*s).as_str(), "@" | ".") => false,

@@ -116,6 +116,8 @@ impl App {
         ctx.set_visuals(visuals);
 
         let server = Server::new();
+        // (a workspace within the application serves no clients, so its user may run shell commands)
+        server.allow_shell_commands(true);
         let conn = Session::new(server.connect());
         let mut app = Self {
             held: vec![],
@@ -182,6 +184,7 @@ impl App {
                 }
             },
         }
+        self.server.allow_shell_commands(true);
         self.refresh_nav();
     }
 

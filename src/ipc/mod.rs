@@ -2,20 +2,26 @@
 //! - Lossless `K` payload encoder/decoder (`encode_k_payload` / `decode_k_payload`, used by `-8!` / `-9!`, flat/splayed files, and TCP frames)
 //! - TCP handshake (`user:password\x03\x00` -> `\x03`) with optional authentication
 //! - Multi-client `Listener` (`kix-serve`, `kix -p`, `kix-gui`, and `kix-cluster`) and synchronous/async `IpcClient` (`hopen`)
+//! - What a server sends to its clients, in `outbox`
 use crate::engine::tree::func_of;
 use crate::error::{KError, KResult};
 use crate::parser::parse_script;
 use crate::sym::{intern, resolve};
 use crate::types::*;
-use crate::Server;
+use crate::{Connection, Server};
+use outbox::Wire;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, TryRecvError};
 use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
+
+mod outbox;
+pub use outbox::{Outbox, QUEUE_LIMIT};
 
 pub const MSG_ASYNC: u8 = 0;
 pub const MSG_SYNC: u8 = 1;
@@ -112,6 +118,10 @@ fn write_k(buf: &mut Vec<u8>, val: &K) {
             buf.push((-19i8) as u8);
             buf.extend_from_slice(&v.to_le_bytes());
         }
+        K::Enum(tag, v) => {
+            write_tag(buf, -20, tag);
+            write_k(buf, v);
+        }
         K::Vector(cv) => write_colvec(buf, cv),
         K::Table(t) => {
             // kdb+ IPC table (`98`): `[98, 0(attr), 99(dict), sym_vec(cols), general_list(vals)]`
@@ -150,7 +160,19 @@ fn write_k(buf: &mut Vec<u8>, val: &K) {
     }
 }
 
+/// An enumeration, as saved files and the nodes of a cluster keep it (kixdb's own form: other programs are sent plain
+/// values): type 20, what the domain is, its name and the values.
+fn write_tag(buf: &mut Vec<u8>, type_num: i8, tag: &Tag) {
+    buf.push(type_num as u8);
+    buf.push(tag.source as u8);
+    write_nul_str(buf, &resolve(tag.domain));
+}
+
 fn write_colvec(buf: &mut Vec<u8>, cv: &ColVec) {
+    if let ColVec::Enum(tag, values) = cv {
+        write_tag(buf, 20, tag);
+        return write_colvec(buf, values);
+    }
     buf.push(cv.type_num() as u8);
     buf.push(cv.attr().ipc_byte());
     buf.extend_from_slice(&(cv.len() as u32).to_le_bytes());
@@ -208,6 +230,8 @@ fn write_colvec(buf: &mut Vec<u8>, cv: &ColVec) {
                 write_nul_str(buf, &resolve(s));
             }
         }
+        // (written above)
+        ColVec::Enum(..) => {}
     }
 }
 
@@ -219,7 +243,7 @@ fn decode_k_endian(data: &[u8], mut p: usize, le: bool) -> KResult<(K, usize)> {
     if p >= data.len() {
         return Err(KError::ipc("truncated IPC payload"));
     }
-    let tag = data[p] as i8;
+    let tag_byte = data[p] as i8;
     p += 1;
 
     let read_i16 = |b: &[u8], o: usize| -> KResult<i16> {
@@ -247,7 +271,7 @@ fn decode_k_endian(data: &[u8], mut p: usize, le: bool) -> KResult<(K, usize)> {
         Ok(if le { f64::from_le_bytes(arr) } else { f64::from_be_bytes(arr) })
     };
 
-    match tag {
+    match tag_byte {
         -128 => {
             let (err_s, next) = read_nul_str(data, p)?;
             let _ = next;
@@ -292,7 +316,7 @@ fn decode_k_endian(data: &[u8], mut p: usize, le: bool) -> KResult<(K, usize)> {
             let attr = Attr::from_ipc_byte(*data.get(p).ok_or_else(|| KError::ipc("truncated vec attr"))?);
             let n = read_u32(data, p + 1)? as usize;
             p += 5;
-            let cv = match tag {
+            let cv = match tag_byte {
                 0 => {
                     let mut xs = Vec::with_capacity(n);
                     for _ in 0..n {
@@ -335,7 +359,7 @@ fn decode_k_endian(data: &[u8], mut p: usize, le: bool) -> KResult<(K, usize)> {
                         xs.push(read_i32(data, p)?);
                         p += 4;
                     }
-                    match tag {
+                    match tag_byte {
                         6 => ColVec::Int(attr, Arc::new(xs)),
                         13 => ColVec::Month(attr, Arc::new(xs)),
                         14 => ColVec::Date(attr, Arc::new(xs)),
@@ -350,7 +374,7 @@ fn decode_k_endian(data: &[u8], mut p: usize, le: bool) -> KResult<(K, usize)> {
                         xs.push(read_i64(data, p)?);
                         p += 8;
                     }
-                    match tag {
+                    match tag_byte {
                         7 => ColVec::Long(attr, Arc::new(xs)),
                         12 => ColVec::Timestamp(attr, Arc::new(xs)),
                         _ => ColVec::Timespan(attr, Arc::new(xs)),
@@ -370,7 +394,7 @@ fn decode_k_endian(data: &[u8], mut p: usize, le: bool) -> KResult<(K, usize)> {
                         xs.push(read_f64(data, p)?);
                         p += 8;
                     }
-                    if tag == 9 {
+                    if tag_byte == 9 {
                         ColVec::Float(attr, Arc::new(xs))
                     } else {
                         ColVec::Datetime(attr, Arc::new(xs))
@@ -390,9 +414,25 @@ fn decode_k_endian(data: &[u8], mut p: usize, le: bool) -> KResult<(K, usize)> {
                     }
                     ColVec::Sym(attr, Arc::new(xs))
                 }
-                _ => return Err(KError::ipc(format!("unsupported vector tag {tag}"))),
+                _ => return Err(KError::ipc(format!("unsupported vector tag {tag_byte}"))),
             };
             Ok((K::Vector(cv), p))
+        }
+
+        20 | -20 => {
+            let source = match data.get(p) {
+                Some(0) => Source::List,
+                Some(1) => Source::Keys,
+                Some(2) => Source::Rows,
+                _ => return Err(KError::ipc("bad enumeration")),
+            };
+            let (domain, next) = read_nul_str(data, p + 1)?;
+            let tag = Tag { domain: intern(&domain), source };
+            match (tag_byte, decode_k_endian(data, next, le)?) {
+                (20, (K::Vector(values), next)) => Ok((K::Vector(ColVec::Enum(tag, Box::new(values))), next)),
+                (-20, (value, next)) => Ok((K::Enum(tag, Box::new(value)), next)),
+                _ => Err(KError::ipc("bad enumeration")),
+            }
         }
 
         98 => {
@@ -466,7 +506,7 @@ fn encode_error_payload(err: &KError) -> Vec<u8> {
 /// Messages longer than this are compressed when the peer is on another machine (as kdb+ does).
 const COMPRESS_OVER: usize = 2000;
 
-fn write_ipc_frame(stream: &mut dyn Wire, msg_type: u8, payload: &[u8], compress: bool) -> KResult<()> {
+fn write_ipc_frame<W: Write + ?Sized>(stream: &mut W, msg_type: u8, payload: &[u8], compress: bool) -> KResult<()> {
     let packed = if compress && payload.len() > COMPRESS_OVER { compress_kdb(payload) } else { None };
     let compressed = packed.is_some();
     let payload = packed.as_deref().unwrap_or(payload);
@@ -483,7 +523,7 @@ fn write_ipc_frame(stream: &mut dyn Wire, msg_type: u8, payload: &[u8], compress
     Ok(())
 }
 
-fn read_ipc_frame(stream: &mut dyn Wire) -> KResult<(u8, bool, Vec<u8>)> {
+fn read_ipc_frame<R: Read + ?Sized>(stream: &mut R) -> KResult<(u8, bool, Vec<u8>)> {
     let mut hdr = [0u8; 8];
     stream.read_exact(&mut hdr)?;
     let le = hdr[0] != 0;
@@ -621,10 +661,6 @@ fn uncompress_kdb(comp: &[u8], le: bool) -> KResult<Vec<u8>> {
 
 // ----- IPC Client (`IpcClient`) ---------------------------------------------
 
-/// A connection's byte stream: plain TCP, or TLS over TCP.
-trait Wire: Read + Write + Send {}
-impl<T: Read + Write + Send> Wire for T {}
-
 fn tls_error(e: impl std::fmt::Display) -> KError {
     KError::ipc(format!("TLS: {e}"))
 }
@@ -665,9 +701,40 @@ fn tls_client(tcp: TcpStream, host: &str, ca_file: &str) -> KResult<Box<dyn Wire
     Ok(Box::new(rustls::StreamOwned::new(conn, tcp)))
 }
 
+/// A frame as it is read: its message's type, whether it is little-endian, and the message.
+type Frame = (u8, bool, Vec<u8>);
+
+/// The frames that a listening client reads ahead of what takes them; any more wait with the server.
+const READ_AHEAD: usize = 64;
+
+/// How a client's frames go and come.
+enum Link {
+    /// Both in the caller's thread.
+    Direct(Box<dyn Wire>),
+    /// Written by the caller, and read by a thread that passes them on.
+    Listening(Box<dyn Write + Send>, Receiver<KResult<Frame>>, #[allow(dead_code)] Hangup),
+}
+
+/// Ends our side of a connection when dropped. The server then closes it, which ends the thread that reads it.
+struct Hangup(TcpStream);
+
+impl Drop for Hangup {
+    fn drop(&mut self) {
+        let _ = self.0.shutdown(Shutdown::Write);
+    }
+}
+
 pub struct IpcClient {
-    stream: Box<dyn Wire>,
+    link: Link,
     compress: bool,
+    /// Asynchronous messages that arrived while an answer was waited for, in order.
+    inbox: VecDeque<KResult<K>>,
+}
+
+impl std::fmt::Debug for IpcClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "IpcClient")
+    }
 }
 
 impl IpcClient {
@@ -719,7 +786,7 @@ impl IpcClient {
             Err(_) => return Err(KError::new("access", "authentication refused by server")),
         }
 
-        Ok(Self { stream, compress })
+        Ok(Self { link: Link::Direct(stream), compress, inbox: VecDeque::new() })
     }
 
     pub fn query_str(&mut self, q_code: &str) -> KResult<K> {
@@ -727,16 +794,92 @@ impl IpcClient {
     }
 
     pub fn query_k(&mut self, msg: &K) -> KResult<K> {
-        let payload = encode_k_payload(msg);
-        write_ipc_frame(&mut *self.stream, MSG_SYNC, &payload, self.compress)?;
-        let (_mtype, le, resp) = read_ipc_frame(&mut *self.stream)?;
-        let (k, _) = decode_k_endian(&resp, 0, le)?;
-        Ok(k)
+        self.write(MSG_SYNC, &encode_k_payload(&msg.untagged()))?;
+        loop {
+            match self.read_message()? {
+                (MSG_RESPONSE, answer) => return answer,
+                (_, sent) => self.inbox.push_back(sent),
+            }
+        }
+    }
+
+    /// The next message the server sends of its own accord (as `neg[.z.w] msg` does there), waiting for one.
+    pub fn receive(&mut self) -> KResult<K> {
+        match self.inbox.pop_front() {
+            Some(message) => message,
+            None => self.read_message()?.1,
+        }
     }
 
     pub fn send_async_k(&mut self, msg: &K) -> KResult<()> {
-        let payload = encode_k_payload(msg);
-        write_ipc_frame(&mut *self.stream, MSG_ASYNC, &payload, self.compress)
+        self.write(MSG_ASYNC, &encode_k_payload(&msg.untagged()))
+    }
+
+    /// Have a thread of the connection's own read what the server sends, calling `arrived` after each frame, so that
+    /// messages can be taken as they come (`pending`).
+    pub(crate) fn listen(mut self, arrived: impl Fn() + Send + 'static) -> KResult<Self> {
+        let Link::Direct(stream) = self.link else { return Ok(self) };
+        let hangup = Hangup(stream.socket().try_clone()?);
+        let (mut reader, writer) = stream.split()?;
+        let (frames, received) = sync_channel(READ_AHEAD);
+        std::thread::spawn(move || loop {
+            let frame = read_ipc_frame(&mut reader);
+            let ended = frame.is_err();
+            // (once nothing takes them, frames are read and dropped until the server closes)
+            let _ = frames.send(frame);
+            arrived();
+            if ended {
+                break;
+            }
+        });
+        self.link = Link::Listening(writer, received, hangup);
+        Ok(self)
+    }
+
+    /// A message of the server's that nothing has taken, without waiting: `None` if there is none now, `Some(None)` once
+    /// the connection has ended. (Only a listening client finds new ones.)
+    pub(crate) fn pending(&mut self) -> Option<Option<KResult<K>>> {
+        if let Some(message) = self.inbox.pop_front() {
+            return Some(Some(message));
+        }
+        let Link::Listening(_, frames, _) = &self.link else { return None };
+        match frames.try_recv() {
+            Err(TryRecvError::Empty) => None,
+            Ok(Ok(frame)) => match self.open(frame) {
+                Ok(message) => message.map(|m| Some(m.1)),
+                Err(_) => Some(None),
+            },
+            _ => Some(None),
+        }
+    }
+
+    fn write(&mut self, kind: u8, payload: &[u8]) -> KResult<()> {
+        match &mut self.link {
+            Link::Direct(stream) => write_ipc_frame(&mut **stream, kind, payload, self.compress),
+            Link::Listening(writer, ..) => write_ipc_frame(&mut **writer, kind, payload, self.compress),
+        }
+    }
+
+    /// The message in `frame` and its type. A request of the server's own is refused (`None`): this end only asks.
+    fn open(&mut self, (kind, le, body): Frame) -> KResult<Option<(u8, KResult<K>)>> {
+        if kind != MSG_SYNC {
+            return Ok(Some((kind, decode_k_endian(&body, 0, le).map(|v| v.0))));
+        }
+        self.write(MSG_RESPONSE, &encode_error_payload(&KError::nyi("a synchronous call to a client")))?;
+        Ok(None)
+    }
+
+    /// The next message and its type, waiting for one.
+    fn read_message(&mut self) -> KResult<(u8, KResult<K>)> {
+        loop {
+            let frame = match &mut self.link {
+                Link::Direct(stream) => read_ipc_frame(&mut **stream),
+                Link::Listening(_, frames, _) => frames.recv().unwrap_or_else(|_| Err(KError::ipc("the connection is closed"))),
+            }?;
+            if let Some(message) = self.open(frame)? {
+                return Ok(message);
+            }
+        }
     }
 }
 
@@ -750,13 +893,17 @@ pub struct IpcConfig {
     pub tls: Option<Arc<rustls::ServerConfig>>,
     /// Require TLS (`tcps://`) and reject unencrypted connections.
     pub force_tls: bool,
+    /// The bytes of asynchronous messages that may wait for a client before it is disconnected (`None`: `QUEUE_LIMIT`).
+    pub queue_limit: Option<usize>,
+    /// Let the workspace run shell commands while it serves clients, which then can run programs on this machine.
+    pub allow_shell: bool,
 }
 
 impl IpcConfig {
     pub fn with_single_user(user: impl Into<String>, password: impl Into<String>) -> Self {
         let mut m = HashMap::new();
         m.insert(user.into(), password.into());
-        Self { users: Some(m), tls: None, force_tls: false }
+        Self { users: Some(m), ..Self::default() }
     }
 
     /// Whether it is safe to listen on `bind`. Beyond this machine every client must give a password, over TLS: else
@@ -787,6 +934,8 @@ impl Listener {
     pub fn bind(server: Server, bind_addr: impl ToSocketAddrs, cfg: IpcConfig) -> KResult<Self> {
         let tcp = TcpListener::bind(bind_addr)?;
         let addr = tcp.local_addr()?;
+        // (whatever a client sets, a callback or the timer included, runs in this process)
+        server.allow_shell_commands(cfg.allow_shell);
         let stop = Arc::new(AtomicBool::new(false));
         let stop_bg = stop.clone();
         let cfg = Arc::new(RwLock::new(cfg));
@@ -839,9 +988,13 @@ fn handle_client(
 ) -> KResult<()> {
     let _ = tcp.set_nodelay(true);
     let compress = tcp.peer_addr().is_ok_and(|a| !a.ip().is_loopback());
-    let (tls, force_tls) = {
+    let address = tcp.peer_addr().ok().and_then(|a| match a.ip() {
+        std::net::IpAddr::V4(ip) => Some(u32::from(ip)),
+        std::net::IpAddr::V6(ip) => ip.to_ipv4().map(u32::from),
+    });
+    let (tls, force_tls, limit) = {
         let g = cfg.read().unwrap_or_else(|e| e.into_inner());
-        (g.tls.clone(), g.force_tls)
+        (g.tls.clone(), g.force_tls, g.queue_limit.unwrap_or(QUEUE_LIMIT))
     };
     // a TLS connection starts with a handshake record (0x16), which no IPC handshake does
     let mut first = [0u8; 1];
@@ -849,10 +1002,9 @@ fn handle_client(
     if force_tls && !is_tls {
         return Err(KError::ipc("plaintext connection rejected (--force-tls)"));
     }
+    let socket = tcp.try_clone()?;
     let mut stream: Box<dyn Wire> = match tls {
-        Some(t) if is_tls => {
-            Box::new(rustls::StreamOwned::new(rustls::ServerConnection::new(t).map_err(tls_error)?, tcp))
-        }
+        Some(t) if is_tls => Box::new(rustls::StreamOwned::new(rustls::ServerConnection::new(t).map_err(tls_error)?, tcp)),
         _ => Box::new(tcp),
     };
 
@@ -865,6 +1017,11 @@ fn handle_client(
         }
         if b[0] == 0 {
             break;
+        }
+        // an HTTP request, which a web page can have a browser send to this machine, has line ends, and no user name
+        // does: nothing of it is taken for a message
+        if matches!(b[0], b'\r' | b'\n') {
+            return Err(KError::ipc("not an IPC handshake"));
         }
         hs.push(b[0]);
         if hs.len() > 1024 {
@@ -891,39 +1048,66 @@ fn handle_client(
         }
     }
 
+    let mut conn = server.connect_as_trusted(if user.is_empty() { "anonymous" } else { user });
+    // (what is sent to the client while it logs in waits in the queue until it has been let in)
+    let outbox = Outbox::new(socket, limit);
+    conn.connected_from(address.map_or(0, |a| a as i32), &outbox);
+    if !conn.authorized(user, pass) {
+        conn.closed(false, &outbox);
+        let _ = stream.write_all(&[0xff]);
+        let _ = stream.flush();
+        return Ok(());
+    }
+
+    let served = serve_client(stream, &mut conn, &outbox, cap, compress, &stop);
+    conn.closed(true, &outbox);
+    outbox.finish();
+    served
+}
+
+/// Accept a client that has been let in, and answer its messages until it leaves.
+fn serve_client(
+    mut stream: Box<dyn Wire>,
+    conn: &mut Connection,
+    outbox: &Outbox,
+    cap: u8,
+    compress: bool,
+    stop: &AtomicBool,
+) -> KResult<()> {
     stream.write_all(&[cap.min(3)])?;
     stream.flush()?;
-
-    let mut conn = server.connect_as_trusted(if user.is_empty() { "anonymous" } else { user });
+    let (mut reader, writer) = stream.split()?;
+    outbox.write_to(writer, compress);
+    conn.opened();
 
     while !stop.load(Ordering::SeqCst) {
-        let (msg_type, le, raw_body) = match read_ipc_frame(&mut *stream) {
+        let (msg_type, le, raw_body) = match read_ipc_frame(&mut reader) {
             Ok(frame) => frame,
             Err(_) => break,
         };
+        // (nothing more is taken from a client once its handle is closed)
+        if outbox.is_closed() {
+            break;
+        }
         let (req_k, _) = match decode_k_endian(&raw_body, 0, le) {
             Ok(v) => v,
             Err(e) => {
+                if conn.bad_message(&raw_body) {
+                    break;
+                }
                 if msg_type == MSG_SYNC {
-                    let ep = encode_error_payload(&e);
-                    let _ = write_ipc_frame(&mut *stream, MSG_RESPONSE, &ep, compress);
+                    outbox.respond(encode_error_payload(&e))?;
                 }
                 continue;
             }
         };
 
-        let res = conn.eval_ipc_message(&req_k);
+        let res = conn.answer(&req_k, msg_type == MSG_SYNC);
         if msg_type == MSG_SYNC {
-            match res {
-                Ok(val) => {
-                    let payload = encode_k_payload(&val);
-                    write_ipc_frame(&mut *stream, MSG_RESPONSE, &payload, compress)?;
-                }
-                Err(err) => {
-                    let ep = encode_error_payload(&err);
-                    write_ipc_frame(&mut *stream, MSG_RESPONSE, &ep, compress)?;
-                }
-            }
+            outbox.respond(match res {
+                Ok(val) => encode_k_payload(&val.untagged()),
+                Err(err) => encode_error_payload(&err),
+            })?;
         }
     }
     Ok(())

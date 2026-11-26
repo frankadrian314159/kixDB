@@ -5,12 +5,17 @@ use kixdb::engine::qsql::DYNAMIC;
 use kixdb::engine::{DistMode, Workspace};
 use kixdb::parser::is_builtin_verb;
 use kixdb::sym::{intern, resolve, SymId};
-use kixdb::{ColVec, Connection, Flip, Func, KeyedTable, Server, K};
+use kixdb::types::Source;
+use kixdb::{ColVec, Connection, Flip, Func, KError, KResult, KeyedTable, Server, K};
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 /// Verbs with effects: an expression that uses one is never pushed down.
-pub const EFFECTS: [&str; 12] = ["insert", "upsert", "set", "system", "value", "get", "eval", "hopen", "hclose", "show", ".Q.dpft", ".kix.dist"];
+pub const EFFECTS: [&str; 27] = [
+    "insert", "upsert", "set", "system", "value", "get", "eval", "hopen", "hclose", "hcount", "hdel", "read0", "read1",
+    "save", "load", "rsave", "rload", "show", ".Q.chk", ".Q.dpft", ".Q.dpfts", ".Q.en", ".Q.ens", ".Q.view", ".Q.fs",
+    ".Q.fsn", ".kix.dist",
+];
 /// Verbs that need only a table's schema.
 const SCHEMA_VERBS: [&str; 4] = ["cols", "keys", "meta", "type"];
 
@@ -150,6 +155,42 @@ impl Names<'_> {
             let mode = ws.dist.get(&name).cloned().unwrap_or(DistMode::Replicated);
             Some(Table { name, schema, nkeys, mode })
         })
+    }
+
+    /// The tables that the foreign keys and links of `t` refer to.
+    pub fn domains(&self, t: &Table) -> Vec<Table> {
+        let referred = |column: &ColVec| match column {
+            ColVec::Enum(tag, _) if tag.source != Source::List => self.table(tag.domain),
+            _ => None,
+        };
+        t.schema.vals.iter().filter_map(referred).collect()
+    }
+
+    /// A shard follows a key into its own copy of a table, so the tables `t` refers to must be replicated.
+    pub fn replicated_domains(&self, t: &Table) -> KResult<()> {
+        match self.domains(t).into_iter().find(|d| !matches!(d.mode, DistMode::Replicated)) {
+            Some(d) => Err(KError::nyi(format!("foreign keys into `{} need it replicated", d.name))),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether `e` follows a key of a table it reads (`key.column`, `` `long$key ``), which needs the table referred to.
+    pub fn follows_keys(&self, e: &Expr) -> KResult<bool> {
+        let mut follows = false;
+        for t in self.refs(e).tables.into_iter().filter_map(|t| self.table(t)) {
+            let keys: Vec<SymId> = t.schema.cols.iter().zip(&t.schema.vals).filter(|(_, c)| matches!(c, ColVec::Enum(tag, _) if tag.source != Source::List)).map(|(n, _)| *n).collect();
+            let key = |x: &Expr| x.any(&mut |x| matches!(x, Expr::Var(s) if keys.contains(s)));
+            let followed = !keys.is_empty() && e.any(&mut |x| match x {
+                Expr::Field(base, _) => key(base),
+                Expr::Binary { op, lhs, rhs } => resolve(*op) == "$" && matches!(&**lhs, Expr::Lit(K::Sym(s)) if resolve(*s) == "long") && key(rhs),
+                _ => false,
+            });
+            if followed {
+                self.replicated_domains(&t)?;
+                follows = true;
+            }
+        }
+        Ok(follows)
     }
 
     pub fn all_tables(&self) -> Vec<SymId> {

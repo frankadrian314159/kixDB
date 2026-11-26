@@ -52,6 +52,7 @@ pub fn is_unary_keyword(s: &str) -> bool {
             | "keys"
             | "cols"
             | "meta"
+            | "fkeys"
             | "tables"
             | "views"
             | "value"
@@ -85,9 +86,25 @@ pub fn is_unary_keyword(s: &str) -> bool {
             | "ltrim"
             | "rtrim"
             | "md5"
+            | "all"
+            | "any"
+            | "rank"
+            | "attr"
+            | "inv"
+            | "ltime"
+            | "gtime"
+            | "getenv"
             | "hopen"
             | "hclose"
             | "hcount"
+            | "hsym"
+            | "hdel"
+            | "read0"
+            | "read1"
+            | "save"
+            | "load"
+            | "rsave"
+            | "rload"
             | "system"
             | "show"
             | "ungroup"
@@ -148,6 +165,14 @@ pub fn is_binary_keyword(s: &str) -> bool {
             | "except"
             | "cross"
             | "cut"
+            | "rotate"
+            | "xprev"
+            | "xrank"
+            | "scov"
+            | "mmu"
+            | "lsq"
+            | "setenv"
+            | "peach"
             | " set"
             | "set"
             | "upsert"
@@ -336,7 +361,9 @@ impl<'a> Parser<'a> {
         // If `lhs` is a bare unary keyword (`sum`, `til`, `neg`, `not`, ...) and more expression follows without a binary op:
         if let Expr::Var(sym) = &lhs {
             let name = sym.as_str_owned();
-            if is_unary_keyword(&name) && !self.is_expr_end() && self.peek_binary_op().is_none() {
+            // (`value +[2]`: an operator with brackets after it begins the argument)
+            let called = matches!(self.peek(), Tok::Op(_)) && matches!(self.peek_n(1), Tok::LBrack);
+            if is_unary_keyword(&name) && !self.is_expr_end() && (called || self.peek_binary_op().is_none()) {
                 let rhs = self.parse_expr()?;
                 return Ok(Expr::Unary { op: *sym, arg: Box::new(rhs) });
             }
@@ -359,6 +386,10 @@ impl<'a> Parser<'a> {
         if !self.is_expr_end() {
             if let Some(bin_op) = self.peek_binary_op() {
                 self.next();
+                if self.is_expr_end() {
+                    let target = Box::new(Expr::Lit(K::Func(Func::Prim(intern(&bin_op)))));
+                    return Ok(Expr::Apply { target, args: vec![Some(lhs), None] });
+                }
                 // Special case: `0N!x` (debug print and return `x`) vs dict `!`
                 let rhs = self.parse_expr()?;
                 return Ok(Expr::Binary { op: intern(&bin_op), lhs: Box::new(lhs), rhs: Box::new(rhs) });
@@ -451,12 +482,17 @@ impl<'a> Parser<'a> {
                     let saved_qsql = self.in_qsql;
                     self.stop_on_comma = false;
                     self.in_qsql = false;
-                    let args = self.parse_bracket_args()?;
+                    let mut args = self.parse_bracket_args()?;
                     self.stop_on_comma = saved_comma;
                     self.in_qsql = saved_qsql;
+                    // `+[2]`: one argument in brackets leaves an operator waiting for its other
+                    let operator = matches!(&base, Expr::Lit(K::Func(Func::Prim(s))) if !s.as_str_owned().starts_with(|c: char| c.is_ascii_alphanumeric()));
+                    if operator && matches!(args.as_slice(), [Some(_)]) {
+                        args.push(None);
+                    }
                     base = Expr::Apply { target: Box::new(base), args };
                 }
-                Tok::Op(s) if s == "." && matches!(self.peek_n(1), Tok::Ident(_)) => {
+                Tok::Field if matches!(self.peek_n(1), Tok::Ident(_)) => {
                     // Check that `.ident` is field/temporal access (`time.minute`, `t.price`)
                     self.next(); // `.`
                     if let Tok::Ident(field) = self.next() {
@@ -498,6 +534,13 @@ impl<'a> Parser<'a> {
                 parse_lambda(&source, &body_tokens)
             }
             Tok::LParen => self.parse_paren_or_table(),
+            Tok::LBrack => {
+                let saved = (std::mem::replace(&mut self.stop_on_comma, false), std::mem::replace(&mut self.in_qsql, false));
+                let args = self.parse_bracket_args();
+                (self.stop_on_comma, self.in_qsql) = saved;
+                let target = Box::new(Expr::Lit(K::Func(Func::Prim(intern(";")))));
+                Ok(Expr::Apply { target, args: args? })
+            }
             other => Err(KError::syntax(format!("unexpected token {other:?}"))),
         }
     }
@@ -516,6 +559,9 @@ impl<'a> Parser<'a> {
             self.skip_newlines();
             if matches!(self.peek(), Tok::Semi | Tok::RBrack) {
                 args.push(None);
+            } else if matches!(self.peek(), Tok::Colon) && matches!(self.peek_n(1), Tok::Semi | Tok::RBrack) {
+                self.next();
+                args.push(Some(Expr::Lit(K::Func(Func::Prim(intern(":"))))));
             } else {
                 args.push(Some(self.parse_expr()?));
             }
@@ -597,6 +643,10 @@ impl<'a> Parser<'a> {
     fn parse_table_lit(&mut self) -> KResult<Expr> {
         self.next(); // `[`
         let keys = self.parse_table_col_defs(Tok::RBrack)?;
+        self.skip_newlines();
+        if matches!(self.peek(), Tok::Semi) {
+            self.next();
+        }
         let vals = self.parse_table_col_defs(Tok::RParen)?;
         Ok(Expr::TableLit { keys, vals })
     }
@@ -621,12 +671,12 @@ impl<'a> Parser<'a> {
                     (intern(&id), self.parse_expr()?)
                 } else {
                     let e = self.parse_expr()?;
-                    let inferred = infer_col_name(&e).unwrap_or_else(|| intern(&format!("x{}", cols.len())));
+                    let inferred = infer_col_name(&e).unwrap_or_else(|| unnamed(&cols));
                     (inferred, e)
                 }
             } else {
                 let e = self.parse_expr()?;
-                let inferred = infer_col_name(&e).unwrap_or_else(|| intern(&format!("x{}", cols.len())));
+                let inferred = infer_col_name(&e).unwrap_or_else(|| unnamed(&cols));
                 (inferred, e)
             };
             cols.push((name, expr));
@@ -844,15 +894,27 @@ impl<'a> Parser<'a> {
 
 /// Infer a default column name from a `qSQL` expression (`price` -> `price`, `sum price` -> `price`, `5 xbar time.minute` -> `minute`).
 pub fn infer_col_name(expr: &Expr) -> Option<SymId> {
+    if matches!(expr, Expr::Var(s) if s.as_str_owned() == "i") {
+        return Some(intern("x"));
+    }
     match expr {
         Expr::Var(s) => Some(*s),
         Expr::Field(_, f) => Some(*f),
         Expr::Unary { arg, .. } => infer_col_name(arg),
-        Expr::Binary { rhs, .. } => infer_col_name(rhs),
+        Expr::Binary { op, lhs, rhs } => {
+            let word = op.as_str_owned().starts_with(|c: char| c.is_ascii_alphabetic());
+            infer_col_name(if word { rhs } else { lhs })
+        }
         Expr::Juxt { arg, .. } => infer_col_name(arg),
-        Expr::Apply { args, .. } => args.last().and_then(|a| a.as_ref()).and_then(infer_col_name),
+        Expr::Apply { args, .. } => args.first().and_then(|a| a.as_ref()).and_then(infer_col_name),
         _ => None,
     }
+}
+
+/// The name of the next column without one.
+fn unnamed(cols: &[(SymId, Expr)]) -> SymId {
+    let names = (0..).map(|n| intern(&if n == 0 { "x".to_string() } else { format!("x{n}") }));
+    names.into_iter().find(|name| cols.iter().all(|c| c.0 != *name)).unwrap_or_else(|| intern("x"))
 }
 
 fn parse_lambda(source: &str, toks: &[Tok]) -> KResult<Expr> {
@@ -903,6 +965,8 @@ fn parse_lambda(source: &str, toks: &[Tok]) -> KResult<Expr> {
     };
 
     let body = p.parse_seq(true)?;
+    let ends_open = toks.iter().rev().find(|t| !matches!(t, Tok::Newline | Tok::Eof)) == Some(&Tok::Semi);
+    let body = if ends_open { [body, vec![Expr::Lit(K::Null)]].concat() } else { body };
     Ok(Expr::Lambda {
         params,
         implicit,

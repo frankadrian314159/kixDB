@@ -5,6 +5,7 @@ use crate::error::{KError, KResult};
 use crate::sym::{intern, resolve, SymId};
 use chrono::{Datelike, NaiveDate};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
@@ -268,6 +269,24 @@ impl Attr {
     }
 }
 
+// ----- Enumerations ---------------------------------------------------------
+
+/// What the values of an enumeration are drawn from: the items of a list, the keys of a keyed table (a foreign key), or,
+/// as row numbers, the rows of a table (a linked column).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Source {
+    List,
+    Keys,
+    Rows,
+}
+
+/// The tag of enumerated values: the global they are drawn from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tag {
+    pub domain: SymId,
+    pub source: Source,
+}
+
 // ----- Typed Column Vectors (`ColVec`) --------------------------------------
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -291,6 +310,8 @@ pub enum ColVec {
     Minute(Attr, Arc<Vec<i32>>),
     Second(Attr, Arc<Vec<i32>>),
     Time(Attr, Arc<Vec<i32>>),
+    /// Values (never themselves tagged) tagged with their domain. (Last, so that files saved before it existed load.)
+    Enum(Tag, Box<ColVec>),
 }
 
 impl PartialEq for ColVec {
@@ -321,6 +342,7 @@ impl PartialEq for ColVec {
             (ColVec::Minute(_, a), ColVec::Minute(_, b)) => a == b,
             (ColVec::Second(_, a), ColVec::Second(_, b)) => a == b,
             (ColVec::Time(_, a), ColVec::Time(_, b)) => a == b,
+            (ColVec::Enum(t, a), ColVec::Enum(u, b)) => t == u && a == b,
             _ => false,
         }
     }
@@ -348,6 +370,7 @@ impl ColVec {
             ColVec::Minute(_, v) => v.len(),
             ColVec::Second(_, v) => v.len(),
             ColVec::Time(_, v) => v.len(),
+            ColVec::Enum(_, v) => v.len(),
         }
     }
 
@@ -376,6 +399,7 @@ impl ColVec {
             | ColVec::Minute(a, _)
             | ColVec::Second(a, _)
             | ColVec::Time(a, _) => *a,
+            ColVec::Enum(_, v) => v.attr(),
         }
     }
 
@@ -400,6 +424,7 @@ impl ColVec {
             | ColVec::Minute(a, _)
             | ColVec::Second(a, _)
             | ColVec::Time(a, _) => *a = na,
+            ColVec::Enum(_, v) => v.set_attr_unchecked(na),
         }
     }
 
@@ -463,6 +488,7 @@ impl ColVec {
             ColVec::Minute(_, _) => 17,
             ColVec::Second(_, _) => 18,
             ColVec::Time(_, _) => 19,
+            ColVec::Enum(..) => 20,
         }
     }
 
@@ -494,6 +520,7 @@ impl ColVec {
             ColVec::Minute(_, _) => 'u',
             ColVec::Second(_, _) => 'v',
             ColVec::Time(_, _) => 't',
+            ColVec::Enum(_, v) => v.meta_type_char(),
         }
     }
 
@@ -519,6 +546,7 @@ impl ColVec {
             ColVec::Minute(_, _) => "minute",
             ColVec::Second(_, _) => "second",
             ColVec::Time(_, _) => "time",
+            ColVec::Enum(_, v) => v.type_name(),
         }
     }
 
@@ -543,6 +571,15 @@ impl ColVec {
             ColVec::Minute(_, _) => K::Minute(NULL_INT),
             ColVec::Second(_, _) => K::Second(NULL_INT),
             ColVec::Time(_, _) => K::Time(NULL_INT),
+            ColVec::Enum(t, v) => K::Enum(*t, Box::new(v.null_atom())),
+        }
+    }
+
+    /// The values without an enumeration tag.
+    pub fn plain(&self) -> &ColVec {
+        match self {
+            ColVec::Enum(_, v) => v,
+            other => other,
         }
     }
 
@@ -595,12 +632,21 @@ impl ColVec {
             ColVec::Minute(_, v) => K::Minute(v[idx]),
             ColVec::Second(_, v) => K::Second(v[idx]),
             ColVec::Time(_, v) => K::Time(v[idx]),
+            ColVec::Enum(t, v) => K::Enum(*t, Box::new(v.get_atom(idx))),
         }
     }
 
     /// Index by signed integer (out of bounds yields typed null, as in kdb+ `v[999]`).
     pub fn get_signed(&self, idx: i64) -> K {
         if idx < 0 || (idx as usize) >= self.len() {
+            // past the end of a list of mixed values: a null like its first item
+            if let ColVec::General(_, items) = self {
+                return match items.first() {
+                    Some(K::Vector(v)) => K::Vector(v.take(0)),
+                    Some(atom) => ColVec::from_atoms(vec![atom.clone()]).null_atom(),
+                    None => self.null_atom(),
+                };
+            }
             self.null_atom()
         } else {
             self.get_atom(idx as usize)
@@ -615,7 +661,11 @@ impl ColVec {
             }};
         }
         match self {
-            ColVec::General(_, v) => pick!(General, v, K::Null),
+            // (a missing item of a list of lists is an empty list like its first)
+            ColVec::General(_, v) => pick!(General, v, match v.first() {
+                Some(K::Vector(first)) => K::Vector(first.take(0)),
+                _ => K::Null,
+            }),
             ColVec::Bool(_, v) => pick!(Bool, v, false),
             ColVec::Guid(_, v) => pick!(Guid, v, NULL_GUID),
             ColVec::Byte(_, v) => pick!(Byte, v, 0),
@@ -634,6 +684,7 @@ impl ColVec {
             ColVec::Minute(_, v) => pick!(Minute, v, NULL_INT),
             ColVec::Second(_, v) => pick!(Second, v, NULL_INT),
             ColVec::Time(_, v) => pick!(Time, v, NULL_INT),
+            ColVec::Enum(t, v) => ColVec::Enum(*t, Box::new(v.gather(indices))),
         }
     }
 
@@ -652,7 +703,11 @@ impl ColVec {
             }};
         }
         match self {
-            ColVec::General(_, v) => pick!(General, v, K::Null),
+            // (a missing item of a list of lists is an empty list like its first)
+            ColVec::General(_, v) => pick!(General, v, match v.first() {
+                Some(K::Vector(first)) => K::Vector(first.take(0)),
+                _ => K::Null,
+            }),
             ColVec::Bool(_, v) => pick!(Bool, v, false),
             ColVec::Guid(_, v) => pick!(Guid, v, NULL_GUID),
             ColVec::Byte(_, v) => pick!(Byte, v, 0),
@@ -671,6 +726,7 @@ impl ColVec {
             ColVec::Minute(_, v) => pick!(Minute, v, NULL_INT),
             ColVec::Second(_, v) => pick!(Second, v, NULL_INT),
             ColVec::Time(_, v) => pick!(Time, v, NULL_INT),
+            ColVec::Enum(t, v) => ColVec::Enum(*t, Box::new(v.gather_signed(indices))),
         }
     }
 
@@ -743,6 +799,13 @@ impl ColVec {
         if items.is_empty() {
             return ColVec::General(Attr::None, Arc::new(items));
         }
+        // atoms of one enumeration make an enumeration
+        if let K::Enum(tag, _) = items[0] {
+            if items.iter().all(|x| matches!(x, K::Enum(t, _) if *t == tag)) {
+                let values = items.into_iter().map(|x| x.plain().into_owned()).collect();
+                return ColVec::Enum(tag, Box::new(ColVec::from_atoms(values)));
+            }
+        }
         let t0 = items[0].type_num();
         if t0 < 0 && items.iter().all(|x| x.type_num() == t0) {
             match t0 {
@@ -781,6 +844,9 @@ impl ColVec {
             }};
         }
         match (self, other) {
+            (ColVec::Enum(t, a), ColVec::Enum(u, b)) if t == u => ColVec::Enum(*t, Box::new(a.concat(b))),
+            // (values of different domains, or with others that have none, lose their tags)
+            (ColVec::Enum(..), _) | (_, ColVec::Enum(..)) if !self.is_empty() && !other.is_empty() => self.plain().concat(other.plain()),
             (ColVec::Bool(_, a), ColVec::Bool(_, b)) => cat!(Bool, a, b),
             (ColVec::Guid(_, a), ColVec::Guid(_, b)) => cat!(Guid, a, b),
             (ColVec::Byte(_, a), ColVec::Byte(_, b)) => cat!(Byte, a, b),
@@ -816,6 +882,15 @@ impl ColVec {
 
     /// Strict typed append for table `insert`/`upsert` (coerces int->long/float where safe, errors on incompatible types).
     pub fn append_strict(&self, other: &ColVec) -> KResult<ColVec> {
+        // an enumeration takes only its own: the engine enumerates new values, checking them, before it adds them
+        match (self, other) {
+            (ColVec::Enum(t, a), ColVec::Enum(u, b)) if t == u => return Ok(ColVec::Enum(*t, Box::new(a.append_strict(b)?))),
+            (ColVec::Enum(..), _) if other.is_empty() => return Ok(self.clone()),
+            (ColVec::Enum(t, _), _) => return Err(KError::new("cast", format!("not values of `{}", resolve(t.domain)))),
+            (ColVec::General(..), ColVec::Enum(..)) if self.is_empty() => return Ok(other.clone()),
+            (_, ColVec::Enum(_, b)) => return self.append_strict(b),
+            _ => {}
+        }
         if self.type_num() == other.type_num() || matches!(self, ColVec::General(_, _)) {
             if matches!(self, ColVec::General(_, _)) && self.is_empty() && !matches!(other, ColVec::General(_, _)) {
                 return Ok(other.clone());
@@ -826,8 +901,15 @@ impl ColVec {
         if other.is_empty() {
             return Ok(self.clone());
         }
-        // Safe numeric widening into float or long
+        // Safe numeric widening into float or long, and longs that fit into int
         match (self, other) {
+            (ColVec::Int(_, a), ColVec::Long(_, b)) => {
+                let mut out = (**a).clone();
+                for &v in b.iter() {
+                    out.push(long_as_int(v).ok_or_else(|| KError::ty(format!("{v} does not fit an int column")))?);
+                }
+                Ok(ColVec::Int(Attr::None, Arc::new(out)))
+            }
             (ColVec::Float(_, a), _) if other.is_numeric() => {
                 let mut out = (**a).clone();
                 for i in 0..other.len() {
@@ -908,6 +990,7 @@ impl ColVec {
             ColVec::Float(_, v) | ColVec::Datetime(_, v) => par(v, |&x| float(x)),
             ColVec::Sym(_, v) => par(v, |&x| u64::from(x.0)),
             ColVec::General(..) | ColVec::Guid(..) => return None,
+            ColVec::Enum(_, v) => return v.key_bits(),
         })
     }
 
@@ -940,6 +1023,7 @@ impl ColVec {
             }
             ColVec::Real(_, v) => Some(v.iter().map(|&x| x as f64).collect()),
             ColVec::Float(_, v) | ColVec::Datetime(_, v) => Some((**v).clone()),
+            ColVec::Enum(_, v) => v.as_f64_vec(),
             _ => None,
         }
     }
@@ -956,12 +1040,13 @@ impl ColVec {
             | ColVec::Second(_, v)
             | ColVec::Time(_, v) => Some(v.iter().map(|&x| if x == NULL_INT { NULL_LONG } else { x as i64 }).collect()),
             ColVec::Long(_, v) | ColVec::Timestamp(_, v) | ColVec::Timespan(_, v) => Some((**v).clone()),
+            ColVec::Enum(_, v) => v.as_i64_vec(),
             _ => None,
         }
     }
 
     pub fn as_str(&self) -> Option<String> {
-        if let ColVec::Char(_, bytes) = self {
+        if let ColVec::Char(_, bytes) = self.plain() {
             Some(String::from_utf8_lossy(bytes).into_owned())
         } else {
             None
@@ -989,6 +1074,7 @@ impl ColVec {
             | ColVec::Datetime(_, _)
             | ColVec::Timespan(_, _) => n * 8,
             ColVec::Guid(_, _) => n * 16,
+            ColVec::Enum(_, v) => v.approx_bytes(),
         }
     }
 }
@@ -1218,7 +1304,8 @@ impl Func {
             Func::Lambda(l) => l.source.clone(),
             Func::Adverb { kind, inner } => format!("{}{}", inner.source_text(), kind.symbol()),
             Func::Proj { func, args, .. } => {
-                let parts: Vec<String> = args
+                let given = args.iter().rposition(Option::is_some).map_or(0, |last| last + 1);
+                let parts: Vec<String> = args[..given]
                     .iter()
                     .map(|a| a.as_ref().map(|k| k.q_repr()).unwrap_or_default())
                     .collect();
@@ -1258,6 +1345,8 @@ pub enum K {
     KeyedTable(Arc<KeyedTable>),
     Dict(Arc<Dict>),
     Func(Func),
+    /// An atom (or the key of a compound foreign key) tagged with its domain. (Last, as for `ColVec::Enum`.)
+    Enum(Tag, Box<K>),
 }
 
 impl PartialEq for K {
@@ -1287,6 +1376,7 @@ impl PartialEq for K {
             (K::KeyedTable(a), K::KeyedTable(b)) => a == b,
             (K::Dict(a), K::Dict(b)) => a == b,
             (K::Func(a), K::Func(b)) => a == b,
+            (K::Enum(t, a), K::Enum(u, b)) => t == u && a == b,
             _ => false,
         }
     }
@@ -1301,8 +1391,69 @@ impl K {
         K::Sym(intern(s))
     }
 
+    /// Whether there are enumeration tags at the top or in the items of a list of mixed values; with `deep`, in tables
+    /// and dictionaries too.
+    fn has_tags(&self, deep: bool) -> bool {
+        let column = |c: &ColVec| match c {
+            ColVec::Enum(..) => true,
+            ColVec::General(_, items) => items.iter().any(|i| i.has_tags(deep)),
+            _ => false,
+        };
+        match self {
+            K::Enum(..) => true,
+            K::Vector(c) => column(c),
+            K::Table(t) if deep => t.vals.iter().any(column),
+            K::KeyedTable(t) if deep => t.keys.vals.iter().chain(&t.vals.vals).any(column),
+            K::Dict(d) if deep => d.keys.has_tags(true) || d.vals.has_tags(true),
+            _ => false,
+        }
+    }
+
+    /// The value without the tags that `has_tags` finds.
+    fn stripped(&self, deep: bool) -> K {
+        let column = |c: &ColVec| match c {
+            ColVec::Enum(_, values) => (**values).clone(),
+            ColVec::General(a, items) => ColVec::General(*a, Arc::new(items.iter().map(|i| i.stripped(deep)).collect())),
+            other => other.clone(),
+        };
+        let flip = |f: &Flip| Flip { cols: f.cols.clone(), vals: f.vals.iter().map(column).collect() };
+        match self {
+            K::Enum(_, v) => (**v).clone(),
+            K::Vector(c) => K::Vector(column(c)),
+            K::Table(t) if deep => K::Table(Arc::new(flip(t))),
+            K::KeyedTable(t) if deep => K::KeyedTable(Arc::new(KeyedTable { keys: flip(&t.keys), vals: flip(&t.vals) })),
+            K::Dict(d) if deep => K::Dict(Arc::new(Dict { keys: Box::new(d.keys.stripped(true)), vals: Box::new(d.vals.stripped(true)) })),
+            other => other.clone(),
+        }
+    }
+
+    /// The value as verbs that work on values see it: without enumeration tags.
+    pub fn plain(&self) -> Cow<'_, K> {
+        match self.has_tags(false) {
+            true => Cow::Owned(self.stripped(false)),
+            false => Cow::Borrowed(self),
+        }
+    }
+
+    /// The value as it goes to another program: with no enumeration tags anywhere.
+    pub fn untagged(&self) -> Cow<'_, K> {
+        match self.has_tags(true) {
+            true => Cow::Owned(self.stripped(true)),
+            false => Cow::Borrowed(self),
+        }
+    }
+
+    /// The domain of an enumerated atom or vector.
+    pub fn tag(&self) -> Option<Tag> {
+        match self {
+            K::Enum(t, _) | K::Vector(ColVec::Enum(t, _)) => Some(*t),
+            _ => None,
+        }
+    }
+
     pub fn type_num(&self) -> i16 {
         match self {
+            K::Enum(..) => -20,
             K::Null => 101,
             K::Bool(_) => -1,
             K::Guid(_) => -2,
@@ -1355,6 +1506,7 @@ impl K {
             K::Float(v) | K::Datetime(v) => v.is_nan(),
             K::Char(c) => *c == NULL_CHAR,
             K::Sym(s) => s.is_null(),
+            K::Enum(_, v) => v.is_null(),
             _ => false,
         }
     }
@@ -1363,9 +1515,10 @@ impl K {
         match self {
             K::Bool(b) => Ok(*b),
             K::Byte(v) => Ok(*v != 0),
-            K::Short(v) => Ok(*v != 0 && *v != NULL_SHORT),
-            K::Int(v) => Ok(*v != 0 && *v != NULL_INT),
-            K::Long(v) => Ok(*v != 0 && *v != NULL_LONG),
+            K::Short(v) => Ok(*v != 0),
+            K::Int(v) => Ok(*v != 0),
+            K::Long(v) => Ok(*v != 0),
+            K::Enum(_, v) => v.as_bool(),
             _ => Err(KError::ty("expected boolean condition")),
         }
     }
@@ -1379,6 +1532,7 @@ impl K {
                 Ok(if *v == NULL_INT { NULL_LONG } else { *v as i64 })
             }
             K::Long(v) | K::Timestamp(v) | K::Timespan(v) => Ok(*v),
+            K::Enum(_, v) => v.as_i64(),
             _ => Err(KError::ty("expected integer")),
         }
     }
@@ -1394,6 +1548,7 @@ impl K {
             K::Long(v) | K::Timestamp(v) | K::Timespan(v) => Ok(if *v == NULL_LONG { f64::NAN } else { *v as f64 }),
             K::Real(v) => Ok(*v as f64),
             K::Float(v) | K::Datetime(v) => Ok(*v),
+            K::Enum(_, v) => v.as_f64(),
             _ => Err(KError::ty("expected number")),
         }
     }
@@ -1403,6 +1558,7 @@ impl K {
             K::Char(c) => Some((*c as char).to_string()),
             K::Sym(s) => Some(resolve(*s)),
             K::Vector(v) => v.as_str(),
+            K::Enum(_, v) => v.as_str(),
             _ => None,
         }
     }
@@ -1421,6 +1577,8 @@ impl K {
     pub fn k_cmp(&self, other: &Self) -> std::cmp::Ordering {
         use std::cmp::Ordering;
         match (self, other) {
+            (K::Enum(_, a), b) => a.k_cmp(b),
+            (a, K::Enum(_, b)) => a.k_cmp(b),
             (K::Sym(a), K::Sym(b)) => a.cmp(b),
             (K::Char(a), K::Char(b)) => a.cmp(b),
             (K::Guid(a), K::Guid(b)) => a.cmp(b),
@@ -1464,6 +1622,9 @@ impl K {
 
     /// Canonical byte key for hashing/grouping/distinct (`NaN` canonicalized so nulls group together).
     pub fn hash_key(&self) -> Vec<u8> {
+        if let K::Enum(_, v) = self {
+            return v.hash_key();
+        }
         let mut out = Vec::with_capacity(12);
         out.extend_from_slice(&self.type_num().to_le_bytes());
         match self {
@@ -1492,7 +1653,8 @@ impl K {
                     out.extend_from_slice(&v.get_atom(i).hash_key());
                 }
             }
-            _ => out.extend_from_slice(self.q_repr().as_bytes()),
+            // (in full: printing rounds)
+            _ => out.extend_from_slice(format!("{self:?}").as_bytes()),
         }
         out
     }
@@ -1507,18 +1669,29 @@ impl K {
         }
     }
 
-    /// Plain cell text for grids and CSV export (no quotes around strings or backticks on symbols).
+    /// `cell_text` with floats in full, for files: what the console rounds away must not be lost.
+    pub fn data_text(&self) -> String {
+        match self {
+            K::Float(v) if v.is_finite() => v.to_string(),
+            K::Real(v) if v.is_finite() => v.to_string(),
+            K::Enum(_, v) => v.data_text(),
+            other => other.cell_text(),
+        }
+    }
+
+    /// Plain cell text for grids and `string` (no quotes around strings or backticks on symbols).
     pub fn cell_text(&self) -> String {
         match self {
             K::Null => String::new(),
-            K::Bool(b) => if *b { "1b".into() } else { "0b".into() },
+            K::Bool(b) => if *b { "1".into() } else { "0".into() },
             K::Guid(g) => if *g == NULL_GUID { String::new() } else { format_guid(g) },
             K::Byte(b) => format!("0x{b:02x}"),
             K::Short(v) => if *v == NULL_SHORT { String::new() } else if *v == INF_SHORT { "0Wh".into() } else if *v == NINF_SHORT { "-0Wh".into() } else { v.to_string() },
             K::Int(v) => if *v == NULL_INT { String::new() } else if *v == INF_INT { "0Wi".into() } else if *v == NINF_INT { "-0Wi".into() } else { v.to_string() },
             K::Long(v) => if *v == NULL_LONG { String::new() } else if *v == INF_LONG { "0W".into() } else if *v == NINF_LONG { "-0W".into() } else { v.to_string() },
             K::Real(v) => format_float_cell(*v as f64),
-            K::Float(v) | K::Datetime(v) => format_float_cell(*v),
+            K::Float(v) => format_float_cell(*v),
+            K::Datetime(v) => if v.is_nan() { String::new() } else { format_datetime(*v) },
             K::Char(c) => (*c as char).to_string(),
             K::Sym(s) => resolve(*s),
             K::Timestamp(v) => if *v == NULL_LONG { String::new() } else { format_timestamp(*v) },
@@ -1529,6 +1702,7 @@ impl K {
             K::Second(v) => if *v == NULL_INT { String::new() } else { format_second(*v) },
             K::Time(v) => if *v == NULL_INT { String::new() } else { format_time(*v) },
             K::Vector(ColVec::Char(_, bytes)) => String::from_utf8_lossy(bytes).into_owned(),
+            K::Enum(_, v) => v.cell_text(),
             other => other.q_repr(),
         }
     }
@@ -1566,10 +1740,11 @@ impl K {
                 } else if *v == f32::NEG_INFINITY {
                     "-0We".into()
                 } else {
-                    format!("{v}e")
+                    format!("{}e", crate::display::float(f64::from(*v)))
                 }
             }
-            K::Float(v) | K::Datetime(v) => format_float_q(*v),
+            K::Float(v) => format_float_q(*v),
+            K::Datetime(v) => format_datetime(*v),
             K::Char(c) => format!("\"{}\"", escape_q_char(*c)),
             K::Sym(s) => format!("`{}", resolve(*s)),
             K::Timestamp(v) => format_timestamp(*v),
@@ -1580,53 +1755,50 @@ impl K {
             K::Second(v) => format_second(*v),
             K::Time(v) => format_time(*v),
             K::Vector(v) => format_vector_q(v),
-            K::Table(t) => crate::tools::format_flip(t, 40),
-            K::KeyedTable(kt) => crate::tools::format_keyed_table(kt, 40),
-            K::Dict(d) => crate::tools::format_dict(d),
+            K::Table(t) => table_repr(t),
+            K::KeyedTable(kt) => format!("({})!{}", table_repr(&kt.keys), table_repr(&kt.vals)),
+            K::Dict(d) => dict_repr(d.keys.q_repr(), d.vals.q_repr()),
             K::Func(f) => f.source_text(),
+            K::Enum(tag, v) => enum_repr(tag, v),
         }
     }
 }
 
 fn format_float_cell(v: f64) -> String {
-    if v.is_nan() {
-        String::new()
-    } else if v == f64::INFINITY {
-        "0w".into()
-    } else if v == f64::NEG_INFINITY {
-        "-0w".into()
-    } else {
-        format_float_num(v, false)
-    }
+    if v.is_nan() { String::new() } else { crate::display::float(v) }
 }
 
+/// A float atom: one that looks like a whole number is marked `f`.
 fn format_float_q(v: f64) -> String {
-    if v.is_nan() {
-        "0n".into()
-    } else if v == f64::INFINITY {
-        "0w".into()
-    } else if v == f64::NEG_INFINITY {
-        "-0w".into()
-    } else {
-        format_float_num(v, true)
+    let s = crate::display::float(v);
+    match s.contains(['.', 'e', 'n', 'w']) {
+        true => s,
+        false => format!("{s}f"),
     }
 }
 
-fn format_float_num(v: f64, suffix_if_int: bool) -> String {
-    let v = if v == 0.0 { 0.0 } else { v };
-    // Round to 7 significant-ish decimal places like kdb+'s `\P 7` default to avoid 0.30000000000000004 noise
-    let s = if v.abs() >= 1e9 || (v != 0.0 && v.abs() < 1e-5) {
-        format!("{v:.7e}")
-    } else {
-        let rounded = (v * 1e7).round() / 1e7;
-        let raw = format!("{rounded}");
-        raw
-    };
-    if suffix_if_int && !s.contains('.') && !s.contains('e') {
-        format!("{s}f")
-    } else {
-        s
+/// A datetime (days since 2000.01.01), to the millisecond.
+pub fn format_datetime(days: f64) -> String {
+    if !days.is_finite() {
+        return format!("{}z", &crate::display::float(days).replace('n', "N"));
     }
+    let ms = (days * 86_400_000.0).round() as i64;
+    format!("{}T{}", format_date(ms.div_euclid(86_400_000) as i32), format_time(ms.rem_euclid(86_400_000) as i32))
+}
+
+/// `keys!values` as q writes it; keys that begin with a verb are put in brackets.
+fn dict_repr(keys: String, values: String) -> String {
+    match keys.starts_with([',', '+']) {
+        true => format!("({keys})!{values}"),
+        false => format!("{keys}!{values}"),
+    }
+}
+
+/// `+names!columns`
+fn table_repr(t: &Flip) -> String {
+    let names = K::Vector(ColVec::Sym(Attr::None, Arc::new(t.cols.clone())));
+    let columns = K::Vector(ColVec::General(Attr::None, Arc::new(t.vals.iter().cloned().map(K::Vector).collect())));
+    format!("+{}", dict_repr(names.q_repr(), columns.q_repr()))
 }
 
 fn escape_q_char(b: u8) -> String {
@@ -1641,11 +1813,28 @@ fn escape_q_char(b: u8) -> String {
     }
 }
 
+/// `` `sym$`a `` for an enumeration of a list or of keys, `` `t!0 `` for row numbers.
+fn enum_repr(tag: &Tag, values: &K) -> String {
+    let verb = if tag.source == Source::Rows { '!' } else { '$' };
+    format!("`{}{verb}{}", resolve(tag.domain), values.q_repr())
+}
+
+/// A long as an int, if it is one: nulls and infinities become int ones.
+fn long_as_int(v: i64) -> Option<i32> {
+    match v {
+        NULL_LONG => Some(NULL_INT),
+        INF_LONG => Some(INF_INT),
+        NINF_LONG => Some(NINF_INT),
+        other => i32::try_from(other).ok().filter(|&i| i != NULL_INT),
+    }
+}
+
 fn format_vector_q(v: &ColVec) -> String {
     let pfx = v.attr().prefix();
     let single = v.len() == 1;
     let enlist = if single && !matches!(v, ColVec::Char(_, _)) { "," } else { "" };
     match v {
+        ColVec::Enum(tag, values) => enum_repr(tag, &K::Vector((**values).clone())),
         ColVec::Bool(_, xs) => {
             if xs.is_empty() {
                 format!("{pfx}`boolean$()")
@@ -1726,13 +1915,12 @@ fn format_vector_q(v: &ColVec) -> String {
                 format!("{pfx}{enlist}{}", parts.join(" "))
             }
         }
-        ColVec::Float(_, xs) | ColVec::Datetime(_, xs) => {
+        ColVec::Float(_, xs) => {
             if xs.is_empty() {
                 format!("{pfx}`float$()")
             } else {
-                let any_dot = xs.iter().any(|x| x.is_nan() || x.is_infinite() || x.fract() != 0.0);
-                let parts: Vec<String> = xs.iter().map(|&x| format_float_num_vec(x)).collect();
-                let tail = if any_dot { "" } else { "f" };
+                let parts: Vec<String> = xs.iter().map(|&x| crate::display::float(x)).collect();
+                let tail = if parts.iter().any(|p| p.contains(['.', 'e', 'n', 'w'])) { "" } else { "f" };
                 format!("{pfx}{enlist}{}{tail}", parts.join(" "))
             }
         }
@@ -1740,7 +1928,7 @@ fn format_vector_q(v: &ColVec) -> String {
             if xs.is_empty() {
                 format!("{pfx}`real$()")
             } else {
-                let parts: Vec<String> = xs.iter().map(|&x| format_float_num_vec(x as f64)).collect();
+                let parts: Vec<String> = xs.iter().map(|&x| crate::display::float(f64::from(x))).collect();
                 format!("{pfx}{enlist}{}e", parts.join(" "))
             }
         }
@@ -1762,18 +1950,6 @@ fn format_vector_q(v: &ColVec) -> String {
                 format!("{pfx}{enlist}{}", parts.join(" "))
             }
         }
-    }
-}
-
-fn format_float_num_vec(v: f64) -> String {
-    if v.is_nan() {
-        "0n".into()
-    } else if v == f64::INFINITY {
-        "0w".into()
-    } else if v == f64::NEG_INFINITY {
-        "-0w".into()
-    } else {
-        format_float_num(v, false)
     }
 }
 

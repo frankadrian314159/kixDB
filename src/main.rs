@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! kix [DATA_DIR | SCRIPT.q] [-D dir] [-p port] [--connect host[:port]] [-U user -P pass]
-//!     [-q|-Q expr]... [-f|-i script.q]...
+//!     [-q|-Q expr]... [-f|-i script.q]... [--allow-shell]
 //! ```
 use kixdb::inspect::ObjectKind;
 use kixdb::ipc::{IpcClient, IpcConfig, Listener};
@@ -22,9 +22,13 @@ Enter q / qSQL expressions at the q) prompt. Backslash commands match kdb+, and 
   \\d [.ns]                   show or switch current namespace
   \\l PATH                    load a .q script or mount an HDB directory
   \\t [:N] EXPR               execution time in milliseconds (N iterations)
+  \\t [MS]                    show or set the interval of the timer that calls .z.ts (0: off)
+  \\x NAME                    remove a variable, such as a callback
   \\ts [:N] EXPR              time (ms) and space (bytes) of EXPR
   \\p [PORT]                  start/show background IPC listener on PORT
   \\w  | .storage             workspace memory, symbol pool, and WAL statistics
+  \\P [DIGITS]                show or set the significant digits of floats (7; 0: all)
+  \\c [LINES CHARS]           show or set the size of printed output (25 80)
   \\\\  | .quit | exit         exit shell
 
 Dot commands:
@@ -38,16 +42,20 @@ Dot commands:
   .checkpoint                fold WAL into an atomic snapshot now
   .help                      show this help";
 
-const USAGE: &str = "usage: kix [DATA_DIR | SCRIPT.q] [-D dir] [-p port] [--connect host[:port]] [-U user -P pass] [-Q expr]... [-i script.q]...
+const USAGE: &str = "usage: kix [DATA_DIR | SCRIPT.q] [-D dir] [-p port] [--connect host[:port]] [-U user -P pass] [-Q expr]... [-i script.q]... [--allow-shell] [-- ARGS]
 
 Without a data directory the workspace lives in memory only. Passing a .q file loads it before entering the REPL
-(or exits if -Q/-q is also given). --connect attaches the shell to a remote kix-serve / kix-cluster over kdb+ IPC.";
+(or exits if -Q/-q is also given). --connect attaches the shell to a remote kix-serve / kix-cluster over kdb+ IPC.
+Arguments after -- are the script's own, in .z.x.
+Shell commands (\\ls) run unless the shell listens for clients (-p, \\p), which then needs --allow-shell.";
 
 enum Target {
     Local {
         conn: Connection,
         server: Server,
         listener: Option<Listener>,
+        /// Keep shell commands on while listening (`--allow-shell`).
+        allow_shell: bool,
     },
     Remote {
         client: IpcClient,
@@ -70,6 +78,7 @@ fn main() -> ExitCode {
     let mut remote_addr: Option<String> = None;
     let mut user = String::from("admin");
     let mut pass = String::new();
+    let mut allow_shell = false;
     let opts = StorageOptions::default();
 
     let bad = |m: &str| {
@@ -79,6 +88,8 @@ fn main() -> ExitCode {
 
     while let Some(a) = args.next() {
         match a.as_str() {
+            "--" => break,
+            "--allow-shell" => allow_shell = true,
             "-h" | "--help" | "-?" => {
                 println!("{USAGE}\n\n{HELP}");
                 return ExitCode::SUCCESS;
@@ -147,8 +158,9 @@ fn main() -> ExitCode {
             },
             None => Server::new(),
         };
+        server.allow_shell_commands(true);
         let listener = match listen_port {
-            Some(p) => match Listener::bind(server.clone(), ("127.0.0.1", p), IpcConfig::default()) {
+            Some(p) => match listen(&server, p, allow_shell) {
                 Ok(l) => Some(l),
                 Err(e) => {
                     eprintln!("cannot listen on port {p}: {e}");
@@ -158,10 +170,15 @@ fn main() -> ExitCode {
             None => None,
         };
         let conn = server.connect_as_trusted(&user);
-        Target::Local { conn, server, listener }
+        Target::Local { conn, server, listener, allow_shell }
     };
 
     let mut sh = Shell { target, timer: false, failed: false };
+    // (stopped before the workspace closes)
+    let _background = match &sh.target {
+        Target::Local { server, .. } => Some(server.start_background()),
+        Target::Remote { .. } => None,
+    };
     for s in &preload_scripts {
         sh.run_code(s);
     }
@@ -170,6 +187,7 @@ fn main() -> ExitCode {
         for j in &jobs {
             sh.run_code(j);
         }
+        sh.leave(i32::from(sh.failed));
         return if sh.failed { ExitCode::FAILURE } else { ExitCode::SUCCESS };
     }
 
@@ -187,7 +205,13 @@ fn main() -> ExitCode {
         }
     }
     sh.repl(interactive);
+    sh.leave(0);
     ExitCode::SUCCESS
+}
+
+/// Listen for clients on this machine's `port`.
+fn listen(server: &Server, port: u16, allow_shell: bool) -> kixdb::KResult<Listener> {
+    Listener::bind(server.clone(), ("127.0.0.1", port), IpcConfig { allow_shell, ..IpcConfig::default() })
 }
 
 impl Shell {
@@ -255,7 +279,9 @@ impl Shell {
             buf.push_str(&line);
             if tools::delimiters_balanced(&buf) {
                 let code = std::mem::take(&mut buf);
-                self.run_code(&code);
+                if !self.input_callback(&code) {
+                    self.run_code(&code);
+                }
             }
         }
         if !buf.trim().is_empty() {
@@ -263,15 +289,36 @@ impl Shell {
         }
     }
 
+    fn leave(&mut self, code: i32) {
+        if let Target::Local { conn, .. } = &mut self.target {
+            conn.leaving(code);
+        }
+    }
+
+    /// Whether `.z.pi` took what was typed. (System commands never go to it, so `\\x .z.pi` can remove it.)
+    fn input_callback(&mut self, code: &str) -> bool {
+        let Target::Local { conn, .. } = &mut self.target else { return false };
+        if code.trim_start().starts_with('\\') {
+            return false;
+        }
+        match conn.console_input(code) {
+            None => return false,
+            Some(Ok(K::Null)) => {}
+            Some(Ok(value)) => println!("{}", kixdb::display::console(&value)),
+            Some(Err(e)) => eprintln!("{e}"),
+        }
+        true
+    }
+
     fn handle_port_cmd(&mut self, arg: &str) {
-        if let Target::Local { server, listener, .. } = &mut self.target {
+        if let Target::Local { server, listener, allow_shell, .. } = &mut self.target {
             if arg.is_empty() {
                 let p = listener.as_ref().map(|l| l.local_addr().port() as i32).unwrap_or(0);
                 println!("{p}i");
             } else if arg == "0" {
                 *listener = None;
             } else if let Ok(p) = arg.parse::<u16>() {
-                match Listener::bind(server.clone(), ("127.0.0.1", p), IpcConfig::default()) {
+                match listen(server, p, *allow_shell) {
                     Ok(l) => *listener = Some(l),
                     Err(e) => eprintln!("{e}"),
                 }
@@ -290,7 +337,7 @@ impl Shell {
             }
             Target::Remote { client, .. } => match client.query_str(code) {
                 Ok(K::Null) => {}
-                Ok(val) => println!("{}", val.q_repr()),
+                Ok(val) => println!("{}", kixdb::display::console(&val)),
                 Err(e) => {
                     self.failed = true;
                     eprintln!("{e}");
@@ -308,14 +355,12 @@ impl Shell {
         for ev in &res.events {
             match ev {
                 Event::Rows(rs) => {
-                    let _ = writeln!(out, "{}", tools::format_grid(rs, 60));
+                    let _ = writeln!(out, "{}", kixdb::display::grid(rs));
                 }
                 Event::Value(v) => {
-                    let _ = writeln!(out, "{}", v.q_repr());
+                    let _ = writeln!(out, "{}", kixdb::display::console(v));
                 }
-                Event::Message(m) => {
-                    let _ = writeln!(out, "{m}");
-                }
+                Event::Message(_) | Event::Console { .. } => ev.print(),
                 Event::Error(e) => {
                     self.failed = true;
                     eprintln!("{e}");

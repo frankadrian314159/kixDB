@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! kix-serve [DATA_DIR] [-p|--port N] [--bind ADDR] [-u USER:PASS] [--tls-cert FILE --tls-key FILE | --tls] [--no-sync]
+//!           [--max-queue MB] [--allow-shell] [-- ARGS]
 //! ```
 //!
 //! An address other machines can reach needs `-u` and `--force-tls`, or `--insecure-clients` to listen unprotected.
@@ -10,7 +11,7 @@ use kixdb::{Server, StorageOptions};
 
 fn usage() -> ! {
     eprintln!(
-        "usage: kix-serve [DATA_DIR] [-p|--port N] [--bind ADDR] [-u USER:PASSWORD] [--tls-cert FILE --tls-key FILE | --tls] [--no-sync]\n\n\
+        "usage: kix-serve [DATA_DIR] [-p|--port N] [--bind ADDR] [-u USER:PASSWORD] [--tls-cert FILE --tls-key FILE | --tls] [--no-sync] [--max-queue MB] [--allow-shell]\n\n\
          DATA_DIR        directory for durable WAL/snapshot and HDB partitions (omitted: in-memory)\n\
          -p, --port N    TCP port for kdb+ binary IPC (default 5000)\n\
          --bind ADDR     interface address to listen on (default 127.0.0.1)\n\
@@ -20,6 +21,8 @@ fn usage() -> ! {
          --tls           accept TLS with a new self-signed certificate, written to kix-cert.pem\n\
          --force-tls     reject plaintext connections (requires --tls or --tls-cert/--tls-key)\n\
          --insecure-clients  listen beyond this machine without both -u and --force-tls\n\
+         --max-queue MB  disconnect a client when more than this waits to be sent to it (default 256; 0: no limit)\n\
+         --allow-shell   let q run commands of this machine's shell: then any client can run programs here\n  \
          --no-sync       disable per-write fsync on WAL appends"
     );
     std::process::exit(2)
@@ -42,6 +45,8 @@ fn main() {
     let mut opts = StorageOptions::default();
     let (mut cert, mut key, mut self_signed, mut force_tls) = (None::<String>, None::<String>, false, false);
     let mut insecure_clients = false;
+    let mut queue_limit = None::<usize>;
+    let mut allow_shell = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -55,7 +60,14 @@ fn main() {
             "--tls" => self_signed = true,
             "--force-tls" => force_tls = true,
             "--insecure-clients" => insecure_clients = true,
+            "--allow-shell" => allow_shell = true,
+            "--max-queue" => {
+                let megabytes: usize = args.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage());
+                queue_limit = Some(if megabytes == 0 { usize::MAX } else { megabytes.saturating_mul(1 << 20) });
+            }
             "-h" | "--help" => usage(),
+            // (what follows is the workspace's own, in `.z.x`)
+            "--" => break,
             other if !other.starts_with('-') && dir.is_none() => dir = Some(other.to_string()),
             _ => usage(),
         }
@@ -79,6 +91,12 @@ fn main() {
         },
         None => IpcConfig::default(),
     };
+
+    ipc_cfg.queue_limit = queue_limit;
+    ipc_cfg.allow_shell = allow_shell;
+    if allow_shell {
+        eprintln!("kix-serve: WARNING: shell commands are allowed: any client can run programs on this machine");
+    }
 
     let pem = match (cert, key) {
         (Some(c), Some(k)) => Some((read_pem(&c), read_pem(&k))),
@@ -107,7 +125,8 @@ fn main() {
         Ok(()) => {}
     }
 
-    let listener = match Listener::bind(server, (bind.as_str(), port), ipc_cfg) {
+    let _background = server.start_background();
+    let listener = match Listener::bind(server.clone(), (bind.as_str(), port), ipc_cfg) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("cannot listen on {bind}:{port}: {e}");

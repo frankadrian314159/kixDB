@@ -18,6 +18,8 @@ pub enum Tok {
     Lit(K),
     Ident(String),
     Op(String),
+    /// The `.` of `value.field`, written without spaces.
+    Field,
     Adverb(AdverbKind),
     Colon,       // :
     DoubleColon, // ::
@@ -107,6 +109,18 @@ pub fn tokenize(src: &str) -> KResult<Vec<Tok>> {
             continue;
         }
 
+        if b == b'/' && at_line_start && src[i + 1..].split('\n').next().is_some_and(|rest| rest.trim().is_empty()) {
+            let mut lines = src[i..].split_inclusive('\n');
+            i += lines.next().map_or(0, str::len);
+            for line in lines {
+                i += line.len();
+                if line.trim_end() == "\\" {
+                    break;
+                }
+            }
+            continue;
+        }
+
         // Comments: `/` at line start or preceded by whitespace
         if b == b'/' && (at_line_start || after_ws) {
             // Check if this is `/:` — even after space `x /: y` is each-right!
@@ -161,11 +175,12 @@ pub fn tokenize(src: &str) -> KResult<Vec<Tok>> {
         }
 
         // Numeric / temporal / boolean / byte literal (or space-separated vector of them!)
+        let number_at = |j: usize| j < len && (bytes[j].is_ascii_digit() || (bytes[j] == b'.' && j + 1 < len && bytes[j + 1].is_ascii_digit()));
         let neg_num_ok = b == b'-'
-            && i + 1 < len
-            && bytes[i + 1].is_ascii_digit()
+            && number_at(i + 1)
             && (after_ws || prev != PrevKind::Value);
-        if b.is_ascii_digit() || neg_num_ok {
+        let point_ok = b == b'.' && i + 1 < len && bytes[i + 1].is_ascii_digit() && (after_ws || prev != PrevKind::Value);
+        if b.is_ascii_digit() || neg_num_ok || point_ok {
             let (k, next_i) = lex_numeric_sequence(src, i)?;
             out.push(match k {
                 K::Func(Func::Prim(s)) => Tok::Op(s.as_str_owned()),
@@ -331,7 +346,7 @@ pub fn tokenize(src: &str) -> KResult<Vec<Tok>> {
         // Dot field access `.field` immediately after a value (`time.minute`, `t.price`) vs `.` apply operator
         if b == b'.' {
             if !after_ws && prev == PrevKind::Value && i + 1 < len && bytes[i + 1].is_ascii_alphabetic() {
-                out.push(Tok::Op(".".into()));
+                out.push(Tok::Field);
                 i += 1;
                 after_ws = false;
                 prev = PrevKind::Other;
@@ -517,6 +532,12 @@ fn lex_symbols(src: &str, start: usize) -> (K, usize) {
             while i < len && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'.')) {
                 i += 1;
             }
+            // a web address such as `http://host/page
+            if bytes[i..].starts_with(b"://") {
+                while i < len && !bytes[i].is_ascii_whitespace() && !matches!(bytes[i], b';' | b')' | b']' | b'}' | b',' | b'`' | b'"') {
+                    i += 1;
+                }
+            }
         }
         syms.push(intern(&src[s_start..i]));
     }
@@ -580,6 +601,8 @@ fn lex_numeric_sequence(src: &str, start: usize) -> KResult<(K, usize)> {
     }
 
     let (first_atom, mut pos, mut vec_suffix) = lex_one_number_or_temporal(src, start)?;
+    // the type a letter on the last time of a list gives to all of them
+    let mut time_kind = time_letter(&src[start..pos]);
     if vec_suffix.is_some() {
         // e.g. `42i`, `3.5e`, `10h` — single atom with explicit suffix
         return Ok((apply_type_suffix_atom(first_atom, vec_suffix)?, pos));
@@ -598,7 +621,9 @@ fn lex_numeric_sequence(src: &str, start: usize) -> KResult<(K, usize)> {
         }
         // Next item is part of the vector if it starts with a digit, OR `-` immediately followed by a digit!
         let next_b = bytes[ws];
-        let starts_num = next_b.is_ascii_digit() || (next_b == b'-' && ws + 1 < len && bytes[ws + 1].is_ascii_digit());
+        let digit_after = ws + 1 < len && bytes[ws + 1].is_ascii_digit();
+        let negative_point = next_b == b'-' && ws + 2 < len && bytes[ws + 1] == b'.' && bytes[ws + 2].is_ascii_digit();
+        let starts_num = next_b.is_ascii_digit() || (matches!(next_b, b'-' | b'.') && digit_after) || negative_point;
         if !starts_num {
             break;
         }
@@ -620,11 +645,18 @@ fn lex_numeric_sequence(src: &str, start: usize) -> KResult<(K, usize)> {
 
         let (atom, next_pos, suf) = lex_one_number_or_temporal(src, ws)?;
         atoms.push(atom);
+        time_kind = time_letter(&src[ws..next_pos]);
         pos = next_pos;
         if suf.is_some() {
             vec_suffix = suf;
             break;
         }
+    }
+
+    // times of different types become the type written last, or the finest of them
+    let kinds: Vec<i16> = atoms.iter().map(|a| a.type_num()).collect();
+    if let Some(kind) = time_kind.or_else(|| crate::temporal::finest(&kinds)) {
+        atoms.iter_mut().filter(|a| a.type_num() != -kind).for_each(|a| *a = crate::temporal::convert(a, kind));
     }
 
     if atoms.len() == 1 {
@@ -634,9 +666,10 @@ fn lex_numeric_sequence(src: &str, start: usize) -> KResult<(K, usize)> {
     }
 }
 
-#[allow(dead_code)]
-fn is_num_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || matches!(b, b'.' | b':' | b'-' | b'+')
+/// The type a time ends by naming (`12:34u` is a minute).
+fn time_letter(raw: &str) -> Option<i16> {
+    let kind = "uvtn".find(raw.chars().last()?)?;
+    raw.contains(':').then_some([17, 18, 19, 16][kind])
 }
 
 /// Lexes a single numeric or temporal scalar token starting at `start`.
@@ -718,6 +751,21 @@ fn parse_scalar_token(raw: &str) -> KResult<(K, Option<char>)> {
         "0Nt" => return Ok((K::Time(NULL_INT), None)),
         "0Ng" => return Ok((K::Guid(NULL_GUID), None)),
         _ => {}
+    }
+
+    // Datetime (`YYYY.MM.DDThh:mm:ss.mmm`)
+    if let Some((date, time)) = raw.split_once('T').filter(|(date, _)| date.contains('.')) {
+        let day = if time.is_empty() { 0 } else { parse_hms_nanos(time)? };
+        return Ok((K::Datetime(f64::from(parse_date_str(date)?) + day as f64 / NANOS_PER_DAY as f64), None));
+    }
+
+    // A time followed by the letter of the type it is to have (`11:59:59.999u`)
+    if let Some((body, kind)) = raw.char_indices().last().and_then(|(i, c)| Some((&raw[..i], "uvtn".find(c)?))) {
+        if body.contains(':') {
+            let (value, _) = parse_scalar_token(body)?;
+            let kind = [17, 18, 19, 16][kind];
+            return Ok((crate::temporal::convert(&value, kind), None));
+        }
     }
 
     // Timestamp (`YYYY.MM.DDDhh:mm:ss[.nnnnnnnnn]`) or Timespan (`[+-][d]Dhh:mm:ss[.nnnnnnnnn]`)

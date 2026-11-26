@@ -102,6 +102,7 @@ impl QueryTab {
                     KEvent::Rows(rs) => self.items.push(OutputItem::Rows(rs)),
                     KEvent::Value(v) => self.items.push(OutputItem::Value(v)),
                     KEvent::Message(m) => self.items.push(OutputItem::Message(m)),
+                    KEvent::Console { text, .. } => self.items.push(OutputItem::Message(text.trim_end_matches('\n').to_string())),
                     KEvent::Error(err) => self.items.push(OutputItem::Error(err)),
                 }
             }
@@ -246,7 +247,7 @@ impl QueryTab {
                                 ui.monospace(format!("({} row(s), {} col(s))", rs.rows.len(), rs.columns.len()));
                             }
                             OutputItem::Value(k) => {
-                                ui.monospace(k.q_repr());
+                                ui.monospace(kixdb::display::console(k));
                             }
                             OutputItem::Message(m) => {
                                 ui.monospace(m);

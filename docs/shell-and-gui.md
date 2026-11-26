@@ -4,13 +4,23 @@
 
 ```
 kix [DATA_DIR | SCRIPT.q] [-D dir] [-p port] [--connect host[:port]] [-U user] [-P password] [-Q expr]... [-i script.q]...
+    [--allow-shell]
 ```
 
 Without a data directory the workspace is in memory. `-Q` (also `-q`, `-c`) and `-i` (also `-f`) run an expression or a
 script and exit. `-p` serves the workspace over IPC on the loopback address, without a password. Input continues over
 lines while a bracket, brace or string is open.
 
-q's `\` commands work (see [language.md](language.md#system-commands)), plus `\p [port]` and `\\` to quit.
+q's `\` commands work (see [language.md](language.md#system-commands)), plus `\p [port]` and `\\` to quit. `\t 1000` calls `.z.ts` every second; `.z.pi` and `.z.exit` take the shell's input
+and hear it leave ([callbacks](ipc.md#callbacks)). Arguments after `--` are in `.z.x`.
+
+Any other `\` command runs in the system's shell (`\ls`; see [shell commands](ipc.md#shell-commands)), unless the shell
+listens for clients (`-p`, `\p`), which then needs `--allow-shell`. What servers it is connected to send is run while
+it waits for input ([receiving](ipc.md#receiving)).
+
+Values print as in q's console: a list of mixed values one item a line, dictionaries and tables in columns, floats to 7
+significant digits (`\P 12` shows more, `\P 0` all), and no more than 25 lines of 80 characters, with `..` where output
+is cut (`\c 50 200` changes that). A script that reads the shell's output should set `\P` and `\c` first.
 
 | Command | Does |
 | --- | --- |
@@ -31,12 +41,13 @@ remote server or `kix-cluster` gateway.
 ## kix-gui
 
 ```
-cargo run --release --features gui --bin kix-gui -- [DATA_DIR] [--embedded]
+cargo run --release --features gui --bin kix-gui -- [DATA_DIR] [--embedded] [--allow-shell]
 cargo run --release --features gui --bin kix-gui -- --connect [tcps://]HOST[:PORT] [-U USER] [-P PASSWORD] [--tls] [--tls-ca FILE]
 ```
 
 Without `--connect` it uses a server already listening on `127.0.0.1:5000` (credentials from `KIX_USER` and
-`KIX_PASSWORD`), or starts one in its own process with a generated password. `--embedded` opens no port.
+`KIX_PASSWORD`), or starts one in its own process with a generated password. `--embedded` opens no port. The server it
+starts runs [shell commands](ipc.md#shell-commands) only with `--allow-shell`; an embedded workspace runs them.
 
 * **Navigation:** namespaces, filter, tables, views, functions, dictionaries and variables.
 * **Datasheet:** scrollable grid with a row limit, q filter and column sorting; editing, adding and deleting rows of

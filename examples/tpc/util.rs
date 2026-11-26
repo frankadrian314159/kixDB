@@ -28,7 +28,7 @@ pub fn k_str(v: &K) -> String {
     match v {
         K::Float(f) | K::Datetime(f) => if *f == 0.0 { "0".to_string() } else { f.to_string() },
         K::Real(f) => if *f == 0.0 { "0".to_string() } else { f.to_string() },
-        _ => v.cell_text(),
+        _ => v.data_text(),
     }
 }
 

@@ -84,7 +84,7 @@ fn a_follower_given_the_changes_holds_the_same_values() {
         "g,: `b",
         "e: ()",
         "e,: 1",
-        "e,: `x",
+        "e: e, `x",
         "l: (1 2; \"ab\")",
         "l,: enlist `g#`x`y`x",
         "l: (`s#1 2; \"ab\"; `x`y`x)",

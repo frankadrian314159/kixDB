@@ -287,6 +287,7 @@ impl ClusterSession {
             self.note("control: schema");
             return self.conn.eval_expr(e).map(Some);
         }
+        let follows = self.names().follows_keys(e)?;
         if let Some(t) = self.counted(e) {
             self.note(format!("scatter-gather: count of {}", t.name));
             return Ok(Some(K::Long(self.inner.count(&t)? as i64)));
@@ -298,6 +299,10 @@ impl ClusterSession {
                 self.fill(x)?;
             }
             return self.inner.run_push(&mut self.conn, &push).map(Some);
+        }
+        // (a key can be followed on the shards, or here with the table it refers to, but not into rows gathered alone)
+        if follows {
+            return Ok(None);
         }
         if let Some(v) = self.read_parts(e)? {
             return Ok(Some(v));
@@ -436,7 +441,16 @@ impl ClusterSession {
     fn on_mirror(&mut self, e: &Expr) -> KResult<K> {
         let refs = self.names().refs(e);
         let before: BTreeSet<SymId> = self.names().all_tables().into_iter().collect();
-        let wanted = if refs.dynamic { before.clone() } else { refs.tables };
+        let mut wanted = if refs.dynamic { before.clone() } else { refs.tables };
+        // (and the tables that their foreign keys and links refer to)
+        let mut look: Vec<SymId> = wanted.iter().copied().collect();
+        while let Some(t) = look.pop() {
+            for d in self.names().table(t).map(|t| self.names().domains(&t)).unwrap_or_default() {
+                if wanted.insert(d.name) {
+                    look.push(d.name);
+                }
+            }
+        }
         // what the mirror goes back to if the shards do not take the change
         let undo = self.inner.mirror.export_state()?;
         let mut originals = vec![];
@@ -683,10 +697,15 @@ impl ClusterSession {
 
     fn insert(&mut self, verb: &str, t: Table, rows: &Expr) -> KResult<K> {
         let rows = self.exclusive(rows)?;
+        self.names().replicated_domains(&t)?;
         // the mirror turns the rows into columns of the table's types, as one engine would
-        let empty = K::Table(Arc::new(t.schema.clone()));
+        let plain = K::Table(Arc::new(t.schema.clone())).untagged().into_owned();
+        let K::Table(plain) = plain else { return Err(KError::ty("not a table")) };
+        let empty = K::Table(plain.clone());
         let coerce = Expr::Binary { op: intern("upsert"), lhs: Box::new(Expr::Lit(empty)), rhs: Box::new(Expr::Lit(rows)) };
         let K::Table(coerced) = self.conn.eval_expr(&coerce)? else { return Err(KError::ty("rows do not form a table")) };
+        // (this node has the lists that enumerations take values from; the shards check foreign keys)
+        let coerced = self.conn.enumerate_rows(&t.schema, (*coerced).clone(), true)?;
         let schema = t.schema.concat(&coerced.take(0))?;
         let before = match verb {
             "insert" => self.inner.rows_of(&t)? as i64,

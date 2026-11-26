@@ -3,7 +3,7 @@ use crate::engine::ResultSet;
 use crate::error::{KError, KResult};
 use crate::inspect::TableInfo;
 use crate::sym::resolve;
-use crate::types::{ColVec, Dict, Flip, KeyedTable, K};
+use crate::types::{ColVec, Flip, KeyedTable, K};
 use std::io::BufRead;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -31,7 +31,7 @@ pub fn format_flip(f: &Flip, max_rows: usize) -> String {
     for r in 0..show_rows {
         let mut row = Vec::with_capacity(f.ncols());
         for (ci, col) in f.vals.iter().enumerate() {
-            let txt = truncate_cell(col.get_atom(r).cell_text(), 50);
+            let txt = truncate_cell(crate::display::column_cell(col, r), 50);
             widths[ci] = widths[ci].max(txt.chars().count());
             row.push(txt);
         }
@@ -79,7 +79,7 @@ pub fn format_keyed_table(kt: &KeyedTable, max_rows: usize) -> String {
     for r in 0..show_rows {
         let mut kr = Vec::with_capacity(kt.keys.ncols());
         for (ci, col) in kt.keys.vals.iter().enumerate() {
-            let txt = truncate_cell(col.get_atom(r).cell_text(), 40);
+            let txt = truncate_cell(crate::display::column_cell(col, r), 40);
             kw[ci] = kw[ci].max(txt.chars().count());
             kr.push(txt);
         }
@@ -87,7 +87,7 @@ pub fn format_keyed_table(kt: &KeyedTable, max_rows: usize) -> String {
 
         let mut vr = Vec::with_capacity(kt.vals.ncols());
         for (ci, col) in kt.vals.vals.iter().enumerate() {
-            let txt = truncate_cell(col.get_atom(r).cell_text(), 40);
+            let txt = truncate_cell(crate::display::column_cell(col, r), 40);
             vw[ci] = vw[ci].max(txt.chars().count());
             vr.push(txt);
         }
@@ -120,85 +120,6 @@ pub fn format_keyed_table(kt: &KeyedTable, max_rows: usize) -> String {
     }
     out
 }
-
-pub fn format_dict(d: &Dict) -> String {
-    let n = d.keys.count().min(40);
-    let mut keys = Vec::with_capacity(n);
-    let mut vals = Vec::with_capacity(n);
-    let mut kw = 1usize;
-    for i in 0..n {
-        let k = crate::engine::ops::index_k(&d.keys, &[Some(K::Long(i as i64))]).unwrap_or(K::Null);
-        let v = crate::engine::ops::index_k(&d.vals, &[Some(K::Long(i as i64))]).unwrap_or(K::Null);
-        let ks = k.cell_text();
-        kw = kw.max(ks.chars().count());
-        keys.push(ks);
-        vals.push(if matches!(v, K::Sym(_) | K::Char(_)) { v.cell_text() } else { v.q_repr() });
-    }
-    let mut lines = Vec::with_capacity(n);
-    for (k, v) in keys.into_iter().zip(vals) {
-        lines.push(format!("{k}{}| {v}", " ".repeat(kw - k.chars().count())));
-    }
-    if d.keys.count() > n {
-        lines.push("..".into());
-    }
-    lines.join("\n")
-}
-
-pub fn format_grid(rs: &ResultSet, max_width: usize) -> String {
-    if rs.columns.is_empty() {
-        return "(0 rows)".into();
-    }
-    let mut widths: Vec<usize> = rs.columns.iter().map(|c| c.chars().count().max(1)).collect();
-    let mut body: Vec<Vec<String>> = Vec::with_capacity(rs.rows.len());
-    for r in &rs.rows {
-        let mut row = Vec::with_capacity(r.len());
-        for (i, cell) in r.iter().enumerate() {
-            let s = truncate_cell(cell.cell_text(), max_width);
-            if i < widths.len() {
-                widths[i] = widths[i].max(s.chars().count());
-            }
-            row.push(s);
-        }
-        body.push(row);
-    }
-
-    let mut out = String::new();
-    let fmt_row = |cells: &[String]| -> String {
-        let mut left = Vec::new();
-        let mut right = Vec::new();
-        for (i, (c, &w)) in cells.iter().zip(&widths).enumerate() {
-            let padded = format!("{c}{}", " ".repeat(w - c.chars().count()));
-            if rs.key_count > 0 && i < rs.key_count {
-                left.push(padded);
-            } else {
-                right.push(padded);
-            }
-        }
-        if rs.key_count > 0 && rs.key_count < rs.columns.len() {
-            format!("{}| {}", left.join(" "), right.join(" ")).trim_end().to_string()
-        } else {
-            right.into_iter().chain(left).collect::<Vec<_>>().join(" ").trim_end().to_string()
-        }
-    };
-
-    out.push_str(&fmt_row(&rs.columns));
-    out.push('\n');
-    if rs.key_count > 0 && rs.key_count < rs.columns.len() {
-        let lw = widths[..rs.key_count].iter().sum::<usize>() + rs.key_count.saturating_sub(1);
-        let rw = widths[rs.key_count..].iter().sum::<usize>() + (rs.columns.len() - rs.key_count).saturating_sub(1);
-        out.push_str(&format!("{}| {}", "-".repeat(lw), "-".repeat(rw)));
-    } else {
-        let tw = widths.iter().sum::<usize>() + widths.len().saturating_sub(1);
-        out.push_str(&"-".repeat(tw.max(1)));
-    }
-    for row in &body {
-        out.push('\n');
-        out.push_str(&fmt_row(row));
-    }
-    out
-}
-
-// ----- `q` Script & Literal Helpers -----------------------------------------
 
 pub fn table_script(info: &TableInfo) -> String {
     let mut keys = Vec::new();
@@ -282,7 +203,7 @@ pub fn to_csv(rs: &ResultSet) -> String {
     out.push_str(&rs.columns.iter().map(|c| csv_field(c)).collect::<Vec<_>>().join(","));
     out.push_str("\r\n");
     for r in &rs.rows {
-        let cells: Vec<String> = r.iter().map(|v| if v.is_null() { String::new() } else { csv_field(&v.cell_text()) }).collect();
+        let cells: Vec<String> = r.iter().map(|v| if v.is_null() { String::new() } else { csv_field(&v.data_text()) }).collect();
         out.push_str(&cells.join(","));
         out.push_str("\r\n");
     }

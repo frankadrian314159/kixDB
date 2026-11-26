@@ -266,6 +266,69 @@ fn writes_change_the_cluster_as_they_change_one_engine() {
 }
 
 #[test]
+fn tables_named_by_symbols_are_changed_on_the_shards() {
+    let mut p = market(3);
+    for statement in [
+        "`price xasc `trade",
+        "select from trade",
+        "`sym xkey `inst",
+        "inst",
+        "bump: {[t] update size: size + 1 from t}",
+        "bump `trade",
+        "exec sum size from trade",
+        "`time xasc `trade",
+        "trade",
+        "quote: 0#quote",
+        "`quote insert ([] time: 2#09:30:00.000; sym: `IBM`AMD; bid: 1 2f; ask: 3 4f)",
+        "trade,: `time`sym`price`size`ex`trader!(09:45:00.000; `IBM; 1.5; 3; `N; `ann)",
+        "select from trade where sym = `IBM",
+        "quote",
+    ] {
+        p.check(statement);
+    }
+}
+
+#[test]
+fn foreign_keys_and_enumerations_work_across_the_shards() {
+    let mut p = market(3);
+    p.check("kt: ([eid: 1001 1002 1003] name: `Dent`Beeblebrox`Prefect; iq: 98 42 126)");
+    p.session.eval("DISTRIBUTE kt REPLICATED").unwrap();
+    for statement in [
+        "d: ([] sym: 30#`a`b`c`d`e; eid: `kt$30#1003 1001 1002; sc: til 30)",
+        "select from d",
+        "meta d",
+        "select eid.name, sc from d",
+        "select sum sc by eid.name from d",
+        "select sc from d where eid.iq > 90",
+        "select sum eid.iq by sym from d",
+        "`d insert (`a; 1002; 100)",
+        "`d insert (`a; 1009; 101)",
+        "d ,: `sym`eid`sc!(`b; 1001; 102)",
+        "update eid: 1001 from `d where sc = 100",
+        "update eid: 1009 from `d where sc = 100",
+        "select eid.name, sc from d where sc >= 28",
+        // an enumeration of a list, which the shards do not have
+        "venue: `N`Q`L",
+        "e: ([] sym: 6#`a`b`c; x: `venue$6#`N`Q)",
+        "`e insert (`a; `L)",
+        "`e insert (`a; `Z)",
+        "update x: `Q from `e where sym = `a",
+        "select from e",
+        "meta e",
+    ] {
+        p.check(statement);
+    }
+    assert!(p.shards.rows("d").iter().filter(|&&r| r > 0).count() > 1, "d is on one shard only");
+    // (the changes that should be made were)
+    assert_eq!(p.session.eval("(count d; count e; exec sum eid from d where sc = 100)").unwrap().to_string(), "32 7 1001");
+    // a shard cannot follow a key into a table that it has only part of
+    p.session.eval("DISTRIBUTE kt BY eid").unwrap();
+    assert_eq!(p.session.eval("select eid.name from d").unwrap_err().signal, "nyi");
+    assert_eq!(p.session.eval("`d insert (`a; 1002; 103)").unwrap_err().signal, "nyi");
+    p.check("select eid, sc from d");
+}
+
+#[test]
 fn distribution_modes_and_namespaces() {
     let mut p = market(3);
     p.session.eval("DISTRIBUTE trade PARTITIONED BY time").unwrap();
@@ -332,6 +395,29 @@ fn clients_see_one_database_over_ipc() {
     let q = format!("h: hopen `:{}; r: h \"select sum size by ex from trade\"; hclose h; r", gateway.local_addr());
     let remote = kixdb::Server::new().connect().eval(&q).unwrap();
     assert!(same(&remote, &client.query_str("select sum size by ex from trade").unwrap()));
+}
+
+#[test]
+fn callbacks_a_cluster_cannot_make_are_refused() {
+    let p = market(2);
+    let listener = Listener::bind(p.cluster.gateway(), "127.0.0.1:0", IpcConfig::default()).unwrap();
+    let address = listener.local_addr().to_string();
+    let mut client = IpcClient::connect_addr(&address, "alice", "").unwrap();
+    // none is left in force for a client to rely on, however it is set
+    for statement in [".z.pg: {'denied}", ".z.ps: {x}", "`.z.ts set {x}", ".z.vs: {[n; i] n}"] {
+        assert_eq!(client.query_str(statement).err().map(|e| e.signal), Some("nyi".into()), "{statement}");
+    }
+    // nor does a node run shell commands
+    assert_eq!(client.query_str("system \"echo hi\"").err().map(|e| e.signal), Some("access".into()));
+    // the console's handles are accepted, though the node prints nothing for a client
+    assert_eq!(client.query_str("-1 \"to the console\"").unwrap(), K::Int(-1));
+    // nor is anything sent to a client
+    assert_eq!(client.query_str("(neg .z.w) 1").err().map(|e| e.signal), Some("nyi".into()));
+    assert_eq!(client.query_str("count trade").unwrap(), K::Long(240));
+    // who connects is still checked
+    client.query_str(".z.pw: {[user; password] user = `alice}").unwrap();
+    assert!(IpcClient::connect_addr(&address, "alice", "").is_ok());
+    assert!(IpcClient::connect_addr(&address, "mallory", "").is_err());
 }
 
 #[test]

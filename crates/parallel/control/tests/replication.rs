@@ -167,7 +167,7 @@ fn a_replicated_shard_survives_its_leader_and_changes_members() {
     let victim = (1..=3).find(|&id| id != leader).unwrap();
     s.eval(&format!("REMOVE REPLICA 0 {victim}")).unwrap();
     group.kill(victim as usize - 1);
-    assert_eq!(s.eval("REPLICAS 0").unwrap().to_string().lines().count(), 5, "two header lines and three members");
+    assert_eq!(s.eval("REPLICAS 0").unwrap().count(), 3, "three members");
     s.eval("`trade insert (`a`b`c`d`e`f; 6#7)").unwrap();
     assert_eq!(s.eval("count trade").unwrap(), K::Long(rows + 6));
     assert!(s.eval("REPLICAS 1").unwrap_err().detail.contains("not replicated"));

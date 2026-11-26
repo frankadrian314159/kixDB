@@ -1,10 +1,20 @@
 //! `q` workspace state, session state, expression evaluator, lambdas, projections, adverbs,
 //! protected evaluation (`@[f;x;h]` / `.[f;args;h]`), views (`::`), and system commands (`\...`).
 pub mod joins;
+pub mod builtins;
+mod dotz;
+mod enums;
+pub mod files;
+mod hdb;
+mod json;
+mod markup;
+pub mod namespaces;
 pub mod ops;
 pub mod par;
 pub mod pure;
 pub mod qsql;
+pub mod rows;
+mod shell;
 pub mod writes;
 pub mod tree;
 
@@ -17,10 +27,10 @@ use crate::sym::{intern, resolve, sym_count, SymId};
 use crate::types::*;
 use chrono::{Datelike, Local, Timelike, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -39,7 +49,23 @@ pub enum Event {
     Rows(ResultSet),
     Value(K),
     Message(String),
+    /// What `-1`, `-2`, `1` and `2` write: the text as it is, line ends included, to the output or (`error`) as errors.
+    Console { text: String, error: bool },
     Error(KError),
+}
+
+impl Event {
+    /// Write what was printed (as by `show` or `-1`) to the process's console.
+    pub fn print(&self) {
+        use std::io::Write;
+        // (output that cannot be written, as to a closed pipe, is dropped)
+        let _ = match self {
+            Event::Message(line) => writeln!(std::io::stdout(), "{line}"),
+            Event::Console { text, error: false } => write!(std::io::stdout(), "{text}").and_then(|_| std::io::stdout().flush()),
+            Event::Console { text, error: true } => write!(std::io::stderr(), "{text}"),
+            _ => Ok(()),
+        };
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -120,7 +146,28 @@ impl<T: Clone> DerefMut for Shared<T> {
     }
 }
 
+/// What a workspace shares with the processes that serve it, and with its copies.
+#[derive(Debug, Default)]
+pub struct Host {
+    /// The clients that are connected, by their handles.
+    pub clients: Mutex<BTreeMap<i32, crate::ipc::Outbox>>,
+    /// The handles that `hopen` gave, which every session may use.
+    pub handles: Mutex<BTreeMap<i32, files::Handle>>,
+    /// The thread that runs what servers send, woken when something arrives.
+    pub events: Arc<Mutex<Option<std::thread::Thread>>>,
+    /// Whether commands of the operating system may be run.
+    pub shell: AtomicBool,
+    /// The interval of the timer (`\t`), 0 for none.
+    pub timer_ms: AtomicU64,
+    /// Set on a cluster's control node, which does not make the callbacks in `NOT_ON_A_CLUSTER`.
+    pub cluster: AtomicBool,
+}
+
+/// Callbacks that a cluster's control node refuses, so that none is taken to be in force when it is not.
+const NOT_ON_A_CLUSTER: [&str; 4] = [".z.pg", ".z.ps", ".z.ts", ".z.vs"];
+
 pub struct Workspace {
+    pub host: Arc<Host>,
     pub vars: Shared<HashMap<SymId, K>>,
     pub views: Shared<HashMap<SymId, ViewDef>>,
     pub dist: Shared<HashMap<SymId, DistMode>>,
@@ -145,6 +192,7 @@ impl Default for Workspace {
 impl Workspace {
     pub fn new() -> Self {
         Self {
+            host: Arc::default(),
             vars: Shared::default(),
             views: Shared::default(),
             dist: Shared::default(),
@@ -163,6 +211,7 @@ impl Workspace {
     /// shared until one side writes them.
     pub fn snapshot(&self) -> Workspace {
         Workspace {
+            host: self.host.clone(),
             vars: self.vars.clone(),
             views: self.views.clone(),
             dist: self.dist.clone(),
@@ -197,8 +246,10 @@ pub struct SessionState {
     pub id: u64,
     pub login: String,
     pub current_ns: String,
-    pub handles: HashMap<i32, crate::ipc::IpcClient>,
-    pub next_handle: i32,
+    /// `\P` and `\c`.
+    pub display: crate::display::Settings,
+    /// While a client's connection or a server's message is served, its handle (`.z.w`) and IPv4 address (`.z.a`).
+    pub client: Option<(i32, i32)>,
     /// Set (from any thread) to stop what the session is evaluating before its next step, with `'stop`.
     pub cancel: Arc<AtomicBool>,
 }
@@ -209,8 +260,8 @@ impl SessionState {
             id,
             login: login.into(),
             current_ns: String::new(),
-            handles: HashMap::new(),
-            next_handle: 3,
+            display: Default::default(),
+            client: None,
             cancel: Arc::default(),
         }
     }
@@ -241,9 +292,18 @@ pub enum Write {
 pub struct Engine<'a> {
     pub ws: &'a mut Workspace,
     pub session: &'a mut SessionState,
-    locals: Vec<HashMap<SymId, K>>,
+    pub(crate) locals: Vec<HashMap<SymId, K>>,
     table_scopes: Vec<TableScope>,
-    pub messages: Vec<String>,
+    /// The lambdas being called, innermost last.
+    running: Vec<Arc<Lambda>>,
+    /// Whether `.z.vs` is being called, which does not call itself.
+    watching: bool,
+    /// Where the last error not yet trapped arose, for `.Q.trp`.
+    backtrace: Vec<K>,
+    /// The views being computed.
+    viewing: Vec<SymId>,
+    /// What the statements have printed.
+    pub messages: Vec<Event>,
     /// Suppress WAL/replication recording while replaying a log or installing a snapshot.
     pub replaying: bool,
 }
@@ -261,13 +321,49 @@ impl From<KError> for StepErr {
 
 impl<'a> Engine<'a> {
     pub fn new(ws: &'a mut Workspace, session: &'a mut SessionState) -> Self {
+        crate::display::apply(session.display);
         Self {
             ws,
             session,
             locals: Vec::new(),
             table_scopes: Vec::new(),
+            running: Vec::new(),
+            backtrace: Vec::new(),
+            watching: false,
+            viewing: Vec::new(),
             messages: Vec::new(),
             replaying: false,
+        }
+    }
+
+    /// What has been printed since the last call.
+    pub(crate) fn take_messages(&mut self) -> Vec<Event> {
+        std::mem::take(&mut self.messages)
+    }
+
+    /// Print: for a client's or a server's message, straight to the process's console; else with the results.
+    pub(crate) fn print(&mut self, printed: Event) {
+        match self.session.client {
+            Some(_) => printed.print(),
+            None => self.messages.push(printed),
+        }
+    }
+
+    /// The value of a message as a connection sends them: code, or a function (or its name) and its arguments.
+    pub fn eval_message(&mut self, msg: &K) -> KResult<K> {
+        match msg {
+            K::Char(c) => self.eval_str(&(*c as char).to_string()),
+            K::Vector(ColVec::Char(_, code)) => self.eval_str(&String::from_utf8_lossy(code)),
+            K::Vector(ColVec::General(_, items)) if !items.is_empty() => {
+                let function = match &items[0] {
+                    K::Sym(s) => self.get_var(*s)?,
+                    K::Vector(ColVec::Char(_, code)) => self.eval_str(&String::from_utf8_lossy(code))?,
+                    other => other.clone(),
+                };
+                let args: Vec<Option<K>> = items[1..].iter().cloned().map(Some).collect();
+                self.apply_value(&function, &args)
+            }
+            other => Ok(other.clone()),
         }
     }
 
@@ -301,14 +397,15 @@ impl<'a> Engine<'a> {
                 return events;
             }
         };
-        for s in &stmts {
-            match self.eval_expr(s) {
+        for (i, s) in stmts.iter().enumerate() {
+            let result = self.eval_expr(s);
+            events.append(&mut self.messages);
+            match result {
                 Ok(val) => {
-                    for m in self.messages.drain(..) {
-                        events.push(Event::Message(m));
-                    }
-                    // kdb+ prints nothing for a top-level assignment
-                    if !matches!(val, K::Null) && !matches!(s, Expr::Assign { .. }) {
+                    // kdb+ prints nothing for a top-level assignment, nor for a line that ends with a semicolon (which
+                    // the parser follows with `::`)
+                    let silent = matches!(s, Expr::Assign { .. }) || matches!(stmts.get(i + 1), Some(Expr::Lit(K::Null)));
+                    if !matches!(val, K::Null) && !silent {
                         if let Some(rs) = k_to_resultset(&val) {
                             events.push(Event::Rows(rs));
                         } else {
@@ -317,9 +414,6 @@ impl<'a> Engine<'a> {
                     }
                 }
                 Err(e) => {
-                    for m in self.messages.drain(..) {
-                        events.push(Event::Message(m));
-                    }
                     events.push(Event::Error(e));
                     break;
                 }
@@ -329,7 +423,9 @@ impl<'a> Engine<'a> {
     }
 
     pub fn has_partitioned(&self, name: SymId) -> bool {
-        self.ws.partitioned.contains_key(&name)
+        // (a local of the name takes its place, as in reading the name)
+        let local = self.locals.last().is_some_and(|f| f.contains_key(&name));
+        !local && self.ws.partitioned.contains_key(&name)
     }
 
     pub fn resolve_table_for_query(&mut self, name: SymId, where_clauses: &[Expr], needed: Option<&[SymId]>) -> KResult<K> {
@@ -370,6 +466,10 @@ impl<'a> Engine<'a> {
     }
 
     pub fn set_global(&mut self, name: SymId, val: K) -> KResult<()> {
+        if let Some(file) = resolve(name).strip_prefix(':') {
+            self.ws.writable()?;
+            return storage::save_path(self.ws, file, &val);
+        }
         let qname = self.qualify(name);
         self.set_globals(vec![(qname, Some(val))])
     }
@@ -384,6 +484,19 @@ impl<'a> Engine<'a> {
     pub fn write_globals(&mut self, writes: Vec<(SymId, Write)>) -> KResult<()> {
         let logged = !self.replaying && (self.ws.persist.get_mut().is_ok_and(|p| p.is_some()) || self.ws.replicator.get_mut().is_ok_and(|r| r.is_some()));
         self.ws.writable()?;
+        if self.ws.host.cluster.load(Ordering::SeqCst) {
+            let refused = |w: &(SymId, Write)| !matches!(w.1, Write::Value(None)) && NOT_ON_A_CLUSTER.contains(&resolve(w.0).as_str());
+            if let Some((name, _)) = writes.iter().find(|w| refused(w)) {
+                return Err(KError::nyi(format!("{} on a cluster", resolve(*name))));
+            }
+        }
+        // `.z.vs` hears of each global set in the root namespace
+        let watched = !self.replaying && !self.watching;
+        let watcher = watched.then(|| self.ws.vars.get(&intern(".z.vs")).cloned()).flatten();
+        let set: Vec<SymId> = match watcher {
+            Some(_) => writes.iter().filter(|w| !matches!(w.1, Write::Value(None)) && !resolve(w.0).starts_with('.')).map(|w| w.0).collect(),
+            None => vec![],
+        };
         // every change must find the value it was made from before any of them is logged or made
         for (name, write) in &writes {
             if matches!(write, Write::Change(c) if !self.ws.vars.get(name).is_some_and(|v| crate::delta::fits(v, c))) {
@@ -426,13 +539,28 @@ impl<'a> Engine<'a> {
             self.ws.views.remove(&name);
             self.ws.unlogged.remove(&name);
             match write {
-                Write::Value(Some(val)) => drop(self.ws.vars.insert(name, val)),
+                Write::Value(Some(val)) => {
+                    // a value assigned to the name of a mounted table takes its place
+                    if self.ws.partitioned.contains_key(&name) {
+                        self.ws.partitioned.remove(&name);
+                    }
+                    self.ws.vars.insert(name, val);
+                }
                 Write::Value(None) => drop(self.ws.vars.remove(&name)),
                 Write::Change(changes) => {
                     if let Some(value) = self.ws.vars.get_mut(&name) {
                         crate::delta::patch(value, &changes);
                     }
                 }
+            }
+        }
+        if let Some(watcher) = watcher {
+            for name in set {
+                self.watching = true;
+                let none = K::Vector(ColVec::General(Attr::None, Arc::new(vec![])));
+                let heard = self.apply_value(&watcher, &[Some(K::Sym(name)), Some(none)]);
+                self.watching = false;
+                heard?;
             }
         }
         Ok(())
@@ -504,6 +632,10 @@ impl<'a> Engine<'a> {
         if let Some(sys_val) = self.eval_builtin_ns(&s)? {
             return Ok(sys_val);
         }
+        // (a file, named by `insert`, an amend or a query, holds a value as a global does)
+        if let Some(file) = s.strip_prefix(':') {
+            return storage::load_path(self.ws, file);
+        }
 
         // 4. Current namespace or root global variable / view / partitioned table
         let qname = self.qualify(name);
@@ -530,12 +662,69 @@ impl<'a> Engine<'a> {
             return Ok(K::Table(Arc::new(flip)));
         }
 
+        if let Some(namespace) = self.namespace(&s) {
+            return Ok(namespace);
+        }
+        // the partitions mounted are listed under the name of their column, such as `date`
+        if let Some(values) = self.partition_values(Some(name), false) {
+            return Ok(values);
+        }
+        if s == "csv" {
+            return Ok(K::Char(b','));
+        }
         Err(KError::value(s))
+    }
+
+    /// The dictionary of the namespace `name` (`.` is the root), if there is one.
+    fn namespace(&self, name: &str) -> Option<K> {
+        let prefix = match name {
+            "." => String::new(),
+            n if n.starts_with('.') => format!("{n}."),
+            _ => return None,
+        };
+        let mut held: Vec<(String, K)> = self.ws.vars.iter().filter_map(|(&n, v)| {
+            let full = resolve(n);
+            let rest = full.strip_prefix(&prefix)?;
+            (!rest.contains('.')).then(|| (rest.to_string(), v.clone()))
+        }).collect();
+        if held.is_empty() && !prefix.is_empty() {
+            return None;
+        }
+        held.sort_by(|a, b| a.0.cmp(&b.0));
+        let (names, values): (Vec<String>, Vec<K>) = held.into_iter().unzip();
+        let keys = ColVec::Sym(Attr::None, Arc::new(names.iter().map(|n| intern(n)).collect()));
+        Some(K::Dict(Arc::new(Dict { keys: Box::new(K::Vector(keys)), vals: Box::new(K::Vector(ColVec::General(Attr::None, Arc::new(values)))) })))
+    }
+
+    /// `key` of a name: the keys of what it holds, the names in a namespace, or the namespaces (`` key ` ``).
+    fn key_of_name(&mut self, name: SymId) -> KResult<K> {
+        let text = resolve(name);
+        let symbols = |mut names: Vec<String>| {
+            names.sort();
+            names.dedup();
+            K::Vector(ColVec::Sym(Attr::None, Arc::new(names.iter().map(|n| intern(n)).collect())))
+        };
+        if text.is_empty() {
+            let spaces = self.ws.vars.keys().filter_map(|&n| resolve(n).strip_prefix('.')?.split_once('.').map(|(ns, _)| ns.to_string()));
+            return Ok(symbols(spaces.chain(["q".to_string(), "Q".to_string(), "h".to_string()]).collect()));
+        }
+        if let Some(K::Dict(space)) = self.namespace(&text) {
+            return Ok((*space.keys).clone());
+        }
+        match self.get_var(name) {
+            Ok(value @ (K::Dict(_) | K::KeyedTable(_))) => ops::eval_unary_prim("key", &value),
+            Ok(_) => Ok(K::Sym(name)),
+            Err(_) => Ok(K::Vector(ColVec::General(Attr::None, Arc::new(vec![])))),
+        }
     }
 
     /// A view's value, which is kept for every reader. So it is computed from global names only, those of the view's own
     /// namespace first: the columns of a query or the variables of a function that reads it first play no part.
     fn eval_view(&mut self, view: &ViewDef) -> KResult<K> {
+        if self.viewing.contains(&view.name) {
+            return Err(KError::new("loop", format!("the view `{} depends on itself", resolve(view.name))));
+        }
+        self.viewing.push(view.name);
         let name = resolve(view.name);
         let ns = name.rfind('.').filter(|_| name.starts_with('.')).map_or("", |dot| &name[..dot]);
         let saved_ns = std::mem::replace(&mut self.session.current_ns, ns.to_string());
@@ -543,7 +732,31 @@ impl<'a> Engine<'a> {
         let value = self.eval_expr(&view.expr);
         (self.table_scopes, self.locals) = saved;
         self.session.current_ns = saved_ns;
+        self.viewing.pop();
         value
+    }
+
+    /// `.z.b`: for each name that views read, the views that read it.
+    fn dependencies(&self) -> K {
+        let mut views: Vec<&ViewDef> = self.ws.views.values().collect();
+        views.sort_by_key(|v| resolve(v.name));
+        let mut read: Vec<(SymId, Vec<SymId>)> = vec![];
+        for view in views {
+            view.expr.any(&mut |e| {
+                if let Expr::Var(name) = e {
+                    match read.iter().position(|r| r.0 == *name) {
+                        Some(i) if !read[i].1.contains(&view.name) => read[i].1.push(view.name),
+                        Some(_) => {}
+                        None if !crate::parser::is_builtin_verb(&resolve(*name)) => read.push((*name, vec![view.name])),
+                        None => {}
+                    }
+                }
+                false
+            });
+        }
+        let (names, by): (Vec<SymId>, Vec<K>) = read.into_iter().map(|(n, by)| (n, K::Vector(ColVec::Sym(Attr::None, Arc::new(by))))).unzip();
+        let keys = K::Vector(ColVec::Sym(Attr::None, Arc::new(names)));
+        K::Dict(Arc::new(Dict { keys: Box::new(keys), vals: Box::new(K::Vector(ColVec::General(Attr::None, Arc::new(by)))) }))
     }
 
     fn eval_builtin_ns(&self, s: &str) -> KResult<Option<K>> {
@@ -581,10 +794,17 @@ impl<'a> Engine<'a> {
                 Ok(Some(K::Time(ms)))
             }
             ".z.K" => Ok(Some(K::Float(4.1))),
+            ".Q.pv" | ".Q.PV" | ".Q.pf" | ".Q.pt" => Ok(self.partition_info(s)),
+            ".z.b" => Ok(Some(self.dependencies())),
+            ".z.s" => Ok(self.running.last().map(|lam| K::Func(Func::Lambda(lam.clone())))),
             ".z.i" => Ok(Some(K::Int(std::process::id() as i32))),
             ".z.u" => Ok(Some(K::Sym(intern(&self.session.login)))),
+            _ if s.starts_with(".z.") && self.system_value(s).is_some() => Ok(self.system_value(s)),
             ".z.o" => Ok(Some(K::Sym(intern(if cfg!(windows) { "w64" } else if cfg!(target_os = "macos") { "m64" } else { "l64" })))),
-            ".Q.en" | ".Q.dpft" | ".Q.s" | ".kix.dist" | ".kix.objects" | ".kix.def" => Ok(Some(K::Func(Func::Prim(intern(s))))),
+            // a variable of the same name takes the place of a built-in of these namespaces
+            _ if [".Q.", ".h.", ".j.", ".kix."].iter().any(|ns| s.starts_with(ns)) && !self.ws.vars.contains_key(&intern(s)) => {
+                Ok(namespaces::arity(s).map(|_| K::Func(Func::Prim(intern(s)))).or_else(|| namespaces::constant(s)))
+            }
             _ => Ok(None),
         }
     }
@@ -617,7 +837,10 @@ impl<'a> Engine<'a> {
                     }
                 }
                 let v = self.eval_step(base)?;
-                Ok(ops::eval_field(&v, *field)?)
+                match v.tag() {
+                    Some(tag) if tag.source != Source::List => Ok(self.follow(tag, &v, *field)?),
+                    _ => Ok(ops::eval_field(&v, *field)?),
+                }
             }
 
             Expr::List(items) => {
@@ -626,7 +849,7 @@ impl<'a> Engine<'a> {
                 for (i, item) in items.iter().enumerate().rev() {
                     vals[i] = self.eval_step(item)?;
                 }
-                Ok(K::Vector(ColVec::from_atoms(vals)))
+                Ok(rows::collapse(vals))
             }
 
             Expr::TableLit { keys, vals } => {
@@ -667,7 +890,7 @@ impl<'a> Engine<'a> {
                 let rval = self.eval_step(rhs)?;
                 // Special case: `0N ! x` prints `x` and returns `x`!
                 if op_name == "!" && matches!(&**lhs, Expr::Lit(K::Long(NULL_LONG))) {
-                    self.messages.push(rval.q_repr());
+                    self.print(Event::Message(rval.q_repr()));
                     return Ok(rval);
                 }
                 let lval = self.eval_step(lhs)?;
@@ -693,6 +916,13 @@ impl<'a> Engine<'a> {
                     if op_s == "!" && args.len() == 4 {
                         return Ok(self.eval_functional_update(args)?);
                     }
+                    if op_s == ";" {
+                        let mut last = K::Null;
+                        for statement in args.iter().flatten() {
+                            last = self.eval_step(statement)?;
+                        }
+                        return Ok(last);
+                    }
                 }
                 // Evaluate arguments right-to-left (preserving `None` for projection slots!)
                 let mut evaled: Vec<Option<K>> = vec![None; args.len()];
@@ -702,6 +932,11 @@ impl<'a> Engine<'a> {
                     }
                 }
                 let tval = self.eval_step(target)?;
+                if let (K::Func(Func::Prim(s)), [Some(c), Some(a), Some(b)]) = (&tval, evaled.as_slice()) {
+                    if resolve(*s) == "?" {
+                        return Ok(ops::choose(c, a, b)?);
+                    }
+                }
                 Ok(self.apply_value(&tval, &evaled)?)
             }
 
@@ -719,18 +954,30 @@ impl<'a> Engine<'a> {
                     self.record_ops(vec![LogOp::SetView { def: vdef.clone() }])?;
                     self.ws.vars.remove(&qname);
                     self.ws.views.insert(qname, vdef);
+                    self.ws.invalidate_views();
                     return Ok(K::Null);
                 }
 
                 let rhs = self.eval_step(val)?;
                 let final_val = if let Some(op_sym) = op {
                     let cur = self.get_var(*name)?;
-                    self.eval_binary_dispatch(&resolve(*op_sym), &cur, &rhs)?
+                    match (resolve(*op_sym).as_str(), &cur, &rhs) {
+                        // what is added to an enumeration is enumerated first
+                        (",", K::Vector(ColVec::Enum(tag, _)), more) => {
+                            let more = self.enumerate(*tag, more)?;
+                            self.eval_binary_dispatch(",", &cur, &more)?
+                        }
+                        (",", K::Vector(list), more) if !matches!(list, ColVec::General(..)) && more.type_num().abs() != list.type_num() && more.count() > 0 => {
+                            return Err(KError::ty("what is added must have the type of the list").into());
+                        }
+                        (",", K::Table(_), _) => self.append_to_table(&cur, &rhs, false)?.0,
+                        (op, ..) => self.eval_binary_dispatch(op, &cur, &rhs)?,
+                    }
                 } else {
                     rhs
                 };
 
-                if !*global && !self.locals.is_empty() {
+                if self.locals.last().is_some_and(|f| !*global || f.contains_key(name)) {
                     self.locals.last_mut().unwrap().insert(*name, final_val.clone());
                 } else {
                     self.set_global(*name, final_val.clone())?;
@@ -874,8 +1121,18 @@ impl<'a> Engine<'a> {
                 syms.sort();
                 Ok(K::Vector(ColVec::Sym(Attr::Sorted, Arc::new(syms))))
             }
+            "key" if matches!(x, K::Sym(s) if !resolve(*s).starts_with(':')) => {
+                let K::Sym(name) = x else { unreachable!() };
+                self.key_of_name(*name)
+            }
+            "key" if matches!(x, K::Sym(_)) => self.key_of_path(x),
+            "fkeys" | "meta" | "cols" | "iasc" | "idesc" if matches!(x, K::Sym(_)) => {
+                let K::Sym(table) = x else { unreachable!() };
+                let table = self.get_var(*table)?;
+                ops::eval_unary_prim(name.as_str(), &table)
+            }
             "show" => {
-                self.messages.push(x.q_repr());
+                self.print(Event::Message(crate::display::console(x)));
                 Ok(K::Null)
             }
             "get" => self.eval_get(x),
@@ -883,48 +1140,84 @@ impl<'a> Engine<'a> {
             "eval" => self.eval_tree(x),
             "hopen" => self.eval_hopen(x),
             "hclose" => self.eval_hclose(x),
-            "hcount" => storage::hcount(x),
+            "hcount" => storage::hcount(self.ws, x),
+            "hsym" => files::hsym(x),
+            "hdel" => self.hdel(x),
+            "read0" => self.read_file(x, true),
+            "read1" => self.read_file(x, false),
+            "save" => self.save(x),
+            "rsave" => self.rsave(x),
+            "load" | "rload" => self.load(x),
             "system" => {
                 let s = x.as_str().ok_or_else(|| KError::ty("system expects string"))?;
+                let s = s.trim();
                 let (cmd, arg) = match s.find(char::is_whitespace) {
                     Some(p) => (&s[..p], s[p..].trim()),
-                    None => (s.as_str(), ""),
+                    None => (s, ""),
                 };
                 self.eval_sys_cmd(cmd, arg)
             }
             "value" => {
+                if let K::Vector(ColVec::General(_, items)) = x {
+                    let applied = match items.first() {
+                        Some(K::Func(f)) => Some(K::Func(f.clone())),
+                        Some(K::Sym(name)) => Some(self.get_var(*name)?),
+                        // (a function as its source, as a client may send it)
+                        Some(K::Vector(ColVec::Char(_, source))) if items.len() > 1 => Some(self.eval_str(&String::from_utf8_lossy(source))?),
+                        _ => None,
+                    };
+                    if let Some(f) = applied {
+                        let args: Vec<Option<K>> = items[1..].iter().cloned().map(Some).collect();
+                        return self.apply_value(&f, &args);
+                    }
+                }
+                if let K::Func(Func::Proj { func, args, .. }) = x {
+                    let mut parts = vec![K::Func((**func).clone())];
+                    parts.extend(args.iter().map(|a| a.clone().unwrap_or(K::Null)));
+                    return Ok(K::Vector(ColVec::General(Attr::None, Arc::new(parts))));
+                }
+                if let K::Func(Func::Adverb { inner, .. }) = x {
+                    return Ok(K::Func((**inner).clone()));
+                }
                 if let K::Vector(ColVec::Char(_, bs)) = x {
                     let code = String::from_utf8_lossy(bs).into_owned();
                     self.eval_str(&code)
                 } else if let K::Sym(s) = x {
-                    if resolve(*s).starts_with(':') {
-                        self.eval_get(x)
-                    } else {
-                        self.get_var(*s)
-                    }
+                    self.get_var(*s)
                 } else {
                     ops::eval_unary_prim("value", x)
                 }
-            }
-            ".Q.s" => Ok(K::string(&x.q_repr())),
-            ".kix.objects" => crate::inspect::workspace_objects_table(self.ws),
-            ".kix.def" => {
-                let target = x.as_str().unwrap_or_else(|| x.cell_text());
-                crate::inspect::workspace_definition(self.ws, &target)
             }
             _ => ops::eval_unary_prim(&name, x),
         }
     }
 
     fn eval_binary_dispatch(&mut self, op: &str, lhs: &K, rhs: &K) -> KResult<K> {
+        if let (K::Sym(name), "xasc" | "xdesc" | "xkey" | "xcol" | "xcols") = (rhs, op) {
+            let table = self.get_var(*name)?;
+            let changed = self.eval_binary_dispatch(op, lhs, &table)?;
+            self.set_global(*name, changed)?;
+            return Ok(rhs.clone());
+        }
+        if let Some(result) = self.enum_verb(op, lhs, rhs) {
+            return result;
+        }
         match op {
             "@" => self.apply_value(lhs, &[Some(rhs.clone())]),
-            "each" | "over" | "scan" | "prior" => {
+            // `-1 each lines`, and the same with any handle
+            "each" | "peach" if self.open_handle(lhs).is_some() => {
+                let sent = (0..rhs.count() as i64).map(|i| {
+                    let item = ops::index_k(rhs, &[Some(K::Long(i))])?;
+                    self.apply_value(lhs, &[Some(item)])
+                });
+                Ok(K::Vector(ColVec::from_atoms(sent.collect::<KResult<_>>()?)))
+            }
+            "each" | "peach" | "over" | "scan" | "prior" => {
                 let K::Func(f) = lhs else {
                     return Err(KError::ty(format!("{op} requires a function on its left")));
                 };
                 let kind = match op {
-                    "each" => AdverbKind::Each,
+                    "each" | "peach" => AdverbKind::Each,
                     "over" => AdverbKind::Over,
                     "scan" => AdverbKind::Scan,
                     _ => AdverbKind::EachPrior,
@@ -942,16 +1235,18 @@ impl<'a> Engine<'a> {
             "insert" => self.eval_insert(lhs, rhs),
             "upsert" => self.eval_upsert(lhs, rhs),
             "fby" => self.eval_fby(lhs, rhs),
-            "0:" => storage::zero_colon(lhs, rhs),
-            "1:" => storage::one_colon(lhs, rhs),
+            "0:" => storage::zero_colon(self.ws, lhs, rhs),
+            "1:" => storage::one_colon(self.ws, lhs, rhs),
             "!" => {
                 // `-8!x` (IPC serialize to byte vector), `-9!bytes` (IPC deserialize), `-11!logfile`!
                 if matches!(lhs, K::Long(_) | K::Int(_)) {
                     match lhs.as_i64()? {
+                        -25 => return self.broadcast(rhs),
                         -8 => {
-                            let bytes = crate::ipc::encode_k_payload(rhs);
+                            let bytes = crate::ipc::encode_k_payload(&rhs.untagged());
                             return Ok(K::Vector(ColVec::Byte(Attr::None, Arc::new(bytes))));
                         }
+                        -3 => return Ok(K::string(&rhs.q_repr())),
                         -9 => {
                             let K::Vector(ColVec::Byte(_, bs)) = rhs else {
                                 return Err(KError::ty("-9! expects byte vector"));
@@ -964,7 +1259,6 @@ impl<'a> Engine<'a> {
                 }
                 ops::eval_binary_prim("!", lhs, rhs)
             }
-            ".Q.en" => storage::q_en(lhs, rhs),
             _ => ops::eval_binary_prim(op, lhs, rhs),
         }
     }
@@ -972,30 +1266,27 @@ impl<'a> Engine<'a> {
     pub fn apply_value(&mut self, target: &K, args: &[Option<K>]) -> KResult<K> {
         match target {
             K::Func(f) => self.apply_func_opt(f, args),
+            K::Null if args.len() == 1 => Ok(args[0].clone().unwrap_or(K::Null)),
+            K::Vector(ColVec::General(..)) | K::Dict(_) if args.len() > 1 && matches!(ops::index_k(target, &args[..1]), Ok(K::Func(_))) => {
+                let held = ops::index_k(target, &args[..1])?;
+                self.apply_value(&held, &args[1..])
+            }
             // IPC handle call: `h "select from trade"` (sync) or `(neg h) "upd..."` (async)!
-            K::Int(h) if self.session.handles.contains_key(&h.abs()) => {
+            K::Int(_) | K::Long(_) if self.open_handle(target).is_some() => {
                 let arg = args.first().and_then(|a| a.clone()).unwrap_or(K::Null);
-                let hid = h.abs();
-                let sync = *h > 0;
-                let client = self.session.handles.get_mut(&hid).ok_or_else(|| KError::ipc("closed handle"))?;
-                if sync {
-                    client.query_k(&arg)
-                } else {
-                    client.send_async_k(&arg)?;
-                    Ok(K::Null)
-                }
+                self.apply_handle(self.open_handle(target).unwrap_or_default(), arg)
             }
-            K::Long(h) if (*h as i32 != 0) && self.session.handles.contains_key(&((*h as i32).abs())) => {
-                let hi = *h as i32;
-                self.apply_value(&K::Int(hi), args)
-            }
+            // (a cluster's control node evaluates on a workspace that its clients are not connected to)
+            K::Int(0 | i32::MIN..=-1) if self.ws.host.cluster.load(Ordering::SeqCst) => Err(KError::nyi("sending to a client of a cluster")),
             // Symbol handle one-shot IPC `` `:localhost:5000 "1+1" ``
-            K::Sym(s) if resolve(*s).starts_with("::") || (resolve(*s).starts_with(':') && resolve(*s)[1..].contains(':')) => {
-                let spec = resolve(*s);
-                let addr = spec.trim_start_matches(':');
-                let mut client = crate::ipc::IpcClient::connect_addr(addr, &self.session.login, "")?;
+            K::Sym(s) if resolve(*s).starts_with(':') && files::server_address(&resolve(*s)).is_some() => {
+                let mut client = self.connect_to(&resolve(*s)).unwrap_or_else(|| Err(KError::ipc("not a server")))?;
                 let arg = args.first().and_then(|a| a.clone()).unwrap_or(K::Null);
                 client.query_k(&arg)
+            }
+            K::Sym(s) if !resolve(*s).starts_with(':') => {
+                let named = self.get_var(*s)?;
+                self.apply_value(&named, args)
             }
             other => ops::index_k(other, args),
         }
@@ -1030,7 +1321,15 @@ impl<'a> Engine<'a> {
         let vals: Vec<K> = args.iter().map(|a| a.clone().unwrap_or(K::Null)).collect();
         match func {
             Func::Prim(sym) => self.call_prim(*sym, &vals),
-            Func::Lambda(lam) => self.call_lambda(lam, &vals),
+            Func::Lambda(lam) => {
+                self.running.push(lam.clone());
+                let result = self.call_lambda(lam, &vals);
+                if result.is_err() && self.backtrace.is_empty() {
+                    self.backtrace = self.frames();
+                }
+                self.running.pop();
+                result
+            }
             Func::Proj { func: inner, args: bound, .. } => {
                 let mut merged: Vec<Option<K>> = Vec::with_capacity(bound.len());
                 let mut vi = 0usize;
@@ -1071,9 +1370,8 @@ impl<'a> Engine<'a> {
                 let n = resolve(*s);
                 match n.as_str() {
                     "aj" | "aj0" | "ej" | "ssr" => 3,
-                    "wj" | "wj1" | ".Q.dpft" => 4,
-                    ".Q.s" | ".kix.objects" | ".kix.def" => 1,
-                    ".kix.dist" => 2,
+                    "wj" | "wj1" => 4,
+                    _ if namespaces::arity(&n).is_some() => namespaces::arity(&n).unwrap_or(1),
                     _ if is_unary_keyword(&n) => 1,
                     _ => 2,
                 }
@@ -1087,11 +1385,11 @@ impl<'a> Engine<'a> {
             ("aj", 3) => joins::asof_join(&vals[0], &vals[1], &vals[2], true),
             ("aj0", 3) => joins::asof_join(&vals[0], &vals[1], &vals[2], false),
             ("ej", 3) => joins::equi_join(&vals[0], &vals[1], &vals[2]),
+            ("::", 1) => Ok(vals[0].clone()),
             ("ssr", 3) => ops::ssr_op(&vals[0], &vals[1], &vals[2]),
             ("wj", 4) => joins::window_join(&vals[0], &vals[1], &vals[2], &vals[3], true, |f, a| self.apply_func(f, a)),
             ("wj1", 4) => joins::window_join(&vals[0], &vals[1], &vals[2], &vals[3], false, |f, a| self.apply_func(f, a)),
-            (".Q.dpft", 4) => storage::q_dpft(self.ws, &vals[0], &vals[1], &vals[2], &vals[3]),
-            (".kix.dist", 2 | 3) => self.eval_kix_dist(vals),
+            _ if namespaces::arity(&name).is_some() => self.namespace_call(&name, vals),
             ("enlist", 2..) => Ok(K::Vector(ColVec::from_atoms(vals.to_vec()))),
             (_, 1) => self.eval_unary_dispatch(sym, &vals[0]),
             (_, 2) => self.eval_binary_dispatch(&name, &vals[0], &vals[1]),
@@ -1135,7 +1433,7 @@ impl<'a> Engine<'a> {
     }
 
     fn call_lambda(&mut self, lam: &Lambda, vals: &[K]) -> KResult<K> {
-        if vals.len() > lam.params.len() && !(lam.params.is_empty() && vals.len() == 1 && matches!(vals[0], K::Null)) {
+        if vals.len() > lam.params.len() && !(lam.params.is_empty() && vals.len() == 1) {
             return Err(KError::rank(format!(
                 "lambda takes {} argument(s), got {}",
                 lam.params.len(),
@@ -1191,10 +1489,15 @@ impl<'a> Engine<'a> {
                     for i in 0..cv.len() {
                         out.push(self.apply_func(inner, &[cv.get_atom(i)])?);
                     }
-                    Ok(K::Vector(ColVec::from_atoms(out)))
+                    Ok(rows::collapse(out))
                 }
                 2 => {
                     let (a, b) = (&vals[0], &vals[1]);
+                    if matches!(inner, Func::Prim(s) if resolve(*s) == ",") {
+                        if let Some(joined) = rows::beside(a, b) {
+                            return joined;
+                        }
+                    }
                     match (a, b) {
                         (K::Vector(va), K::Vector(vb)) => {
                             if va.len() != vb.len() {
@@ -1246,7 +1549,8 @@ impl<'a> Engine<'a> {
                         for _ in 0..100_000 {
                             let next = self.apply_func(inner, &[cur.clone()])?;
                             if next == cur || next == init {
-                                return Ok(next);
+                                // (a value that comes round to the start was the last of the cycle)
+                                return Ok(if next == cur { next } else { cur });
                             }
                             cur = next;
                         }
@@ -1292,7 +1596,7 @@ impl<'a> Engine<'a> {
                         self.apply_func(inner, &[acc, vals[1].clone()])
                     }
                 }
-                _ => Err(KError::rank("over takes 1 or 2 arguments")),
+                _ => Ok(self.fold_lists(inner, vals)?.pop().unwrap_or_else(|| vals[0].clone())),
             },
 
             AdverbKind::Scan => match vals.len() {
@@ -1358,7 +1662,7 @@ impl<'a> Engine<'a> {
                     }
                     Ok(K::Vector(ColVec::from_atoms(out)))
                 }
-                _ => Err(KError::rank("scan takes 1 or 2 arguments")),
+                _ => Ok(K::Vector(ColVec::from_atoms(self.fold_lists(inner, vals)?))),
             },
 
             AdverbKind::EachPrior => match vals.len() {
@@ -1370,7 +1674,15 @@ impl<'a> Engine<'a> {
                         return Ok(vals[0].clone());
                     }
                     let mut out = Vec::with_capacity(cv.len());
-                    out.push(cv.get_atom(0));
+                    let first = cv.get_atom(0);
+                    out.push(match inner {
+                        // a comparison compares the first item with a null; dividing it by one makes it a float
+                        Func::Prim(s) if matches!(resolve(*s).as_str(), "=" | "~" | "<>" | "<" | "<=" | ">" | ">=") => {
+                            self.apply_func(inner, &[first, cv.null_atom()])?
+                        }
+                        Func::Prim(s) if resolve(*s) == "%" => self.apply_func(inner, &[first, K::Long(1)])?,
+                        _ => first,
+                    });
                     for i in 1..cv.len() {
                         out.push(self.apply_func(inner, &[cv.get_atom(i), cv.get_atom(i - 1)])?);
                     }
@@ -1423,6 +1735,25 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The results of folding `f` over several lists at once, from the seed `args[0]`.
+    fn fold_lists(&mut self, f: &Func, args: &[K]) -> KResult<Vec<K>> {
+        let n = args[1..].iter().filter(|a| matches!(a, K::Vector(_))).map(K::count).max().unwrap_or(1);
+        if args[1..].iter().any(|a| matches!(a, K::Vector(_)) && a.count() != n) {
+            return Err(KError::length("the lists must be equally long"));
+        }
+        let (mut acc, mut results) = (args[0].clone(), vec![]);
+        for i in 0..n {
+            let mut step = vec![acc];
+            step.extend(args[1..].iter().map(|a| match a {
+                K::Vector(v) => v.get_atom(i),
+                atom => atom.clone(),
+            }));
+            acc = self.apply_func(f, &step)?;
+            results.push(acc.clone());
+        }
+        Ok(results)
+    }
+
     /// `@[f; x; err]` (protected evaluation) and `@[d; i; f; [y]]` (functional amend).
     fn eval_trap_or_amend(&mut self, op: &str, args: &[Option<Expr>]) -> Result<K, StepErr> {
         let mut v = Vec::with_capacity(args.len());
@@ -1432,8 +1763,9 @@ impl<'a> Engine<'a> {
                 None => K::Null,
             });
         }
-        // If 3 arguments and `v[0]` is a `Func`, this is protected evaluation `@[f; x; handler]` or `.[f; args_list; handler]`!
-        if v.len() == 3 && matches!(v[0], K::Func(_)) {
+        // If 3 arguments and `v[0]` is a `Func` or an open handle, this is protected evaluation `@[f; x; handler]` or `.[f; args_list; handler]`!
+        let handle = self.open_handle(&v[0]).is_some();
+        if v.len() == 3 && (handle || matches!(v[0], K::Func(_))) {
             let call_res = if op == "@" {
                 self.apply_value(&v[0], &[Some(v[1].clone())])
             } else if let K::Vector(cv) = &v[1] {
@@ -1445,6 +1777,7 @@ impl<'a> Engine<'a> {
             return match call_res {
                 Ok(ok) => Ok(ok),
                 Err(kerr) => {
+                    self.backtrace.clear();
                     if let K::Func(handler) = &v[2] {
                         Ok(self.apply_func(handler, &[K::string(&kerr.signal)])?)
                     } else {
@@ -1456,10 +1789,17 @@ impl<'a> Engine<'a> {
 
         // Functional amend `@[d; i; f]` / `@[d; i; f; y]`!
         if v.len() >= 3 {
+            // `.[name; (); :; y]` sets the name, whatever it holds
+            if let (".", K::Sym(s), 0, K::Func(Func::Prim(assign)), Some(y)) = (op, &v[0], v[1].count(), &v[2], v.get(3)) {
+                if resolve(*assign) == ":" {
+                    self.set_global(*s, y.clone())?;
+                    return Ok(v[0].clone());
+                }
+            }
             let mut inplace_sym = None;
             let base = if let K::Sym(s) = &v[0] {
                 inplace_sym = Some(*s);
-                self.get_var(*s)?
+                self.held(*s)?
             } else {
                 v[0].clone()
             };
@@ -1477,14 +1817,22 @@ impl<'a> Engine<'a> {
                     return Ok(updated);
                 }
             }
-            let idx_list = vec![Some(v[1].clone())];
-            let cur_sub = ops::index_k(&base, &idx_list)?;
-            let new_sub = if v.len() >= 4 {
-                self.apply_func(f, &[cur_sub, v[3].clone()])?
-            } else {
-                self.apply_func(f, &[cur_sub])?
+            // each column of a table that is named is changed by itself, with its part of `y`
+            let named: Vec<K> = match (&base, &v[1]) {
+                (K::Table(_), K::Vector(ColVec::Sym(_, columns))) => columns.iter().map(|&c| K::Sym(c)).collect(),
+                _ => vec![v[1].clone()],
             };
-            let updated = self.amend_in_place(base, &idx_list, None, &new_sub)?;
+            let mut updated = base;
+            for (n, index) in named.iter().enumerate() {
+                let idx_list = [Some(index.clone())];
+                let mut given = vec![ops::index_k(&updated, &idx_list)?];
+                given.extend(v.get(3).map(|y| match y {
+                    K::Vector(parts) if matches!(v[1], K::Vector(_)) && matches!(updated, K::Table(_)) && parts.len() == named.len() => parts.get_atom(n),
+                    all => all.clone(),
+                }));
+                let new_sub = self.apply_func(f, &given)?;
+                updated = self.amend_in_place(updated, &idx_list, None, &new_sub)?;
+            }
             if let Some(s) = inplace_sym {
                 self.set_global(s, updated)?;
                 return Ok(K::Sym(s));
@@ -1502,6 +1850,25 @@ impl<'a> Engine<'a> {
                 None => self.apply_func(f, &[target]),
             };
         };
+        // `::` before further steps stands for every item
+        if matches!(head, K::Null) && !rest.is_empty() {
+            let every = match &target {
+                K::Dict(d) => (*d.keys).clone(),
+                list => ops::til_op(list.count() as i64)?,
+            };
+            let mut target = target;
+            for i in 0..every.count() {
+                let step = ops::index_k(&every, &[Some(K::Long(i as i64))])?;
+                let mut full = vec![step];
+                full.extend_from_slice(rest);
+                let part = match y {
+                    Some(K::Vector(v)) if v.len() == every.count() => Some(v.get_atom(i)),
+                    other => other.cloned(),
+                };
+                target = self.amend_path(target, &full, f, part.as_ref())?;
+            }
+            return Ok(target);
+        }
         let idx = [Some(head.clone())];
         let sub = ops::index_k(&target, &idx)?;
         let new_sub = self.amend_path(sub, rest, f, y)?;
@@ -1519,13 +1886,20 @@ impl<'a> Engine<'a> {
                 Ok(v.clone())
             }
         };
+        // an enumeration is changed as its values are, and what results enumerated again (which checks it)
+        if let K::Vector(ColVec::Enum(tag, values)) = &target {
+            let amended = self.amend_in_place(K::Vector((**values).clone()), indices, op, &rhs.plain())?;
+            return self.enumerate(*tag, &amended);
+        }
         match target {
             K::Vector(mut cv) => {
                 match first {
                     None | Some(K::Null) => {
+                        // a list as long as the target gives each item its value
+                        let each = matches!(rhs, K::Vector(rv) if rv.len() == cv.len());
                         for i in 0..cv.len() {
-                            let cur = cv.get_atom(i);
-                            let nv = apply_op(&cur, rhs, self)?;
+                            let item = if let (true, K::Vector(rv)) = (each, rhs) { rv.get_atom(i) } else { rhs.clone() };
+                            let nv = apply_op(&cv.get_atom(i), &item, self)?;
                             cv.set_at(i, nv)?;
                         }
                     }
@@ -1546,19 +1920,36 @@ impl<'a> Engine<'a> {
                     }
                     _ => return Err(KError::ty("invalid vector index in assignment")),
                 }
-                Ok(K::Vector(cv))
+                Ok(K::Vector(match cv {
+                    ColVec::General(_, items) => ColVec::from_atoms(Arc::unwrap_or_clone(items)),
+                    typed => typed,
+                }))
             }
             K::Dict(d) => {
-                let Some(k) = first.clone() else { return Ok(K::Dict(d)) };
-                let addon = ops::eval_binary_prim("!", &k, rhs)?;
-                if let Some(op_s) = op {
-                    let cur = ops::dict_lookup(&d, &k)?;
-                    let nv = self.eval_binary_dispatch(&resolve(op_s), &cur, rhs)?;
-                    let addon2 = ops::eval_binary_prim("!", &k, &nv)?;
-                    ops::concat_k(&K::Dict(d), &addon2)
-                } else {
-                    ops::concat_k(&K::Dict(d), &addon)
+                let items = |k: &K| -> Vec<K> { (0..k.count()).map(|i| ops::index_k(k, &[Some(K::Long(i as i64))]).unwrap_or(K::Null)).collect() };
+                let (mut keys, mut vals) = (items(&d.keys), items(&d.vals));
+                // the keys to set (all of them when none is named), each with its part of the new value
+                let (named, one) = match first {
+                    None | Some(K::Null) => (keys.clone(), false),
+                    Some(k @ K::Vector(v)) if !matches!(v, ColVec::Char(..)) && !keys.contains(k) => (items(k), false),
+                    Some(k) => (vec![k.clone()], true),
+                };
+                for (n, key) in named.iter().enumerate() {
+                    let value = match rhs {
+                        K::Vector(rv) if !one && rv.len() == named.len() => rv.get_atom(n),
+                        all => all.clone(),
+                    };
+                    match keys.iter().position(|k| k == key) {
+                        Some(i) => vals[i] = apply_op(&vals[i].clone(), &value, self)?,
+                        None => {
+                            let held = ops::dict_lookup(&d, key)?;
+                            vals.push(if op.is_some() { apply_op(&held, &value, self)? } else { value });
+                            keys.push(key.clone());
+                        }
+                    }
                 }
+                let list = |items| Box::new(K::Vector(ColVec::from_atoms(items)));
+                Ok(K::Dict(Arc::new(Dict { keys: list(keys), vals: list(vals) })))
             }
             K::Table(t) => {
                 let mut f = (*t).clone();
@@ -1689,48 +2080,21 @@ impl<'a> Engine<'a> {
         self.eval_expr(&e)
     }
 
-    // ----- Persistence (`set` / `get`) & IPC handles (`hopen` / `hclose`) ---
+    // ----- Persistence (`set` / `get`) ----------------------------------
 
     fn eval_set(&mut self, lhs: &K, rhs: &K) -> KResult<K> {
         let K::Sym(s) = lhs else {
             return Err(KError::ty("set LHS must be a symbol (`var or `:path)"));
         };
-        let target = resolve(*s);
-        if let Some(rel_path) = target.strip_prefix(':') {
-            storage::save_path(self.ws, rel_path, rhs)?;
-            Ok(lhs.clone())
-        } else {
-            self.set_global(*s, rhs.clone())?;
-            Ok(lhs.clone())
-        }
+        self.set_global(*s, rhs.clone())?;
+        Ok(lhs.clone())
     }
 
     fn eval_get(&mut self, x: &K) -> KResult<K> {
         let K::Sym(s) = x else {
             return Err(KError::ty("get expects file symbol (`:path) or variable symbol"));
         };
-        let target = resolve(*s);
-        if let Some(rel_path) = target.strip_prefix(':') {
-            storage::load_path(self.ws, rel_path)
-        } else {
-            self.get_var(*s)
-        }
-    }
-
-    fn eval_hopen(&mut self, x: &K) -> KResult<K> {
-        let spec = x.as_str().ok_or_else(|| KError::ty("hopen expects `:host:port symbol or string"))?;
-        let addr = spec.trim_start_matches(':');
-        let client = crate::ipc::IpcClient::connect_addr(addr, &self.session.login, "")?;
-        let h = self.session.next_handle;
-        self.session.next_handle += 1;
-        self.session.handles.insert(h, client);
-        Ok(K::Int(h))
-    }
-
-    fn eval_hclose(&mut self, x: &K) -> KResult<K> {
-        let h = x.as_i64()? as i32;
-        self.session.handles.remove(&h.abs());
-        Ok(K::Null)
+        self.get_var(*s)
     }
 
     // ----- System Commands (`\a`, `\b`, `\v`, `\f`, `\d`, `\l`, `\t`, `\ts`, `\w`)
@@ -1785,8 +2149,13 @@ impl<'a> Engine<'a> {
                 }
             }
             "t" => {
+                // `\t` shows the timer's interval and `\t 100` sets it
                 if arg.is_empty() {
-                    return Ok(K::Int(0));
+                    return Ok(K::Int(self.ws.host.timer_ms.load(Ordering::SeqCst) as i32));
+                }
+                if let Ok(ms) = arg.parse::<u32>() {
+                    self.ws.host.timer_ms.store(u64::from(ms), Ordering::SeqCst);
+                    return Ok(K::Null);
                 }
                 // `\t:100 expr` runs 100 times!
                 let (iters, code) = if let Some(rest) = arg.strip_prefix(':') {
@@ -1821,6 +2190,14 @@ impl<'a> Engine<'a> {
                 let ms = t0.elapsed().as_millis() as i64;
                 Ok(K::Vector(ColVec::Long(Attr::None, Arc::new(vec![ms, last_bytes as i64]))))
             }
+            // `\x name` removes a variable, and so restores a callback's default
+            "x" => {
+                let name = self.qualify(intern(arg));
+                if self.ws.vars.contains_key(&name) {
+                    self.set_globals(vec![(name, None)])?;
+                }
+                Ok(K::Null)
+            }
             "w" => {
                 let used = self.ws.approx_memory_bytes() as i64;
                 let syms = sym_count() as i64;
@@ -1830,16 +2207,43 @@ impl<'a> Engine<'a> {
                 if arg.is_empty() {
                     return Err(KError::domain("\\l requires a file or directory path"));
                 }
-                let p = std::path::Path::new(arg);
-                if p.is_dir() {
-                    storage::mount_hdb_dir(self.ws, p)?;
+                // (in the workspace's directory, else in the process's)
+                let held = storage::path_of(self.ws, &K::sym(arg))?;
+                let p = if held.exists() { held } else { PathBuf::from(arg) };
+                if p.is_dir() && !p.join(".d").exists() {
+                    // the tables mounted take the place of variables of their names
+                    let mounted = storage::mount_hdb_dir(self.ws, &p)?;
+                    let replaced: Vec<_> = mounted.into_iter().filter(|t| self.ws.vars.contains_key(t)).map(|t| (t, None)).collect();
+                    if !replaced.is_empty() {
+                        self.set_globals(replaced)?;
+                    }
                     Ok(K::Null)
+                } else if p.is_dir() || storage::holds_value(&p) {
+                    // a splayed table or a file holding a value: the variable named after it
+                    self.load(&K::sym(&p.to_string_lossy()))
                 } else {
                     let src = std::fs::read_to_string(p)?;
                     self.eval_str(&src)
                 }
             }
+            "P" | "c" => {
+                let given: Vec<u16> = arg.split_whitespace().map(|n| n.parse().map_err(|_| KError::domain(format!("\\{cmd} takes numbers")))).collect::<KResult<_>>()?;
+                let held = &mut self.session.display;
+                match (cmd, given.as_slice()) {
+                    ("P", []) => return Ok(K::Int(i32::from(held.precision))),
+                    ("c", []) => return Ok(K::Vector(ColVec::Int(Attr::None, Arc::new(vec![i32::from(held.rows), i32::from(held.cols)])))),
+                    ("P", [digits]) => held.precision = (*digits).min(17) as u8,
+                    ("c", [rows, cols]) => (held.rows, held.cols) = (*rows, *cols),
+                    _ => return Err(KError::domain("\\P takes digits, \\c lines and characters")),
+                }
+                crate::display::apply(*held);
+                Ok(K::Null)
+            }
             "\\" => Ok(K::Null),
+            "cd" if arg.is_empty() => Ok(K::string(&self.directory()?.to_string_lossy())),
+            "cd" => Err(KError::nyi("changing the directory")),
+            // (q's own commands are `ts`, `cd` and single characters: any other is the operating system's)
+            _ if cmd.chars().count() > 1 => self.shell(format!("{cmd} {arg}").trim_end()),
             _ => Err(KError::nyi(format!("unknown system command \\{cmd}"))),
         }
     }
