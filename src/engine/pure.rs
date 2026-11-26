@@ -3,7 +3,7 @@
 //! The answer errs towards "no": anything not known to be harmless runs as before, alone. Should a statement taken to
 //! read try to write after all, the copy refuses (`'snapshot`) and it is run again alone.
 use crate::ast::{Expr, QSqlKind};
-use crate::engine::Workspace;
+use crate::engine::{namespaces, Workspace};
 use crate::parser::is_builtin_verb;
 use crate::sym::{intern, resolve, SymId};
 use crate::types::{Func, K};
@@ -36,7 +36,7 @@ impl<'a> Reader<'a> {
             Some(None) => false,
             // a function may do anything
             Some(Some(value)) => !matches!(value, K::Func(_)),
-            None => !text.starts_with('.') || text.starts_with(".z.") || is_builtin_verb(&text),
+            None => !text.starts_with('.') || text.starts_with(".z.") || is_builtin_verb(&text) || namespaces::reads(&text),
         }
     }
 

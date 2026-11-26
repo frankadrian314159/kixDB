@@ -137,9 +137,29 @@ of printed output.
 `` +`c!,1 2 ``). Both round floats to `\P` digits, as `string` does. Files written with `0:` and exported CSV keep every
 digit, unlike kdb+.
 
+## `.Q` and `.j`
+
+| Group | Names |
+| --- | --- |
+| characters, types | `.Q.A .Q.a .Q.an .Q.b6 .Q.n .Q.nA .Q.t .Q.res .Q.k .Q.ty .Q.qt` |
+| text and dates | `.Q.f .Q.fmt .Q.id .Q.dd .Q.s .Q.s1 .Q.addmonths` |
+| encoding | `.Q.btoa .Q.atob .Q.sha1 .Q.gz .Q.j10 .Q.x10 .Q.j12 .Q.x12 .Q.addr` |
+| tables | `.Q.en .Q.dpft .Q.ff .Q.fk .Q.ft .Q.V` |
+| functions | `.Q.fc .Q.fu .Q.ts .Q.trp .Q.trpd .Q.sbt .Q.bt .Q.v` |
+| command line, memory | `.Q.opt .Q.def .Q.x .Q.gc .Q.w` |
+| JSON | `.j.j .j.jd .j.k` |
+
+A variable assigned one of these names takes its place. Where they differ from kdb+:
+
+* A backtrace (`.Q.bt`, and what `.Q.trp` gives its handler) lists the source of the functions that were running,
+  without marking where in each. `.Q.fc` applies its function once, on one thread.
+* `.Q.gc` returns 0: memory is freed as values are dropped. `.Q.w` gives nulls for what is not measured.
+* `.j.j` writes floats to `\P` digits, a keyed table as the array of its rows, and a function as its source.
+
 ## Not implemented
 
 * `ej` only in bracket form.
 * `.Q.en` records a table's symbols but returns the table without enumerating them.
-* `.Q` and `.z` callbacks (`.z.pg`, `.z.ps`, timers), log replay (`-11!`), and the rest
-  of the `.Q` namespace beyond `.Q.en`, `.Q.dpft` and `.Q.s`.
+* `.z` callbacks (`.z.pg`, `.z.ps`, timers), log replay (`-11!`), and the rest of the `.Q` namespace: functions for
+  partitioned databases and files, `.Q.hg` and `.Q.hp` (HTTP), `.Q.host`, `.Q.K`, and kdb+ internals (`.Q.ipc`,
+  `.Q.prf0`, `.Q.rp`, `.Q.m`).

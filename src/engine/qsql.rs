@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Verbs whose argument names things only at run time.
-pub const DYNAMIC: [&str; 5] = ["value", "get", "eval", "reval", "system"];
+pub const DYNAMIC: [&str; 6] = ["value", "get", "eval", "reval", "system", ".Q.v"];
 
 /// Verbs that give one value for the values of a group.
 const AGGREGATES: [&str; 13] =

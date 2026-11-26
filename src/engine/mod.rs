@@ -3,6 +3,8 @@
 pub mod joins;
 pub mod builtins;
 mod enums;
+mod json;
+pub mod namespaces;
 pub mod ops;
 pub mod par;
 pub mod pure;
@@ -251,6 +253,8 @@ pub struct Engine<'a> {
     table_scopes: Vec<TableScope>,
     /// The lambdas being called, innermost last.
     running: Vec<Arc<Lambda>>,
+    /// Where the last error not yet trapped arose, for `.Q.trp`.
+    backtrace: Vec<K>,
     /// The views being computed.
     viewing: Vec<SymId>,
     pub messages: Vec<String>,
@@ -278,6 +282,7 @@ impl<'a> Engine<'a> {
             locals: Vec::new(),
             table_scopes: Vec::new(),
             running: Vec::new(),
+            backtrace: Vec::new(),
             viewing: Vec::new(),
             messages: Vec::new(),
             replaying: false,
@@ -673,7 +678,10 @@ impl<'a> Engine<'a> {
             ".z.i" => Ok(Some(K::Int(std::process::id() as i32))),
             ".z.u" => Ok(Some(K::Sym(intern(&self.session.login)))),
             ".z.o" => Ok(Some(K::Sym(intern(if cfg!(windows) { "w64" } else if cfg!(target_os = "macos") { "m64" } else { "l64" })))),
-            ".Q.en" | ".Q.dpft" | ".Q.s" | ".Q.s1" | ".kix.dist" | ".kix.objects" | ".kix.def" => Ok(Some(K::Func(Func::Prim(intern(s))))),
+            // a variable of the same name takes the place of a built-in of these namespaces
+            _ if [".Q.", ".j.", ".kix."].iter().any(|ns| s.starts_with(ns)) && !self.ws.vars.contains_key(&intern(s)) => {
+                Ok(namespaces::arity(s).map(|_| K::Func(Func::Prim(intern(s)))).or_else(|| namespaces::constant(s)))
+            }
             _ => Ok(None),
         }
     }
@@ -1050,13 +1058,6 @@ impl<'a> Engine<'a> {
                     ops::eval_unary_prim("value", x)
                 }
             }
-            ".Q.s" => Ok(K::string(&format!("{}\n", crate::display::console(x)))),
-            ".Q.s1" => Ok(K::string(&x.q_repr())),
-            ".kix.objects" => crate::inspect::workspace_objects_table(self.ws),
-            ".kix.def" => {
-                let target = x.as_str().unwrap_or_else(|| x.cell_text());
-                crate::inspect::workspace_definition(self.ws, &target)
-            }
             _ => ops::eval_unary_prim(&name, x),
         }
     }
@@ -1119,7 +1120,6 @@ impl<'a> Engine<'a> {
                 }
                 ops::eval_binary_prim("!", lhs, rhs)
             }
-            ".Q.en" => storage::q_en(lhs, rhs),
             _ => ops::eval_binary_prim(op, lhs, rhs),
         }
     }
@@ -1197,6 +1197,9 @@ impl<'a> Engine<'a> {
             Func::Lambda(lam) => {
                 self.running.push(lam.clone());
                 let result = self.call_lambda(lam, &vals);
+                if result.is_err() && self.backtrace.is_empty() {
+                    self.backtrace = self.frames();
+                }
                 self.running.pop();
                 result
             }
@@ -1240,9 +1243,8 @@ impl<'a> Engine<'a> {
                 let n = resolve(*s);
                 match n.as_str() {
                     "aj" | "aj0" | "ej" | "ssr" => 3,
-                    "wj" | "wj1" | ".Q.dpft" => 4,
-                    ".Q.s" | ".Q.s1" | ".kix.objects" | ".kix.def" => 1,
-                    ".kix.dist" => 2,
+                    "wj" | "wj1" => 4,
+                    _ if namespaces::arity(&n).is_some() => namespaces::arity(&n).unwrap_or(1),
                     _ if is_unary_keyword(&n) => 1,
                     _ => 2,
                 }
@@ -1260,8 +1262,7 @@ impl<'a> Engine<'a> {
             ("ssr", 3) => ops::ssr_op(&vals[0], &vals[1], &vals[2]),
             ("wj", 4) => joins::window_join(&vals[0], &vals[1], &vals[2], &vals[3], true, |f, a| self.apply_func(f, a)),
             ("wj1", 4) => joins::window_join(&vals[0], &vals[1], &vals[2], &vals[3], false, |f, a| self.apply_func(f, a)),
-            (".Q.dpft", 4) => storage::q_dpft(self.ws, &vals[0], &vals[1], &vals[2], &vals[3]),
-            (".kix.dist", 2 | 3) => self.eval_kix_dist(vals),
+            _ if namespaces::arity(&name).is_some() => self.namespace_call(&name, vals),
             ("enlist", 2..) => Ok(K::Vector(ColVec::from_atoms(vals.to_vec()))),
             (_, 1) => self.eval_unary_dispatch(sym, &vals[0]),
             (_, 2) => self.eval_binary_dispatch(&name, &vals[0], &vals[1]),
@@ -1648,6 +1649,7 @@ impl<'a> Engine<'a> {
             return match call_res {
                 Ok(ok) => Ok(ok),
                 Err(kerr) => {
+                    self.backtrace.clear();
                     if let K::Func(handler) = &v[2] {
                         Ok(self.apply_func(handler, &[K::string(&kerr.signal)])?)
                     } else {

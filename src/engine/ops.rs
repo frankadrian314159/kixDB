@@ -1329,6 +1329,18 @@ fn fills_op(x: &K) -> KResult<K> {
     Ok(K::Vector(ColVec::from_atoms(out)))
 }
 
+/// The type letter of a column: upper case for a column of lists of one type.
+pub fn column_letter(column: &ColVec) -> char {
+    if let ColVec::General(_, items) = column {
+        if let Some(K::Vector(v)) = items.first() {
+            if !matches!(v, ColVec::General(..)) && items.iter().all(|i| i.type_num() == v.type_num()) {
+                return v.meta_type_char().to_ascii_uppercase();
+            }
+        }
+    }
+    column.meta_type_char()
+}
+
 pub fn meta_op(x: &K) -> KResult<K> {
     let (all_cols, all_vals, key_count) = match x {
         K::Table(t) => (t.cols.clone(), t.vals.clone(), 0usize),
@@ -1342,17 +1354,7 @@ pub fn meta_op(x: &K) -> KResult<K> {
     let mut f_syms = Vec::with_capacity(all_cols.len());
     let mut a_syms = Vec::with_capacity(all_cols.len());
     for cv in &all_vals {
-        // a column of lists of one type shows it in upper case
-        let nested = match cv {
-            ColVec::General(_, items) => match items.first() {
-                Some(K::Vector(v)) if !matches!(v, ColVec::General(..)) && items.iter().all(|i| i.type_num() == v.type_num()) => {
-                    Some(v.meta_type_char().to_ascii_uppercase())
-                }
-                _ => None,
-            },
-            _ => None,
-        };
-        t_chars.push(nested.unwrap_or_else(|| cv.meta_type_char()) as u8);
+        t_chars.push(column_letter(cv) as u8);
         f_syms.push(match cv {
             ColVec::Enum(tag, _) if tag.source != Source::List => tag.domain,
             _ => SymId::EMPTY,
