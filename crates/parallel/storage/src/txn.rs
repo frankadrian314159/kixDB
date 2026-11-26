@@ -4,7 +4,7 @@
 //! like any other, so a restart or a new leader still holds it. Until it is committed or abandoned the shard takes no
 //! other change. **Commit** makes the change and drops the request in one log record. One shard of the change, its
 //! **primary**, also remembers that it committed: it is committed first, so whether it did decides for all of them.
-use crate::{load_changes, mutation_changes, staged_value, Changes};
+use crate::{load_changes, move_changes, mutation_changes, staged_value, Changes};
 use kixdb::engine::Write;
 use kix_shared_ces::wire::{TxnOp, TxnReply, TxnReq};
 use kixdb::ipc::encode_k_payload;
@@ -63,6 +63,7 @@ fn work_out(conn: &mut Connection, ops: &[TxnOp]) -> KResult<(Changes, Vec<Vec<u
                 answers.push(encode_k_payload(&schema));
                 new
             }
+            TxnOp::Move(req) => move_changes(conn, &changes, req)?,
         };
         for (name, write) in new {
             if changes.iter().any(|c| c.0 == name) {

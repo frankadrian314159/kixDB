@@ -17,6 +17,8 @@ path = "src/main.rs"
 mimalloc = "0.1"
 kixdb = { path = "../../.." }
 kix-shared-ces = { path = "../shared-ces" }
+kix-storage = { path = "../storage" }
+kix-raft = { path = "../raft" }
 arrow-flight = "60"
 tonic = "0.14"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time", "signal"] }
@@ -26,8 +28,6 @@ postcard = { version = "1", features = ["alloc"] }
 crc32fast = "1"
 
 [dev-dependencies]
-kix-storage = { path = "../storage" }
-kix-raft = { path = "../raft" }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 rand = "0.8"
 tempfile = "3"

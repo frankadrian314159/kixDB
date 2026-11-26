@@ -10,13 +10,23 @@
 //!
 //! With `--listen` it serves kdb+ IPC clients (`kix --connect`, `kix-gui --connect`, `hopen`) as one database. Without
 //! it, it runs `q` from standard input against the cluster; `--plan` shows on standard error how each statement ran.
-//! Besides `q`, both accept `EXPLAIN query`, `DISTRIBUTE table BY col | PARTITIONED BY col | REPLICATED`, `SHARDS`, `REPLICAS shard`,
-//! `ADD REPLICA shard id host:port` and `REMOVE REPLICA shard id`.
+//! Besides `q`, both accept `EXPLAIN query`, `DISTRIBUTE table BY col | PARTITIONED BY col | REPLICATED`, `SHARDS`,
+//! `ADD SHARD host:port`, `REMOVE SHARD`, `REPLICAS shard`, `ADD REPLICA shard id host:port` and
+//! `REMOVE REPLICA shard id`.
+//!
+//! With `--listen`, `--scale-command PROGRAM --scale-above-mb N --max-shards N` adds shards by itself: while a shard's
+//! variables hold more than N MB, `PROGRAM ID` is run to start shard ID and print its address. `--scale-interval SECS`
+//! (30), `--scale-checks N` (3 in a row), `--scale-cooldown SECS` (300) and `--scale-dry-run` tune it.
+//!
+//! Several control nodes form a group with one master: give each `--control-id N --control-listen HOST:PORT --data DIR`
+//! (and `--control-addr HOST:PORT` if the others reach it elsewhere) with `--listen`. The first takes the shards from
+//! `--config` (or an existing `--state`); the others take `--join HOST:PORT`, the control address of any node of the
+//! group, and no `--config`. Clients may connect to any of them. `CONTROLS` lists them; `REMOVE CONTROL id` removes one.
 //!
 //! `--wait-shards SECS` (30) waits for every shard to answer before starting; `--broadcast-limit ROWS` (100000) is the
 //! largest table a join copies to every shard rather than shuffling. `--request-timeout SECS` (300; 0: none) is how long
 //! a shard may take over a request before the statement fails; a change that fails so may still be made.
-use kix_control::Cluster;
+use kix_control::{Autoscale, Cluster, GroupConfig};
 use kix_shared_ces::metrics::serve_http;
 use kix_shared_ces::tls::{make_certs, TlsFlags};
 use kix_shared_ces::ClusterConfig;
@@ -34,7 +44,10 @@ fn usage() -> ! {
     eprintln!(
         "usage: kix-cluster --config cluster.json [--state FILE] --listen PORT [--bind ADDR] [-u USER:PASSWORD]\n                   \
          [--tls-cert FILE --tls-key FILE | --tls] [--force-tls] [--insecure-clients] [--metrics-listen HOST:PORT]\n                   \
-         [--wait-shards SECS] [--broadcast-limit ROWS] [--request-timeout SECS]\n       \
+         [--wait-shards SECS] [--broadcast-limit ROWS] [--request-timeout SECS]\n                   \
+         [--scale-command PROGRAM --scale-above-mb N --max-shards N [--scale-interval SECS] [--scale-checks N]\n                   \
+         [--scale-cooldown SECS] [--scale-dry-run]]\n                   \
+         [--control-id N --control-listen HOST:PORT --data DIR [--control-addr HOST:PORT] [--join HOST:PORT]]\n       \
          kix-cluster --config cluster.json [--state FILE] [--plan] < script.q\n       \
          kix-cluster --make-certs DIR NAME...\n\
          connections to the shards need --node-ca FILE --node-cert FILE --node-key FILE, or --insecure"
@@ -57,6 +70,9 @@ fn main() -> ExitCode {
     let (mut metrics_listen, mut broadcast_limit, mut request_timeout) = (None::<String>, None::<usize>, None::<u64>);
     let (mut show_plan, mut wait_shards, mut insecure_clients) = (false, 30u64, false);
     let (mut cert, mut key, mut self_signed, mut force_tls) = (None::<String>, None::<String>, false, false);
+    let (mut scale_command, mut scale_above, mut max_shards) = (None::<String>, None::<usize>, None::<usize>);
+    let (mut scale_interval, mut scale_checks, mut scale_cooldown, mut dry_run) = (None::<u64>, None::<u32>, None::<u64>, false);
+    let (mut control_id, mut control_listen, mut control_addr, mut data, mut join) = (None, None, None::<String>, None::<String>, None::<String>);
     let mut tls = TlsFlags::default();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -86,23 +102,58 @@ fn main() -> ExitCode {
             "--request-timeout" => request_timeout = Some(parsed(args.next())),
             "--wait-shards" => wait_shards = parsed(args.next()),
             "--plan" => show_plan = true,
+            "--scale-command" => scale_command = args.next(),
+            "--scale-above-mb" => scale_above = Some(parsed(args.next())),
+            "--max-shards" => max_shards = Some(parsed(args.next())),
+            "--scale-interval" => scale_interval = Some(parsed(args.next())),
+            "--scale-checks" => scale_checks = Some(parsed(args.next())),
+            "--scale-cooldown" => scale_cooldown = Some(parsed(args.next())),
+            "--scale-dry-run" => dry_run = true,
+            "--control-id" => control_id = Some(parsed(args.next())),
+            "--control-listen" => control_listen = Some(parsed(args.next())),
+            "--control-addr" => control_addr = args.next(),
+            "--data" => data = args.next(),
+            "--join" => join = args.next(),
             _ => usage(),
         }
     }
+    let tuned = scale_interval.is_some() || scale_checks.is_some() || scale_cooldown.is_some() || dry_run;
+    let scaling = match (scale_command, scale_above, max_shards) {
+        (Some(command), Some(above), Some(most)) if listen.is_some() => {
+            let mut policy = Autoscale::new(command, above.saturating_mul(1 << 20), most);
+            policy.interval = scale_interval.map_or(policy.interval, |s| Duration::from_secs(s.max(1)));
+            policy.checks = scale_checks.unwrap_or(policy.checks);
+            policy.cooldown = scale_cooldown.map_or(policy.cooldown, Duration::from_secs);
+            policy.dry_run = dry_run;
+            Some(policy)
+        }
+        (None, None, None) if !tuned => None,
+        _ => fail("adding shards by itself needs --listen, --scale-command, --scale-above-mb and --max-shards".into()),
+    };
     // an existing state file knows the shards; otherwise the configuration names them
     let known = state.as_deref().is_some_and(|s| std::path::Path::new(s).exists());
+    let group = match (control_id, control_listen, data) {
+        (Some(id), Some(control), Some(data)) if listen.is_some() => {
+            Some(GroupConfig { id, listen: control, advertise: control_addr, data: data.into(), join, import: state.clone().map(Into::into) })
+        }
+        (None, None, None) if control_addr.is_none() && join.is_none() => None,
+        _ => fail("a control node of a group needs --listen, --control-id, --control-listen and --data".into()),
+    };
     let config = match config {
         Some(path) => ClusterConfig::from_file(&path).unwrap_or_else(|e| fail(format!("{path}: {e}"))),
-        None if known => ClusterConfig::default(),
+        // (a node of a group may have the shards already, or learn them)
+        None if known || group.is_some() => ClusterConfig::default(),
         None => usage(),
     };
     let tls = tls.load().unwrap_or_else(|e| fail(e));
     if tls.is_none() {
         eprintln!("kix-cluster: WARNING: connections to the shards are neither encrypted nor authenticated (--insecure)");
     }
-    let cluster = match &state {
-        Some(path) => Cluster::open_with(path, &config, tls),
-        None => Cluster::connect_with(&config, tls),
+    let grouped = group.is_some();
+    let cluster = match (group, &state) {
+        (Some(group), _) => Cluster::open_group(group, &config, tls),
+        (None, Some(path)) => Cluster::open_with(path, &config, tls),
+        (None, None) => Cluster::connect_with(&config, tls),
     }
     .unwrap_or_else(|e| fail(e.to_string()));
     if let Some(rows) = broadcast_limit {
@@ -111,7 +162,8 @@ fn main() -> ExitCode {
     if let Some(secs) = request_timeout {
         cluster.set_request_timeout(Duration::from_secs(secs));
     }
-    if wait_shards > 0 {
+    // (a group's master waits for the shards when it takes over)
+    if wait_shards > 0 && !grouped {
         if let Err(down) = cluster.wait_for_shards(Duration::from_secs(wait_shards)) {
             let why: String = cluster.status().into_iter().filter_map(Result::err).map(|e| format!("
   {e}")).collect();
@@ -159,10 +211,15 @@ fn main() -> ExitCode {
     }
     let listener = Listener::bind(cluster.gateway(), (bind.as_str(), port), ipc)
         .unwrap_or_else(|e| fail(format!("cannot listen on {bind}:{port}: {e}")));
-    eprintln!("kix-cluster: control node listening on {} (kdb+ IPC), {} shard(s)", listener.local_addr(), cluster.shard_count());
+    match cluster.control_address() {
+        Some(control) => eprintln!("kix-cluster: control node listening on {} (kdb+ IPC) and {control} (its group)", listener.local_addr()),
+        None => eprintln!("kix-cluster: control node listening on {} (kdb+ IPC), {} shard(s)", listener.local_addr(), cluster.shard_count()),
+    }
+    let scaler = scaling.map(|policy| cluster.autoscale(policy));
     wait_for_stop();
     eprintln!("kix-cluster: stopping");
     drop(listener);
+    drop(scaler);
     match cluster.shutdown() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => fail(format!("cannot write the state: {e}")),

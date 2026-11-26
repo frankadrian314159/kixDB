@@ -8,12 +8,12 @@ use kix_shared_ces::arrowconv;
 use kix_shared_ces::metrics::NodeMetrics;
 use kix_shared_ces::pieces::pieces;
 use kix_shared_ces::tls::{self, NodeTls};
-use kix_shared_ces::wire::{self, Fragment, LoadReq, MemberInfo, MemberReq, MutateReq, ShardStatus, ShuffleReq, TxnReply, TxnReq, Work};
+use kix_shared_ces::wire::{self, ForwardReply, ForwardReq, Fragment, LoadReq, PermitReply, PermitReq, MemberInfo, MemberReq, MutateReq, ShardStatus, ShuffleReq, TxnReply, TxnReq, Work};
 use kixdb::ipc::decode_k_payload;
 use kixdb::{KError, KResult, K};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tonic::transport::Channel;
 use tonic::{Code, Status};
@@ -46,6 +46,8 @@ pub struct ShardClient {
     limit: AtomicU64,
     /// When the replica now `current` last served a request, since which nothing failed.
     served: Mutex<Option<Instant>>,
+    /// The term the control node was elected for (0: it is not the master of a group), sent with every request.
+    term: Arc<AtomicU64>,
 }
 
 fn channel(addr: &str, tls: Option<&NodeTls>) -> KResult<(String, Channel)> {
@@ -60,8 +62,14 @@ fn status_of(e: FlightError) -> Status {
     }
 }
 
-fn client(ch: Channel) -> FlightClient {
-    FlightClient::new_from_inner(FlightServiceClient::new(ch).max_decoding_message_size(MAX_MESSAGE).max_encoding_message_size(MAX_MESSAGE))
+/// A client on the channel; the master of a group of control nodes says which it is with its `term`.
+fn client(ch: Channel, term: u64) -> FlightClient {
+    let mut client = FlightClient::new_from_inner(FlightServiceClient::new(ch).max_decoding_message_size(MAX_MESSAGE).max_encoding_message_size(MAX_MESSAGE));
+    if term > 0 {
+        // (a number is always a valid header)
+        let _ = client.add_header(wire::TERM_HEADER, &term.to_string());
+    }
+    client
 }
 
 /// The node did not run the request: another replica may be asked.
@@ -91,15 +99,43 @@ impl ShardClient {
             return Err(KError::new("cluster", "a shard needs an address"));
         }
         let limit = AtomicU64::new(REQUEST_LIMIT.as_millis() as u64);
-        Ok(ShardClient { id, channels: RwLock::new(channels), current: AtomicUsize::new(0), tls, limit, served: Mutex::default() })
+        Ok(ShardClient { id, channels: RwLock::new(channels), current: AtomicUsize::new(0), tls, limit, served: Mutex::default(), term: Arc::default() })
     }
+
+    /// Send with every request the term that `term` then holds.
+    pub fn fenced_by(mut self, term: Arc<AtomicU64>) -> ShardClient {
+        self.term = term;
+        self
+    }
+
+    /// Have the shard refuse control nodes elected before this one.
+    pub async fn fence(&self) -> KResult<()> {
+        self.send(true, wire::ACTION_FENCE, vec![]).await.map(|_| ())
+    }
+
+    /// Take, renew or release a permit to read, at the control node, which must be the master of its group.
+    pub async fn permit(&self, req: &PermitReq) -> KResult<PermitReply> {
+        reply(&self.send(false, wire::ACTION_PERMIT, body(req)?).await?)
+    }
+
+    /// Pass a statement to the control node, which must be the master of its group.
+    pub(crate) async fn forward(&self, req: &ForwardReq) -> KResult<ForwardReply> {
+        reply(&self.send(false, wire::ACTION_FORWARD, body(req)?).await?)
+    }
+
 
     /// Give up on requests the shard has not answered after `limit` (zero: never).
     pub fn set_limit(&self, limit: Duration) {
         self.limit.store(limit.as_millis() as u64, Ordering::Relaxed);
     }
 
-    fn limit(&self) -> Duration {
+    /// Whether any of the comma-separated `addresses` is one of this shard's.
+    pub(crate) fn shares(&self, addresses: &str) -> bool {
+        let known = self.replicas();
+        addresses.split(',').any(|a| known.iter().any(|r| r.0 == a.trim()))
+    }
+
+    pub(crate) fn limit(&self) -> Duration {
         match self.limit.load(Ordering::Relaxed) {
             0 => Duration::MAX,
             ms => Duration::from_millis(ms),
@@ -116,7 +152,7 @@ impl ShardClient {
     }
 
     /// Add a replica's address if it is not known, and return its position.
-    fn learn(&self, addr: &str) -> Option<usize> {
+    pub(crate) fn learn(&self, addr: &str) -> Option<usize> {
         let mut channels = self.channels.write().unwrap_or_else(|e| e.into_inner());
         if let Some(i) = channels.iter().position(|(a, _)| a == addr) {
             return Some(i);
@@ -184,11 +220,11 @@ impl ShardClient {
             _ => self.limit(),
         };
         // a large request goes as pieces, one after another; the answer comes with the last
-        let parts = pieces(kind, payload);
+        let (parts, term) = (pieces(kind, payload), self.term.load(Ordering::SeqCst));
         self.on_leader(idempotent, limit, |ch| {
             let parts = parts.clone();
             async move {
-                let (mut client, mut answer) = (client(ch), vec![]);
+                let (mut client, mut answer) = (client(ch, term), vec![]);
                 for (kind, body) in parts {
                     let mut results = client.do_action(Action::new(kind, body)).await.map_err(status_of)?;
                     answer = results.try_next().await.map_err(status_of)?.map(|b| b.to_vec()).unwrap_or_default();
@@ -219,10 +255,11 @@ impl ShardClient {
 
     /// Evaluate work that is already encoded.
     pub async fn run(&self, ticket: Ticket) -> KResult<K> {
+        let term = self.term.load(Ordering::SeqCst);
         self.on_leader(true, self.limit(), |ch| {
             let ticket = ticket.clone();
             async move {
-                let mut stream = client(ch).do_get(ticket).await.map_err(status_of)?;
+                let mut stream = client(ch, term).do_get(ticket).await.map_err(status_of)?;
                 let mut batches = vec![];
                 while let Some(b) = stream.try_next().await.map_err(status_of)? {
                     batches.push(b);

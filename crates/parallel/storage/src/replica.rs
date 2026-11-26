@@ -12,7 +12,11 @@
 //! replica that fell behind the log is sent the snapshot). **Membership** can change while serving: a new replica joins
 //! as a learner, is caught up, then promoted.
 //!
-//! The leader serves requests only while a majority has recently heard from it and it has applied everything committed.
+//! The leader serves requests only while it has applied everything committed and holds a lease. A leader cut off from the
+//! others does not know it, so a lease also runs by the clock: a leader serves only while a majority of the replicas has
+//! answered it within one and a half election timeouts, and a new leader waits two before it serves. An old leader was
+//! last answered before the others began to wait for its successor's election, at least one timeout long, so its lease
+//! has run out when the successor starts, as long as an answer is less than one and a half timeouts on its way.
 use crate::transport::{self, AddressBook};
 use kix_raft::{Conf, Config, Entry, FileStorage, Member, Msg, NodeId, Raft, Role, Snapshot, Storage};
 use kix_shared_ces::wire::MemberInfo;
@@ -20,7 +24,9 @@ use kix_shared_ces::NodeTls;
 use kixdb::persist::{Replicator, WalRecord};
 use kixdb::{KError, KResult, Server};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -122,6 +128,13 @@ pub struct Replica {
     book: AddressBook,
     addr: String,
     commit_timeout: Duration,
+    /// Set by tests: nothing passes between this replica and the others.
+    cut_off: AtomicBool,
+    /// When each other replica last answered this one as its leader.
+    heard: Mutex<HashMap<NodeId, Instant>>,
+    /// The term this replica was last seen to lead, and since when.
+    leading: Mutex<(u64, Instant)>,
+    election: Duration,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -166,6 +179,10 @@ impl Replica {
             book: book.clone(),
             addr: cfg.addr.clone(),
             commit_timeout: cfg.commit_timeout,
+            cut_off: AtomicBool::new(false),
+            heard: Mutex::default(),
+            leading: Mutex::new((0, Instant::now())),
+            election: Duration::from_millis(cfg.tick_ms.max(1)) * cfg.election_ticks,
         });
         server.set_replicator(Some(Arc::new(Handle(replica.clone()))));
         transport::spawn_sender(cfg.node_id, book, cfg.tls.clone(), orx, replica.inbox.clone());
@@ -178,10 +195,19 @@ impl Replica {
 
     /// Stop taking part in the group.
     pub fn stop(&self) {
+        self.end(None);
+    }
+
+    /// `stop`, and have the engine refuse every change from then on: one made now would be its alone.
+    pub fn leave(&self) {
+        self.end(Some(Arc::new(Left)));
+    }
+
+    fn end(&self, then: Option<Arc<dyn Replicator>>) {
         lock(&self.apply).take();
         let _ = self.inbox.send(Input::Wake);
         self.cv.notify_all();
-        self.server.set_replicator(None);
+        self.server.set_replicator(then);
     }
 
     fn stopped(&self) -> bool {
@@ -195,7 +221,20 @@ impl Replica {
 
     /// A message from a peer.
     pub fn deliver(&self, from: NodeId, msg: Msg) {
-        let _ = self.inbox.send(Input::Message(from, msg));
+        if !self.is_cut_off() {
+            let _ = self.inbox.send(Input::Message(from, msg));
+        }
+    }
+
+    /// For tests: stop (or start again) passing anything to and from the other replicas, as a failed network would.
+    #[doc(hidden)]
+    pub fn cut_off(&self, cut: bool) {
+        self.cut_off.store(cut, Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
+    pub fn is_cut_off(&self) -> bool {
+        self.cut_off.load(Ordering::SeqCst)
     }
 
     pub fn role(&self) -> (Role, u64) {
@@ -221,12 +260,24 @@ impl Replica {
         lock(&self.raft).snapshot_index()
     }
 
-    /// Whether requests can be served: this is the leader, a majority has answered it recently, and it has applied
-    /// everything the group has committed, including an entry of its own term.
+    /// Whether this leader's lease by the clock lets it serve (see the module). A group of one has no other leader to
+    /// give way to or to wait for. (The lease that `Raft` keeps is counted in ticks, which an election does not wait out.)
+    fn leased(&self, raft: &Raft<FileStorage>) -> bool {
+        if raft.conf.voters.len() <= 1 {
+            return true;
+        }
+        let (term, since) = *lock(&self.leading);
+        let heard = lock(&self.heard);
+        let answers = |m: &&Member| m.id == self.node_id || heard.get(&m.id).is_some_and(|at| at.elapsed() < self.election * 3 / 2);
+        term == raft.term && since.elapsed() >= self.election * 2 && raft.conf.voters.iter().filter(answers).count() >= raft.conf.quorum()
+    }
+
+    /// Whether requests can be served: this is the leader, it holds its lease, and it has applied everything the group
+    /// has committed, including an entry of its own term.
     pub fn can_serve(&self) -> bool {
         let r = lock(&self.raft);
         let commit = r.commit_index;
-        if r.role != Role::Leader || !r.has_lease() || r.term_at(commit) != Some(r.term) {
+        if r.role != Role::Leader || !r.has_lease() || r.term_at(commit) != Some(r.term) || !self.leased(&r) {
             return false;
         }
         drop(r);
@@ -246,7 +297,11 @@ impl Replica {
             }
         }
         for m in ready.messages {
-            let _ = self.outbox.send(m);
+            match (self.is_cut_off(), m.1.carries()) {
+                (false, _) => drop(self.outbox.send(m)),
+                (true, Some(upto)) => raft.sent(m.0, upto, false),
+                (true, None) => {}
+            }
         }
         let Some(apply) = lock(&self.apply).clone() else { return };
         if let Some(s) = ready.snapshot {
@@ -275,7 +330,12 @@ impl Replica {
             let mut raft = lock(&self.raft);
             for input in first.ok().into_iter().chain(inbox.try_iter()) {
                 match input {
-                    Input::Message(from, msg) => raft.step(from, msg),
+                    Input::Message(from, msg) => {
+                        if matches!(msg, Msg::AppendReply { term, .. } | Msg::SnapshotReply { term, .. } if term == raft.term) {
+                            lock(&self.heard).insert(from, Instant::now());
+                        }
+                        raft.step(from, msg)
+                    }
                     Input::Sent(to, upto, delivered) => raft.sent(to, upto, delivered),
                     Input::Unfit(unfit) => raft.set_unfit(unfit),
                     Input::Wake => {}
@@ -285,6 +345,12 @@ impl Replica {
             if last_tick.elapsed() >= tick {
                 last_tick = Instant::now();
                 raft.tick();
+            }
+            if raft.role == Role::Leader {
+                let mut leading = lock(&self.leading);
+                if leading.0 != raft.term {
+                    *leading = (raft.term, Instant::now());
+                }
             }
             self.pump(&mut raft);
         }
@@ -401,6 +467,15 @@ impl Replica {
             return Ok(());
         }
         self.change_conf(Instant::now() + self.commit_timeout, |c| c.without(id))
+    }
+}
+
+/// What the engine of a node that has left its group calls before it makes a change.
+struct Left;
+
+impl Replicator for Left {
+    fn propose(&self, _rec: &WalRecord) -> KResult<()> {
+        Err(KError::new("cluster", "this node has left its group"))
     }
 }
 

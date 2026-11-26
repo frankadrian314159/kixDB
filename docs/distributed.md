@@ -57,9 +57,10 @@ From Rust: `Cluster::connect_with(&config, tls)` or `Cluster::open_with(state_fi
 `NodeTls::from_files(..)` (`connect` and `open` use unprotected connections), then `cluster.session()`,
 `session.eval(q)` and `session.last_plan()`. Do not call these from inside a tokio runtime.
 
-**Keep the state file.** It is checksummed (`KXCS` + CRC32), locked against concurrent processes (`cluster.state.lock`),
+**Keep the state file.** It is checksummed (`KXC2` + CRC32), locked against concurrent processes (`cluster.state.lock`),
 and records the shards, table schemas, distribution, and the variables, functions and views of the control node. A control
-node started without it does not know about data already on the shards.
+node started without it does not know about data already on the shards. (A node of a [group](#several-control-nodes)
+keeps its state in `--data` instead.)
 
 ## Security
 
@@ -90,6 +91,65 @@ for them on an address other machines can reach (`--bind`), `kix-cluster` needs 
 `--insecure-clients`. The
 `--metrics-listen` pages are plain HTTP without authentication.
 
+## Several control nodes
+
+Control nodes can form a group. One of them is the **master**, which alone changes anything; every node answers reads
+itself and passes the other statements of its clients to the master. If the master stops, another takes over.
+
+```
+kix-cluster --make-certs certs c1 c2 c3
+# the first: it takes the shards from --config
+kix-cluster --config cluster.json --listen 5000 --control-id 1 --control-listen 10.0.0.1:50060 --data c1 \
+    --node-ca ca.pem --node-cert c1.pem --node-key c1.key
+# each further one names any node of the group, and no --config
+kix-cluster --join 10.0.0.1:50060 --listen 5000 --control-id 2 --control-listen 10.0.0.2:50060 --data c2 \
+    --node-ca ca.pem --node-cert c2.pem --node-key c2.key
+```
+
+```
+CONTROLS                          / number, address, voter, master
+REMOVE CONTROL 1                  / take a node out of the group (then stop it)
+```
+
+A new node asks the node `--join` names, gets the shard configuration, the schemas and all else from the master, and
+gets a vote once it has caught up. `--control-addr` gives the address the others use, if that is not the one it listens
+on. (From Rust: `Cluster::open_group(group, &config, tls)`, `shutdown` to hand over and leave, `halt` to just stop.)
+
+* **Run three** (or five). The group elects its master (Raft) and needs a majority: three survive the loss of one, five
+  of two. **Two survive none**, so that is worse than one. A node that is gone for good still counts until it is
+  removed: remove it, then join another.
+* **Clients may connect to any node,** with kdb+ IPC to one address. When that node stops they must connect to another
+  (a TCP load balancer does this for them).
+* **Reads are spread, changes are not.** A node that is not the master answers a statement itself if it reads tables and
+  changes nothing: it takes a **permit** from the master, waits until its copy of the schemas is as new as the
+  master's, plans the query, merges what the shards send and gives the permit back. While a permit is out no change is
+  made, so a read sees each change whole. A permit lasts 5 s and is renewed for as long as the read goes on: a node
+  that stops while it reads holds changes up for that long at most.
+* **Passed to the master:** whatever changes something, statements that name no table (such as `x`), functional
+  messages, `EXPLAIN`, the cluster commands, and a query that only the master can run, as one that needs a whole table
+  gathered and put to a user's function. A statement passed on must have a result that fits in 256 MB, and costs
+  another round trip (on one machine, 0.5 to 1 ms).
+* **What the nodes share** is schemas, distribution, variables, functions, views and the record of the shards. Each
+  keeps a durable copy in `--data`. A change to any of it waits for a majority.
+* **When the master stops,** the others elect one (about two seconds from a killed master to the next answer, on one
+  machine). Before it takes a statement it has **every** shard refuse the masters before it, finishes or abandons
+  half-made changes and reads where the rows are; so it answers nothing while a shard cannot be reached. What a change
+  was acknowledged to have done is kept. A statement that was running fails with `'cluster`, and may or may not have
+  been made. Stopping a master with Ctrl-C hands over first.
+* **A master that is cut off** from the other control nodes, but still runs, stops answering before its successor
+  serves, as a [replicated shard's leader](#replication) does, so that it never answers with what the successor has
+  since changed. The shards refuse its changes. A master whose majority answers slowly makes statements wait, for up to
+  a second.
+* **Restart a node with the command that started it.** It carries on from `--data`; `--join` is tried once.
+* **Give every node the same settings:** `-u`, TLS, `--request-timeout`, `--broadcast-limit` and the `--scale-` options
+  (only the master adds shards, so each node needs the program).
+* **Callbacks** run on the node a client is connected to. One that sets a global fails on a node that is not the master.
+* **An existing cluster:** start the first node with `--data` and `--state cluster.state`; it takes the state over, once.
+  (A state file of an earlier version must first be opened by a single control node.) Afterwards the shards refuse a
+  control node that is in no group.
+* **Security:** any holder of a node certificate, a shard's too, can join the group, which gives what it already has:
+  everything. With `--insecure`, so can anyone who reaches a `--control-listen` port.
+
 ## Distribution
 
 A table is distributed when it is assigned. The default:
@@ -110,7 +170,8 @@ Declare something else before creating the table, or move an existing one:
 ```
 
 * **Sharded:** the key's value is hashed into one of 1,024 slots, each owned by a shard. Symbols hash by their text.
-* **Partitioned:** an integer or temporal value modulo the number of shards.
+* **Partitioned:** the value of an integer or temporal column, modulo 1,024, picks the slot, so that consecutive days
+  go to different shards.
 * **Co-partitioned** (partitioned by several columns, such as `date` and `sym`): the values are hashed together, so one
   day is spread over the shards and so is one symbol, while the rows of one (day, symbol) pair share a shard. The order
   the columns are named in does not matter.
@@ -157,6 +218,89 @@ Enumerated columns keep their domains on the shards. A shard follows a key into 
 so that table must be **replicated**: a keyed table is sharded by default, so declare it first
 (`DISTRIBUTE kt REPLICATED`). Otherwise following its keys (`key.column`, `` `long$key ``) and adding rows to a table
 that refers to it signal `'nyi`. Values enumerated from a list are checked on the control node, which holds the list.
+
+## Changing the number of shards
+
+```
+ADD SHARD 10.0.0.9:50051          / the address of the new shard (its replicas separated by commas)
+REMOVE SHARD                      / the last one: shards are numbered by position
+```
+
+Both answer with the table that `SHARDS` gives. (From Rust: `cluster.add_shard(address)`, `cluster.remove_shard()`.)
+To add a shard, start it empty with the next `--id` (the number of shards there are) and its own certificate:
+
+```
+kix-cluster --make-certs certs s2
+kix-shard --id 2 --listen 10.0.0.9:50051 --data s2 --node-ca ca.pem --node-cert s2.pem --node-key s2.key
+```
+
+As few of the 1,024 slots move as will even the shards out, with the rows in them; a new shard also gets the replicated
+tables. The rows are first copied, 100,000 at a time, and then one commit across the shards removes them where they were
+and records the new **layout** (which shards there are and what each owns) on shard 0.
+
+* **Statements wait** until the change is done, reads too.
+* **All or nothing.** If a shard fails or the control node stops before the commit, the cluster stays as it was; run the
+  command again (what an attempt left on a new shard is thrown away). If it stops during the commit, nothing is read
+  until every shard has made the change: statements signal `'cluster` (`SHARDS` still answers).
+* **Shard 0 keeps the layout,** which counts for more than the state file or `--config` once the number of shards has
+  changed. After a change, list the new shards in `cluster.json`: while it names another number of shards, none of its
+  addresses are used for shards that the state file knows.
+* **A new shard must be empty,** or hold only what an earlier attempt to add it left. A removed shard is emptied and can
+  be added again.
+* **Memory.** A shard that gives up rows holds them until the commit, and while preparing it holds what it keeps twice.
+  The control node holds the distribution columns of
+  one shard's part of a table at a time. Add shards well before memory runs out.
+* **Removing** a shard rewrites each table that takes rows in, on each shard that stays, as one change: on a replicated
+  shard, keep tables well under 64 MB when removing ([Replication](#replication)). Adding a shard sends the new one its
+  rows in pieces; a shard that gives rows up records only their numbers, unless it gives up half of them or more.
+* A cluster made by an earlier version placed `PARTITIONED` tables differently when its number of shards did not divide
+  1,024. The first start of this version moves their rows (through the control node, which needs room for the largest
+  such table) before serving; every shard must be up. Earlier versions cannot read the state file afterwards.
+
+## Adding shards by itself
+
+```
+kix-cluster ... --listen 5000 --scale-command ./start-shard --scale-above-mb 48000 --max-shards 8
+```
+
+While some shard's variables hold more than `--scale-above-mb`, the control node runs your program to start another
+shard, waits for it to answer and adds it, as `ADD SHARD` does (statements wait while rows move). It never removes one.
+
+**The program** is run on the control node's machine with one argument, the `--id` of the shard wanted. It starts that
+shard, empty, wherever you like, and prints its address (`host:port`, or comma-separated replicas) as its last line,
+then ends with code 0. It must leave the shard running with its output sent elsewhere. A script for one machine:
+
+```sh
+#!/bin/sh
+# start-shard ID
+kix-shard --id "$1" --listen 127.0.0.1:$((50051 + $1)) --data "s$1" \
+    --node-ca certs/ca.pem --node-cert "certs/s$1.pem" --node-key "certs/s$1.key" >"s$1.log" 2>&1 &
+echo "127.0.0.1:$((50051 + $1))"
+```
+
+On Windows it is a `.cmd` file that starts the shard with `start "" /b kix-shard ... >s%1.log 2>&1` and then
+`echo`es the address. Make the certificates of the shards to come beforehand (`kix-cluster --make-certs certs s2 s3
+s4`): `ca.key` stays off the nodes.
+
+| Option | Default | |
+| --- | --- | --- |
+| `--scale-above-mb N` | required | the memory mark of one shard; set it well below what the machine has, as a change needs room |
+| `--max-shards N` | required | never more shards than this |
+| `--scale-interval SECS` | 30 | between checks |
+| `--scale-checks N` | 3 | checks in a row that must find a shard above the mark |
+| `--scale-cooldown SECS` | 300 | the least time between attempts |
+| `--scale-dry-run` | | say what would be done, and do nothing |
+
+* What it does and why is printed on the control node's console; `/metrics` has `kixdb_autoscale_shards_added_total`,
+  `kixdb_autoscale_failures_total` and `kixdb_autoscale_paused`.
+* **It acts only when every shard answers** and no change is waiting for one.
+* **A shard that was started but could not be added** is tried again after the cooldown; the program is not run for
+  that `--id` again until the shard is added or the control node restarts. The program has 5 minutes to end, and the
+  shard as long to answer.
+* **It pauses when adding does not help:** if the fullest shard hardly shrank (one value holds many of its rows, or its
+  memory is in replicated tables, which every shard holds), nothing more is added until no shard is above the mark.
+* Stopping the control node waits for a change of shards under way.
+* From Rust: `cluster.autoscale(Autoscale::new(program, bytes, most))`, which watches until what it returns is dropped.
 
 ## How a statement runs
 
@@ -226,7 +370,8 @@ statement tries at once after a failure, then every 5 seconds.
 
 ## Concurrency
 
-There is one control node. Pushed-down reads and selective partial gathers (`slice`) share the cluster concurrently
+Changes run on one control node (the master of a [group](#several-control-nodes), whose other nodes can answer reads).
+Pushed-down reads and selective partial gathers (`slice`) share the cluster concurrently
 (and temporary `.kix.tmp.*` broadcast/shuffle join tables stay in shard RAM without writing to the WAL or Raft log);
 writes and full-table mirror gathers take exclusive cluster access.
 
@@ -246,6 +391,12 @@ replica stops can fail. Replicas cut their Raft
 log with snapshots (`--snapshot-every`, 5,000 entries, or sooner when the entries since the last reach `--log-limit-mb`,
 256, as the log is held in memory). A cut keeps up to a quarter of `--snapshot-every` entries (at most 1,000, and 4 MB)
 behind it, so that a replica a little way behind is sent entries; one further behind is sent the snapshot.
+
+A leader that is cut off from the others does not know it, so its lease runs by the clock too: it serves only while a
+majority of the replicas has answered it within 0.3 s, and a new leader waits 0.4 s before it serves. So a cut-off leader
+does not answer reads with what its successor has since changed. This assumes that a reply between replicas takes less
+than 0.3 s. While a majority is slower than that, as when each takes in a large change, the leader refuses requests and
+the control node tries again, for up to 8 s.
 
 The leader has one thing on its way to each replica at a time, a snapshot or a batch of log records (a batch takes no
 further record once it holds 4 MB), over a connection of its own; heartbeats go on meanwhile. It is given 2 seconds and
@@ -321,11 +472,14 @@ shards must match.
 
 ## Limits
 
-* **Upgrade the control node and all shards together:** the messages between them change from version to version.
+* **Upgrade the control nodes and all shards together:** the messages between them change from version to version.
 * **Every node is trusted fully.** A certificate of the cluster's authority gives full access to every shard, and
   certificates cannot be revoked one by one (see [Security](#security)).
-* **The control node is a single point of failure**, and gathering needs memory there for the whole table.
-* **The number of shards is fixed** when the cluster is created. There is no rebalancing.
+* **A single control node is a single point of failure** ([several](#several-control-nodes) are not), and gathering
+  needs memory on the control node for the whole table. More control nodes add capacity for reads only.
+* **Statements wait while shards are added or removed** ([Changing the number of shards](#changing-the-number-of-shards)).
+  Shards can be [added by themselves](#adding-shards-by-itself) when memory calls for it; none is removed so.
+* Slots move to even out their number, not the rows in them: one symbol or day with most of the rows stays whole.
 * **Floating point sums** added in two phases can differ from one server's in the last digits.
 * A shard makes one change at a time.
 * A change that is not an append, an assignment to some rows or columns or a removal of rows (a re-sort, for one) is logged and

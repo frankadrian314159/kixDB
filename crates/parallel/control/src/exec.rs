@@ -65,22 +65,27 @@ pub fn concat(parts: Vec<Flip>) -> KResult<Flip> {
 
 /// Put rows that carry ordinals back in order and remove the ordinal column.
 pub fn in_order(parts: Vec<Flip>) -> KResult<Flip> {
+    Ok(with_ordinals(parts)?.0)
+}
+
+/// Rows that carry ordinals, in order, without the ordinal column, and their ordinals.
+pub fn with_ordinals(parts: Vec<Flip>) -> KResult<(Flip, Vec<i64>)> {
     let all = concat(parts)?;
     let at = all.col_idx(intern(ORD_COL)).ok_or_else(|| KError::new("cluster", "a shard returned no row ordinals"))?;
     let ords = match &all.vals[at] {
         ColVec::Long(_, v) => v.clone(),
         _ => Arc::new(vec![]),
     };
-    let mut out = if ords.windows(2).all(|w| w[0] <= w[1]) {
-        all
+    let (mut out, ords) = if ords.windows(2).all(|w| w[0] <= w[1]) {
+        (all, (*ords).clone())
     } else {
         let mut idx: Vec<usize> = (0..all.nrows()).collect();
         idx.sort_by_key(|&r| ords[r]);
-        all.gather(&idx)
+        (all.gather(&idx), idx.iter().map(|&r| ords[r]).collect())
     };
     out.cols.remove(at);
     out.vals.remove(at);
-    Ok(out)
+    Ok((out, ords))
 }
 
 fn flip_of(k: K) -> KResult<(Flip, usize)> {
@@ -98,20 +103,22 @@ fn dict(keys: K, vals: K) -> K {
 impl Inner {
     /// Evaluate the same work on every shard.
     pub(crate) fn all(&self, work: Work) -> KResult<Vec<K>> {
-        let ticket = ticket(work)?;
-        self.wait(try_join_all(self.shards.iter().map(|s| s.run(ticket.clone()))))
+        let (ticket, shards) = (ticket(work)?, self.shards());
+        self.wait(try_join_all(shards.iter().map(|s| s.run(ticket.clone()))))
     }
 
     pub(crate) fn one(&self, shard: usize, e: Expr) -> KResult<K> {
-        self.wait(self.shards[shard].query(Work::Eval(Box::new(e))))
+        self.wait(self.shard(shard)?.query(Work::Eval(Box::new(e))))
     }
 
     pub(crate) fn load_all(&self, req: &LoadReq) -> KResult<()> {
-        self.wait(try_join_all(self.shards.iter().map(|s| s.load(req)))).map(|_| ())
+        let shards = self.shards();
+        self.wait(try_join_all(shards.iter().map(|s| s.load(req)))).map(|_| ())
     }
 
     pub(crate) fn mutate_all(&self, req: &MutateReq) -> KResult<Vec<K>> {
-        self.wait(try_join_all(self.shards.iter().map(|s| s.mutate(req))))
+        let shards = self.shards();
+        self.wait(try_join_all(shards.iter().map(|s| s.mutate(req))))
     }
 
     fn move_table(&self, m: &Move) -> KResult<()> {
@@ -120,13 +127,14 @@ impl Inner {
         empty.cols.push(intern(ORD_COL));
         empty.vals.push(ColVec::Long(Attr::None, Arc::new(vec![])));
         self.load_all(&LoadReq::new(&temp, LoadMode::Replace, &K::Table(Arc::new(empty)), None))?;
-        let peers: Vec<String> = self.shards.iter().map(|s| s.addresses()).collect();
-        let sends = self.shards.iter().enumerate().map(|(me, shard)| {
+        let (shards, slots) = (self.shards(), self.slots());
+        let peers: Vec<String> = shards.iter().map(|s| s.addresses()).collect();
+        let sends = shards.iter().enumerate().map(|(me, shard)| {
             let req = ShuffleReq {
                 scan: augmented(m.source.name),
                 key_cols: m.keys.iter().map(|&k| resolve(k)).collect(),
                 target_table: temp.clone(),
-                slots: self.slots.clone(),
+                slots: (*slots).clone(),
                 peers: peers.clone(),
                 me,
             };

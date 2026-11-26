@@ -40,6 +40,12 @@ fn columns(v: &K) -> Option<Columns<'_>> {
     }
 }
 
+/// Whether a value is what it was, so that nothing need be written.
+pub(crate) fn unchanged(old: &K, new: &K) -> bool {
+    // (functions, which `identical` is in doubt about, are compared as they would be written)
+    identical(old, new) || postcard::to_allocvec(old).ok() == postcard::to_allocvec(new).ok()
+}
+
 /// Whether two values are the same in every bit, attributes included (`false` when in doubt).
 fn identical(a: &K, b: &K) -> bool {
     match (a, b) {

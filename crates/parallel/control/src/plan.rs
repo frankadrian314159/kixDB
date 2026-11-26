@@ -5,7 +5,7 @@
 //! the control node can put together without looking at the rows again: see [`Kind`].
 use crate::catalog::{column_type, Names, Table, EFFECTS};
 use crate::merge::{self, Aggs};
-use kix_shared_ces::route::{shard_for_keys, shard_for_partition};
+use kix_shared_ces::route::shard_of;
 use kixdb::ast::{ColSpec, Expr, QSql, QSqlKind};
 use kixdb::engine::qsql::resolve_col_names;
 use kixdb::engine::DistMode;
@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 /// Stands for the driving table in a relation's source until it is known how the shards are to read it.
 pub const DRIVER: &str = "kix__driver";
 
-/// How rows are placed: by the hash slot of one or more columns, or by a partition value modulo the number of shards.
+/// How rows are placed: in the slot of the hash of one or more columns, or in that of a partition value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Layout {
     Hash(Vec<SymId>),
@@ -43,11 +43,8 @@ impl Layout {
     }
 
     /// The shard of a row with these values of the distribution columns.
-    pub fn place(&self, values: &[K], shards: usize, slots: &[u32]) -> usize {
-        match self {
-            Layout::Hash(_) => shard_for_keys(values, slots),
-            Layout::Part(_) => shard_for_partition(&values[0], shards),
-        }
+    pub fn place(&self, values: &[K], slots: &[u32]) -> usize {
+        shard_of(values, matches!(self, Layout::Part(_)), slots)
     }
 }
 
@@ -136,7 +133,6 @@ struct Scope<'a> {
 pub struct Planner<'a> {
     pub names: Names<'a>,
     pub mirror: &'a mut Connection,
-    pub shards: usize,
     pub slots: &'a [u32],
     pub broadcast_limit: usize,
     /// The number of rows of a distributed table.
@@ -260,7 +256,7 @@ fn restriction(wc: &Expr, cols: &[SymId], schema: &Flip) -> Option<(SymId, Vec<K
 }
 
 /// The single shard of every combination of the columns' values, if there is one.
-fn one_shard(layout: &Layout, fixed: &HashMap<SymId, Vec<K>>, shards: usize, slots: &[u32]) -> Option<usize> {
+fn one_shard(layout: &Layout, fixed: &HashMap<SymId, Vec<K>>, slots: &[u32]) -> Option<usize> {
     let choices = layout.cols().iter().map(|c| fixed.get(c)).collect::<Option<Vec<_>>>()?;
     let combinations = choices.iter().try_fold(1usize, |n, v| n.checked_mul(v.len()))?;
     let mut found = None;
@@ -273,7 +269,7 @@ fn one_shard(layout: &Layout, fixed: &HashMap<SymId, Vec<K>>, shards: usize, slo
                 value
             })
             .collect();
-        let shard = layout.place(&values, shards, slots);
+        let shard = layout.place(&values, slots);
         if found.replace(shard).is_some_and(|other| other != shard) {
             return None;
         }
@@ -288,7 +284,6 @@ pub fn scan_filters(
     cols: &HashSet<SymId>,
     layout: &Layout,
     schema: &Flip,
-    shards: usize,
     slots: &[u32],
 ) -> Filtered {
     let mut out = Filtered { leading: 0, unpinned: layout.cols().to_vec(), route: None };
@@ -307,7 +302,7 @@ pub fn scan_filters(
             fixed.insert(column, values);
         }
         if out.route.is_none() {
-            out.route = one_shard(layout, &fixed, shards, slots);
+            out.route = one_shard(layout, &fixed, slots);
         }
     }
     out
@@ -670,7 +665,7 @@ impl Planner<'_> {
         }
         // clauses on the distribution columns route the query, if nothing before them looks at other rows
         let schema = self.driver_schema(&rel)?;
-        let filtered = scan_filters(&query.where_clauses, &cols, &layout, &schema, self.shards, self.slots);
+        let filtered = scan_filters(&query.where_clauses, &cols, &layout, &schema, self.slots);
         if let Some(shard) = filtered.route {
             return push(Kind::Route(shard), query, rel);
         }

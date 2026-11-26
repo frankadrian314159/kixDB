@@ -6,6 +6,7 @@ use kixdb::ast::Expr;
 use kixdb::ipc::{decode_k_payload, encode_k_payload};
 use kixdb::{KError, K};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tonic::{Code, Status};
 
 pub const ACTION_LOAD: &str = "load";
@@ -16,6 +17,64 @@ pub const ACTION_METRICS: &str = "metrics";
 pub const ACTION_MEMBERS: &str = "members";
 pub const ACTION_RAFT: &str = "raft";
 pub const ACTION_TXN: &str = "txn";
+/// Have a shard refuse, from now on, any control node elected before the one that asks.
+pub const ACTION_FENCE: &str = "fence";
+/// A statement that a control node passes to the master of its group.
+pub const ACTION_FORWARD: &str = "forward";
+
+/// A control node of a group asks the master to let it read, or ends that.
+pub const ACTION_PERMIT: &str = "permit";
+/// How long a permit to read lasts unless it is renewed.
+pub const PERMIT_LIMIT: Duration = Duration::from_secs(5);
+
+/// The master's leave to read: while it lasts, no statement changes anything.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Permit {
+    /// The term the master that gave it was elected for.
+    pub term: u64,
+    pub id: u64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub enum PermitReq {
+    Take,
+    Renew(Permit),
+    Release(Permit),
+}
+
+/// The permit asked about and, for one taken, how far the master's mirror had come: the reader's must be no older.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct PermitReply {
+    pub permit: Permit,
+    pub position: u64,
+}
+
+/// The request header in which the master of a group of control nodes gives the term it was elected for.
+pub const TERM_HEADER: &str = "kix-term";
+/// The shard variable that holds the latest term the shard was fenced with.
+pub const TERM_VAR: &str = ".kix.term";
+
+/// A statement that a control node that is not the master passes to the one that is, with its session's namespace.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ForwardReq {
+    pub namespace: String,
+    pub what: Forwarded,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum Forwarded {
+    Eval(String),
+    /// A functional IPC message, IPC-encoded.
+    Message(Vec<u8>),
+    Explain(String),
+}
+
+/// What the master answers: the namespace the session is then in, and the value (IPC-encoded) or the signal.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ForwardReply {
+    pub namespace: String,
+    pub answer: Result<Vec<u8>, (String, String)>,
+}
 
 /// Message prefix of the status with which a Raft follower redirects to the current leader (followed by its address).
 pub const NOT_LEADER_PREFIX: &str = "NOTLEADER|";
@@ -25,6 +84,16 @@ const ERROR_PREFIX: &str = "KIX|";
 
 /// A column the control node adds to a table slice on its way through a join: the row's global ordinal.
 pub const ORD_COL: &str = "kix__ord";
+
+/// The shard variable of shard 0 that holds the cluster's layout, once the number of shards has changed.
+pub const LAYOUT_VAR: &str = ".kix.layout";
+/// The shard variable that marks a shard that is being added: what it holds may be thrown away.
+pub const JOINING_VAR: &str = ".kix.joining";
+
+/// Where a shard that stays holds the copies of rows that are moving to it, until they are merged into `table`.
+pub fn moving_var(table: &str) -> String {
+    format!(".kix.move.{table}")
+}
 
 /// The shard variable that holds the global row ordinals of a sharded table, parallel to its rows.
 pub fn ord_var(table: &str) -> String {
@@ -85,6 +154,16 @@ impl LoadReq {
 pub enum TxnOp {
     Load(LoadReq),
     Mutate(MutateReq),
+    Move(MoveReq),
+}
+
+/// A shard's part in moving rows as the number of shards changes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum MoveReq {
+    /// Keep only the rows of `table` that the shard, `me`, owns under `slots`, by the values of `cols`.
+    Keep { table: String, cols: Vec<String>, partitioned: bool, slots: Vec<u32>, me: usize },
+    /// Merge the rows copied beside `table` into it, in the order of their ordinals.
+    Merge { table: String },
 }
 
 impl TxnOp {
@@ -93,6 +172,7 @@ impl TxnOp {
         match self {
             TxnOp::Load(req) => &req.table,
             TxnOp::Mutate(req) => &req.table,
+            TxnOp::Move(MoveReq::Keep { table, .. } | MoveReq::Merge { table }) => table,
         }
     }
 

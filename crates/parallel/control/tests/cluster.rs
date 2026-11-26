@@ -421,6 +421,28 @@ fn callbacks_a_cluster_cannot_make_are_refused() {
 }
 
 #[test]
+fn what_a_statement_makes_on_the_control_node_is_kept_as_one_engine_keeps_it() {
+    let mut p = market(2);
+    for statement in [
+        "x: 1; v:: x + count trade",
+        "v",
+        // what was set before a failure stays, in a function too
+        "f: {y:: x; 'oops}; f 5",
+        "y",
+        // (a gathered table is held only while the statement runs)
+        "z: med exec price from trade; z",
+        "m: 0n; {m:: med trade`price}[]; m",
+        "system \"x y\"; y",
+        "x: 10; v",
+        "`trade insert (`oops)",
+        "update bad: price + sym from `trade",
+        "cols trade",
+    ] {
+        p.check(statement);
+    }
+}
+
+#[test]
 fn concurrent_sessions() {
     let p = market(3);
     std::thread::scope(|scope| {

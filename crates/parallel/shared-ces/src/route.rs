@@ -69,11 +69,51 @@ pub fn shard_for_keys(values: &[K], slots: &[u32]) -> usize {
     }
 }
 
-/// Route a temporal/integer partition value (`date`, `month`, `int`) to a shard index (`val mod nshards`).
-pub fn shard_for_partition(val: &K, nshards: usize) -> usize {
-    let n = nshards.max(1) as i64;
-    let v = val.as_i64().unwrap_or(0);
-    v.rem_euclid(n) as usize
+/// The shard of a temporal or integer partition value (`date`, `month`, `int`): the owner of the slot `val mod 1024`,
+/// so that consecutive days go to different shards.
+pub fn shard_for_partition(val: &K, slots: &[u32]) -> usize {
+    let slot = val.as_i64().unwrap_or(0).rem_euclid(SLOTS as i64) as usize;
+    slots.get(slot).copied().unwrap_or(0) as usize
+}
+
+/// The shard of a row with these values of its table's distribution columns, `partitioned` when the table is placed
+/// by the values of one column and not by their hash.
+pub fn shard_of(values: &[K], partitioned: bool, slots: &[u32]) -> usize {
+    match values {
+        [value, ..] if partitioned => shard_for_partition(value, slots),
+        _ => shard_for_keys(values, slots),
+    }
+}
+
+/// The slot map for `shards` shards that moves as few of `slots` as can be: each shard ends with its share. What a shard
+/// has too much of (all of it, if the shard goes) is taken evenly from across its slots, and handed out in turn.
+pub fn rebalanced(slots: &[u32], shards: usize) -> Vec<u32> {
+    let share = |s: usize| SLOTS / shards + usize::from(s < SLOTS % shards);
+    let (mut held, mut free) = (vec![Vec::new(); shards], Vec::new());
+    for (slot, &owner) in slots.iter().enumerate() {
+        held.get_mut(owner as usize).unwrap_or(&mut free).push(slot);
+    }
+    for (s, owned) in held.iter_mut().enumerate() {
+        let (had, excess) = (owned.len(), owned.len().saturating_sub(share(s)));
+        // (from the last, so that the places of those still to be taken stay as they are)
+        free.extend((0..excess).rev().map(|k| owned.remove(k * had / excess)));
+    }
+    free.sort_unstable();
+    let mut new = vec![0; SLOTS];
+    let mut counts: Vec<usize> = held.iter().map(Vec::len).collect();
+    for (s, owned) in held.into_iter().enumerate() {
+        owned.into_iter().for_each(|slot| new[slot] = s as u32);
+    }
+    let mut next = 0;
+    for slot in free {
+        while counts[next % shards] >= share(next % shards) {
+            next += 1;
+        }
+        new[slot] = (next % shards) as u32;
+        counts[next % shards] += 1;
+        next += 1;
+    }
+    new
 }
 
 #[cfg(test)]
@@ -98,6 +138,27 @@ mod tests {
         for c in counts {
             assert!(c > 800 && c < 1200, "skewed distribution: {counts:?}");
         }
+    }
+
+    #[test]
+    fn rebalancing_moves_only_what_it_must() {
+        let mut slots = even_slots(1);
+        for shards in [2, 3, 4, 7, 3, 1, 5] {
+            let new = rebalanced(&slots, shards);
+            let before = slots.iter().max().map_or(1, |&s| s as usize + 1);
+            for s in 0..shards {
+                let owned = new.iter().filter(|&&o| o as usize == s).count();
+                assert!(owned == SLOTS / shards || owned == SLOTS / shards + 1, "{shards} shards: {s} owns {owned}");
+            }
+            // a slot moves only to a shard that is new, or from one that goes
+            for (old, now) in slots.iter().zip(&new) {
+                let (old, now) = (*old as usize, *now as usize);
+                assert!(old == now || now >= before || old >= shards, "{before} to {shards}: {old} to {now}");
+            }
+            slots = new;
+        }
+        // with a number of shards that divides 1,024, partitions go where the value modulo that number says
+        assert!((0..5000).all(|d| shard_for_partition(&K::Long(d), &even_slots(4)) == d as usize % 4));
     }
 
     #[test]

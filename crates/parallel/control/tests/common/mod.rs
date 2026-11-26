@@ -28,6 +28,14 @@ impl Shards {
         Shards { runtime, nodes }
     }
 
+    /// Start one more shard, as number `id`, and give its address.
+    pub fn add(&mut self, id: u32) -> String {
+        let node = self.runtime.block_on(spawn(ShardNode::new(id, Server::new()), "127.0.0.1:0".parse().unwrap())).unwrap();
+        let address = node.addr.to_string();
+        self.nodes.push(node);
+        address
+    }
+
     pub fn config(&self) -> ClusterConfig {
         let shards = self.nodes.iter().enumerate().map(|(i, n)| ShardInfo { id: i as u32, addr: n.addr.to_string() }).collect();
         ClusterConfig { shards }
