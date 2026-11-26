@@ -337,3 +337,81 @@ fn a_group_takes_over_the_state_of_a_node_that_was_alone() {
     s.eval("`t insert (`e; 5)").unwrap();
     assert_eq!(s.eval("t").unwrap().count(), 5);
 }
+
+#[test]
+fn a_master_cut_off_from_the_others_changes_nothing_and_says_nothing_out_of_date() {
+    let mut g = Group::start(2, 3);
+    g.load();
+    g.session(g.master()).eval("events: ([] n: `long$(); sym: `symbol$())").unwrap();
+    for round in 1..=12i64 {
+        let old = g.master();
+        // someone asks the old master all the while, about a variable that its successor then changes
+        let mut asking = g.session(old);
+        let (answered, answers) = std::sync::mpsc::channel();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopping = stop.clone();
+        std::thread::spawn(move || {
+            while !stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                let asked = Instant::now();
+                let Ok(value) = asking.eval("x") else { break };
+                let _ = answered.send((asked, value.as_i64().unwrap()));
+            }
+        });
+        std::thread::sleep(Duration::from_millis(17 * round as u64));
+        g.nodes[&old].cut_off(true);
+        let new = wait("another master", || g.nodes.iter().find(|n| *n.0 != old && n.1.is_master()).map(|n| *n.0));
+        g.session(new).eval(&format!("x: {}", 100 + round)).unwrap();
+        let changed = Instant::now();
+        std::thread::sleep(Duration::from_millis(500));
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let stale: Vec<(Instant, i64)> = answers.try_iter().filter(|a| a.0 > changed && a.1 != 100 + round).collect();
+        assert!(stale.is_empty(), "round {round}: asked {:?} after the change, the old master said {}", stale[0].0 - changed, stale[0].1);
+        // nor does it change anything, and says why
+        if round == 1 {
+            let e = g.session(old).eval("`events insert (1; `a)").unwrap_err();
+            assert!(e.detail.contains("no control node is the master"), "{e}");
+            assert_eq!(g.session(new).eval("count events").unwrap(), K::Long(0));
+        }
+        g.nodes[&old].cut_off(false);
+        wait("the old master to follow", || g.session(old).eval("x").ok().filter(|x| *x == K::Long(100 + round)));
+    }
+}
+
+#[test]
+fn a_master_cut_off_while_it_changes_rows_on_the_shards_cannot_commit() {
+    let g = Group::start(2, 3);
+    let old = g.master();
+    let mut s = g.session(old);
+    s.eval("events: ([] n: `long$(); sym: `symbol$()); `events insert (1 2 3 4 5 6; `a`b`c`d`e`f)").unwrap();
+    let before = g.shards.rows("events");
+    assert!(before.iter().all(|&n| n > 0), "{before:?}");
+    // shard 1 cannot take its part yet: shard 0 prepares, and the statement waits
+    let engine = g.shards.nodes[1].server.clone();
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let (holding, now_held) = std::sync::mpsc::channel();
+    let hold = std::thread::spawn(move || {
+        engine.read_workspace(|_| {
+            holding.send(()).unwrap();
+            held.recv().ok();
+        })
+    });
+    now_held.recv().unwrap();
+    let writer = std::thread::spawn(move || s.eval("`events insert (11 12 13 14 15 16; `a`b`c`d`e`f)"));
+    let shard = g.shards.nodes[0].server.clone();
+    wait("shard 0 to prepare", || shard.connect().eval("value `.kix.txn.pending").ok());
+    let term = g.term();
+    g.nodes[&old].cut_off(true);
+    // the new master fences shard 0 at once, and shard 1 when what the old one asked of it is done
+    wait("shard 0 to be fenced", || (g.term() > term).then_some(()));
+    release.send(()).unwrap();
+    hold.join().unwrap();
+    let e = writer.join().unwrap().unwrap_err();
+    assert!(e.detail.contains("another control node"), "{e}");
+    let new = wait("another master", || g.nodes.iter().find(|n| *n.0 != old && n.1.is_master()).map(|n| *n.0));
+    let mut s = g.session(new);
+    assert_eq!(s.eval("(count events; sum events`n)").unwrap().to_string(), "6 21");
+    assert_eq!(g.shards.rows("events"), before);
+    s.eval("`events insert (7; `a)").unwrap();
+    g.nodes[&old].cut_off(false);
+    wait("the old master to follow", || g.session(old).eval("count events").ok().filter(|n| *n == K::Long(7)));
+}

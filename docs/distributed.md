@@ -130,6 +130,10 @@ on. (From Rust: `Cluster::open_group(group, &config, tls)`, `shutdown` to hand o
   half-made changes and reads where the rows are; so it answers nothing while a shard cannot be reached. What a change
   was acknowledged to have done is kept. A statement that was running fails with `'cluster`, and may or may not have
   been made. Stopping a master with Ctrl-C hands over first.
+* **A master that is cut off** from the other control nodes, but still runs, stops answering within about 0.3 s, and
+  its successor waits 0.4 s before it serves, so that it never answers with what the successor has since changed. The
+  shards refuse its changes. This assumes a reply between control nodes takes less than 0.3 s; a master whose majority
+  answers slowly makes statements wait, for up to a second.
 * **Restart a node with the command that started it.** It carries on from `--data`; `--join` is tried once.
 * **Give every node the same settings:** `-u`, TLS, `--request-timeout`, `--broadcast-limit` and the `--scale-` options
   (only the master adds shards, so each node needs the program).

@@ -537,6 +537,11 @@ impl ShardNode {
         self
     }
 
+    /// The node's place in its group of replicas, if it is one.
+    pub fn replica(&self) -> Option<Arc<Replica>> {
+        self.core.replica.clone()
+    }
+
     pub fn control(&self) -> NodeControl {
         NodeControl { core: self.core.clone() }
     }

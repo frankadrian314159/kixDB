@@ -7,6 +7,7 @@ use crate::{cluster_error, read_state, Cluster, ClusterSession, Inner, State};
 use futures::future::try_join_all;
 use kix_shared_ces::wire::{self, ForwardReply, ForwardReq, Forwarded, MemberInfo, MemberReq, TxnReply, TxnReq};
 use kix_shared_ces::{ClusterConfig, NodeTls};
+use kix_raft::Role;
 use kix_storage::{spawn_on, Replica, ReplicaConfig, RunningShard, ShardNode};
 use kixdb::persist::LogOp;
 use kixdb::sym::intern;
@@ -22,6 +23,14 @@ use tonic::Status;
 const JOIN_LIMIT: Duration = Duration::from_secs(60);
 /// How long a statement waits for there to be a master.
 const NO_MASTER: Duration = Duration::from_secs(10);
+/// How long a statement waits for a leader that has not heard from a majority lately, as when a disk is slow.
+const HEARING: Duration = Duration::from_secs(1);
+/// A master answers only while a majority has answered it this recently, by the clock.
+const LEASE: Duration = Duration::from_millis(300);
+/// How long a new master waits before it takes over: longer than the lease of the one before it can still run, as that
+/// one was last answered before the others began to wait for it (at least `LEASE` under their election timeout), which
+/// leaves 300 ms for an answer to be on its way.
+const OUTLAST: Duration = Duration::from_millis(400);
 /// The mirror variable that records the shards and what each owns.
 const RECORD: &str = ".kix.cluster";
 /// The mirror variable that holds a change of the control node's that goes with a change on the shards which is not yet
@@ -53,7 +62,6 @@ pub(crate) struct Group {
     settled: AtomicU64,
     /// The connection to the master, for the statements passed to it.
     master: Mutex<Option<(String, Arc<ShardClient>)>>,
-    import: Mutex<Option<State>>,
     halted: AtomicBool,
 }
 
@@ -64,9 +72,23 @@ impl Drop for Group {
 }
 
 impl Group {
-    /// The term for which this node is the master now.
+    /// The term for which this node is the master now. A leader that is not ready to serve this moment (it has a change
+    /// to apply, or has not heard from a majority lately) is waited for.
     fn term(&self) -> Option<u64> {
-        (!self.halted.load(Ordering::SeqCst) && self.replica.can_serve()).then(|| self.replica.role().1)
+        let deadline = Instant::now() + HEARING;
+        loop {
+            let (role, term) = self.replica.role();
+            if self.halted.load(Ordering::SeqCst) || role != Role::Leader {
+                return None;
+            }
+            if self.replica.can_serve() && self.replica.heard_lately(LEASE) {
+                return Some(term);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 }
 
@@ -87,7 +109,8 @@ impl Cluster {
         let (state, first) = (group.data.join("state"), group.data.join("first"));
         let known = state.exists();
         let import = match &group.import {
-            Some(path) if !known && path.exists() => match read_state(path)? {
+            // (also when the first node stopped before it had written what it took over)
+            Some(path) if (!known || first.exists()) && path.exists() => match read_state(path)? {
                 (_, true) => return Err(cluster_error("start a single control node on this old state file once before a group takes it over")),
                 (state, false) => Some(state),
             },
@@ -133,9 +156,21 @@ impl Cluster {
         let node = node.with_extension(Box::new(move |kind, body| {
             (kind == wire::ACTION_FORWARD).then(|| weak.upgrade().ok_or_else(|| Status::unavailable("the control node is gone"))?.answer_forwarded(body))
         }));
+        let replica = node.replica().ok_or_else(|| cluster_error("the control node has no replica"))?;
+        // a new group's first node writes the shards it was given, and what it takes over, before any node can join
+        if first.exists() && inner.held::<State>(RECORD)?.is_none() {
+            inner.until_answered(|| replica.can_serve().then_some(()).ok_or_else(not_master), JOIN_LIMIT)?;
+            if let Some(state) = import {
+                let held = Server::new();
+                held.install_state(&state.mirror)?;
+                let blank = Server::new().read_workspace(kixdb::engine::Workspace::snapshot);
+                held.read_workspace(|ws| inner.mirror.connect_internal().adopt(&blank, ws, &[]))?;
+                inner.set_topology(inner.topology_of(&state.shards, state.slots, state.resizes)?);
+            }
+            inner.record()?;
+        }
         let running = inner.wait(spawn_on(node, listener))?;
-        let replica = running.replica.clone().ok_or_else(|| cluster_error("the control node has no replica"))?;
-        let joined = Group { replica, node: Mutex::new(Some(running)), address: address.clone(), settled: AtomicU64::new(0), master: Mutex::default(), import: Mutex::new(import), halted: AtomicBool::new(false) };
+        let joined = Group { replica, node: Mutex::new(Some(running)), address: address.clone(), settled: AtomicU64::new(0), master: Mutex::default(), halted: AtomicBool::new(false) };
         let _ = inner.group.set(joined);
         if let Some(master) = &master {
             // (a node that has run before is in the group, unless an earlier join was cut short: it asks once)
@@ -181,6 +216,14 @@ impl Cluster {
         let node = group.node.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(node) = node {
             self.inner.wait(node.shutdown());
+        }
+    }
+
+    /// For tests: cut this node off from the other control nodes (it still reaches the shards), or end that.
+    #[doc(hidden)]
+    pub fn cut_off(&self, cut: bool) {
+        if let Some(group) = self.inner.group.get() {
+            group.replica.cut_off(cut);
         }
     }
 
@@ -257,20 +300,11 @@ impl Inner {
         if group.settled.load(Ordering::SeqCst) == term {
             return Ok(());
         }
+        // an earlier master, cut off, may still take itself to lead and answer from its copy of the mirror
+        std::thread::sleep(OUTLAST);
         self.term.store(term, Ordering::SeqCst);
-        let imported = group.import.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        match (self.held::<State>(RECORD)?, imported) {
-            (Some(state), _) => self.set_topology(self.topology_of(&state.shards, state.slots, state.resizes)?),
-            // a new group: what a control node that was alone held is written to the log
-            (None, Some(state)) => {
-                let held = Server::new();
-                held.install_state(&state.mirror)?;
-                let blank = Server::new().read_workspace(kixdb::engine::Workspace::snapshot);
-                held.read_workspace(|ws| self.mirror.connect_internal().adopt(&blank, ws, &[]))?;
-                self.set_topology(self.topology_of(&state.shards, state.slots, state.resizes)?);
-            }
-            (None, None) => {}
-        }
+        let state = self.held::<State>(RECORD)?.ok_or_else(|| cluster_error("the group has no record of its shards"))?;
+        self.set_topology(self.topology_of(&state.shards, state.slots, state.resizes)?);
         // shard 0 first: its layout, if it holds one, says which the other shards are
         self.wait(self.shard(0)?.fence())?;
         if let Some(held) = self.fetch_layout()? {
@@ -324,7 +358,8 @@ impl Inner {
             }
             // (the node taken to be the master is first asked whether it is, which is safe to ask of one that has just
             // died: a statement sent to such a node could not safely be sent again)
-            if let Some(client) = group.replica.leader_addr().and_then(|address| self.client_of(group, address).ok()) {
+            let known = group.replica.leader_addr().filter(|_| !group.replica.is_cut_off());
+            if let Some(client) = known.and_then(|address| self.client_of(group, address).ok()) {
                 if self.wait(client.status()).is_ok_and(|s| s.role == "leader") {
                     break client;
                 }
@@ -353,6 +388,9 @@ impl Inner {
 
     /// Run what another control node passed on.
     fn answer_forwarded(self: Arc<Self>, body: &[u8]) -> Result<Vec<u8>, Status> {
+        if self.group.get().is_some_and(|g| g.replica.is_cut_off()) {
+            return Err(Status::unavailable("the control node cannot be reached"));
+        }
         if let Some(group) = self.group.get().filter(|g| g.term().is_none()) {
             let master = group.replica.leader_addr().unwrap_or_default();
             return Err(Status::unavailable(format!("{}{master}", wire::NOT_LEADER_PREFIX)));

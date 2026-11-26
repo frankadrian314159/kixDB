@@ -20,7 +20,9 @@ use kix_shared_ces::NodeTls;
 use kixdb::persist::{Replicator, WalRecord};
 use kixdb::{KError, KResult, Server};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -122,6 +124,10 @@ pub struct Replica {
     book: AddressBook,
     addr: String,
     commit_timeout: Duration,
+    /// Set by tests: nothing passes between this replica and the others.
+    cut_off: AtomicBool,
+    /// When each other replica last answered this one as its leader.
+    heard: Mutex<HashMap<NodeId, Instant>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -166,6 +172,8 @@ impl Replica {
             book: book.clone(),
             addr: cfg.addr.clone(),
             commit_timeout: cfg.commit_timeout,
+            cut_off: AtomicBool::new(false),
+            heard: Mutex::default(),
         });
         server.set_replicator(Some(Arc::new(Handle(replica.clone()))));
         transport::spawn_sender(cfg.node_id, book, cfg.tls.clone(), orx, replica.inbox.clone());
@@ -204,7 +212,20 @@ impl Replica {
 
     /// A message from a peer.
     pub fn deliver(&self, from: NodeId, msg: Msg) {
-        let _ = self.inbox.send(Input::Message(from, msg));
+        if !self.is_cut_off() {
+            let _ = self.inbox.send(Input::Message(from, msg));
+        }
+    }
+
+    /// For tests: stop (or start again) passing anything to and from the other replicas, as a failed network would.
+    #[doc(hidden)]
+    pub fn cut_off(&self, cut: bool) {
+        self.cut_off.store(cut, Ordering::SeqCst);
+    }
+
+    #[doc(hidden)]
+    pub fn is_cut_off(&self) -> bool {
+        self.cut_off.load(Ordering::SeqCst)
     }
 
     pub fn role(&self) -> (Role, u64) {
@@ -223,6 +244,15 @@ impl Replica {
         let conf = self.conf_with_addrs(&lock(&self.raft));
         let info = |voter| move |m: &Member| (m.id, m.addr.clone(), voter);
         conf.voters.iter().map(info(true)).chain(conf.learners.iter().map(info(false))).collect()
+    }
+
+    /// Whether a majority of the voters, this one among them, has answered it as leader within `window`, by the clock.
+    /// (The leader's own lease is counted in ticks, which a successor's election does not wait out.)
+    pub fn heard_lately(&self, window: Duration) -> bool {
+        let raft = lock(&self.raft);
+        let heard = lock(&self.heard);
+        let answers = |m: &&Member| m.id == self.node_id || heard.get(&m.id).is_some_and(|at| at.elapsed() < window);
+        raft.conf.voters.iter().filter(answers).count() >= raft.conf.quorum()
     }
 
     /// The index of the last snapshot (0: none).
@@ -255,7 +285,11 @@ impl Replica {
             }
         }
         for m in ready.messages {
-            let _ = self.outbox.send(m);
+            match (self.is_cut_off(), m.1.carries()) {
+                (false, _) => drop(self.outbox.send(m)),
+                (true, Some(upto)) => raft.sent(m.0, upto, false),
+                (true, None) => {}
+            }
         }
         let Some(apply) = lock(&self.apply).clone() else { return };
         if let Some(s) = ready.snapshot {
@@ -284,7 +318,12 @@ impl Replica {
             let mut raft = lock(&self.raft);
             for input in first.ok().into_iter().chain(inbox.try_iter()) {
                 match input {
-                    Input::Message(from, msg) => raft.step(from, msg),
+                    Input::Message(from, msg) => {
+                        if matches!(msg, Msg::AppendReply { term, .. } | Msg::SnapshotReply { term, .. } if term == raft.term) {
+                            lock(&self.heard).insert(from, Instant::now());
+                        }
+                        raft.step(from, msg)
+                    }
                     Input::Sent(to, upto, delivered) => raft.sent(to, upto, delivered),
                     Input::Unfit(unfit) => raft.set_unfit(unfit),
                     Input::Wake => {}
