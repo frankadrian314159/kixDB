@@ -101,6 +101,18 @@ fn a_follower_given_the_changes_holds_the_same_values() {
         "a:: n + 1",
         "a: 1 2",
         "a,: 3",
+        "a[1]: 7",
+        "a[0]+: 5",
+        "da: `a`b!1 2",
+        "da[`c]: 3",
+        "da[`a]+: 10",
+        "da[`d]+: 4",
+        "da[`b]: `other",
+        "sd: (`long$())!()",
+        "sd[1]: \"one\"",
+        "sd[2]: \"two\"",
+        "words: (\"ab\"; \"cd\")",
+        "words,: enlist \"ef\"",
     ] {
         pair.run(q);
     }
@@ -126,6 +138,12 @@ fn appends_and_column_updates_log_only_what_changed() {
     pair.run("keyed: ([id: til 100000] x: til 100000; y: 0.5 + til 100000)");
     let one_key = pair.run("`keyed upsert (7; 1; 2.0)");
     assert!(one_key < 200, "{one_key}");
+    // an item of a long list, a key of a large dictionary and a new key are logged by themselves
+    pair.run("bd: (til 100000)!til 100000");
+    for q in ["v[7]: 1.0", "bd[7]: 0", "bd[100000]+: 1"] {
+        let size = pair.run(q);
+        assert!(size < 200, "{q}: {size} bytes");
+    }
     let one_column = pair.run("update b: b + 1 from `big");
     assert!((700_000..900_000).contains(&one_column), "{one_column}");
 }

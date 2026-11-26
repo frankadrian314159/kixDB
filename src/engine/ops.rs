@@ -1,12 +1,12 @@
 //! Vectorized unary and binary `q` primitives, casts, aggregations, moving windows, and temporal extractors.
 use crate::error::{KError, KResult};
-use crate::sym::{intern, resolve, with_str, SymId};
+use crate::sym::{intern, resolve, SymId};
 use crate::types::*;
+use foldhash::{HashMap, HashMapExt, HashSet};
 use chrono::Datelike;
 use regex::Regex;
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::ops::Range;
 use crate::engine::{builtins, rows};
@@ -21,7 +21,7 @@ pub fn eval_field(val: &K, field: SymId) -> KResult<K> {
     let val = &*val.plain();
     let fname = resolve(field);
     // Temporal component extraction (`date.year`, `date.mm`, `date.dd`, `time.hh`, `time.uu`, `time.ss`, `time.minute`, `time.second`, `ts.date`, `ts.time`, `ts.minute`)
-    if let Some(extracted) = try_temporal_field(val, &fname) {
+    if let Some(extracted) = try_temporal_field(val, fname) {
         return Ok(extracted);
     }
     match val {
@@ -873,7 +873,9 @@ pub fn iasc_indices(cv: &ColVec, desc: bool) -> Vec<usize> {
             });
         }
         ColVec::Sym(_, xs) => {
-            idx.sort_by(|&a, &b| if desc { xs[b].cmp(&xs[a]) } else { xs[a].cmp(&xs[b]) });
+            // (each name is looked up once)
+            let names: Vec<&str> = xs.iter().map(|&s| resolve(s)).collect();
+            idx.sort_by(|&a, &b| if desc { names[b].cmp(names[a]) } else { names[a].cmp(names[b]) });
         }
         _ => {
             idx.sort_by(|&a, &b| {
@@ -990,13 +992,13 @@ fn str_transform(x: &K, f: &dyn Fn(&str) -> String) -> KResult<K> {
             let s = f(&(*c as char).to_string());
             Ok(K::Char(s.as_bytes().first().copied().unwrap_or(b' ')))
         }
-        K::Sym(s) => Ok(K::Sym(intern(&f(&resolve(*s))))),
+        K::Sym(s) => Ok(K::Sym(intern(&f(resolve(*s))))),
         K::Vector(ColVec::Char(_, bs)) => {
             let s = f(&String::from_utf8_lossy(bs));
             Ok(K::string(&s))
         }
         K::Vector(ColVec::Sym(_, xs)) => {
-            let out: Vec<SymId> = xs.iter().map(|&s| intern(&f(&resolve(s)))).collect();
+            let out: Vec<SymId> = xs.iter().map(|&s| intern(&f(resolve(s)))).collect();
             Ok(K::Vector(ColVec::Sym(Attr::None, Arc::new(out))))
         }
         K::Vector(ColVec::General(_, xs)) => {
@@ -2111,7 +2113,7 @@ fn take_or_attr_op(lhs: &K, rhs: &K) -> KResult<K> {
     // Attribute application: `` `s#x ``, `` `u#x ``, `` `p#x ``, `` `g#x ``, `` `#x ``
     if let K::Sym(s) = lhs {
         let s_str = resolve(*s);
-        if let Some(attr) = Attr::from_sym(&s_str) {
+        if let Some(attr) = Attr::from_sym(s_str) {
             return match rhs {
                 K::Vector(cv) => Ok(K::Vector(cv.with_attr(attr)?)),
                 K::Dict(d) => match &*d.keys {
@@ -2348,14 +2350,14 @@ pub fn cast_op(lhs: &K, rhs: &K) -> KResult<K> {
     if let K::Sym(tsym) = lhs {
         let tname = resolve(*tsym);
         // Temporal component cast `` `year$d ``, `` `mm$d ``, `` `minute$t ``
-        if let Some(part) = try_temporal_field(rhs, &tname) {
+        if let Some(part) = try_temporal_field(rhs, tname) {
             return Ok(part);
         }
-        let temporal = ["date", "month", "time", "second", "minute", "timespan", "timestamp"].contains(&tname.as_str());
+        let temporal = ["date", "month", "time", "second", "minute", "timespan", "timestamp"].contains(&tname);
         if matches!(rhs, K::Datetime(_) | K::Vector(ColVec::Datetime(..))) && temporal {
             return cast_op(lhs, &temporal::convert(rhs, 12));
         }
-        return cast_by_name(&tname, rhs);
+        return cast_by_name(tname, rhs);
     }
 
     // 3. Char cast `"I"$"42"` (uppercase = parse string!), `"i"$3.5` (lowercase = binary/value cast!)
@@ -2856,7 +2858,7 @@ fn like_op(lhs: &K, rhs: &K) -> KResult<K> {
     let inner = Regex::new(inner).map_err(|e| KError::domain(e.to_string()))?;
     let found = |s: &str| if s.contains('\n') { rx.is_match(s) } else { inner.is_match(s) };
     // match the text where it lies, without making a string of it for every item
-    let symbol = |s: SymId| with_str(s, found);
+    let symbol = |s: SymId| found(resolve(s));
     let text = |bs: &[u8]| found(&String::from_utf8_lossy(bs));
     match lhs {
         K::Sym(s) => Ok(K::Bool(symbol(*s))),
@@ -2899,7 +2901,7 @@ pub fn ssr_op(s: &K, pat: &K, rep: &K) -> KResult<K> {
 fn vs_op(lhs: &K, rhs: &K) -> KResult<K> {
     // `"," vs "a,b,c"` -> `("a";"b";"c")`; `` ` vs `a.b.c `` -> `` `a`b`c ``
     if let (K::Sym(sep), K::Sym(target)) = (lhs, rhs) {
-        let d = if sep.is_null() { "." } else { &resolve(*sep) };
+        let d = if sep.is_null() { "." } else { resolve(*sep) };
         let s = resolve(*target);
         let parts: Vec<SymId> = s.split(d).map(intern).collect();
         return Ok(K::Vector(ColVec::Sym(Attr::None, Arc::new(parts))));
@@ -2955,10 +2957,10 @@ fn vs_op(lhs: &K, rhs: &K) -> KResult<K> {
 
 fn sv_op(lhs: &K, rhs: &K) -> KResult<K> {
     if let (K::Sym(sep), K::Vector(ColVec::Sym(_, syms))) = (lhs, rhs) {
-        let joined: Vec<String> = syms.iter().map(|&s| resolve(s)).collect();
+        let joined: Vec<String> = syms.iter().map(|&s| resolve(s).into()).collect();
         // symbols that start with a path are joined into a path
         let path = joined.first().is_some_and(|s| s.starts_with(':'));
-        let d = if !sep.is_null() { &resolve(*sep) } else if path { "/" } else { "." };
+        let d = if !sep.is_null() { resolve(*sep) } else if path { "/" } else { "." };
         return Ok(K::Sym(intern(&joined.join(d))));
     }
     // lines of text, each ended
@@ -3311,16 +3313,14 @@ pub fn table_sort_op(lhs: &K, rhs: &K, desc: bool) -> KResult<K> {
     for s in &sort_cols {
         col_indices.push(flip.col_idx(*s).ok_or_else(|| KError::value(resolve(*s)))?);
     }
-    let mut row_idx: Vec<usize> = (0..flip.nrows()).collect();
-    row_idx.sort_by(|&a, &b| {
-        for &ci in &col_indices {
-            let ord = flip.vals[ci].get_atom(a).k_cmp(&flip.vals[ci].get_atom(b));
-            if ord != Ordering::Equal {
-                return if desc { ord.reverse() } else { ord };
-            }
-        }
-        a.cmp(&b)
-    });
+    // by the last column first: each grade keeps the order of equals that the ones before it made
+    let mut row_idx = vec![];
+    for (n, &ci) in col_indices.iter().rev().enumerate() {
+        row_idx = match n {
+            0 => iasc_indices(&flip.vals[ci], desc),
+            _ => iasc_indices(&flip.vals[ci].gather(&row_idx), desc).into_iter().map(|i| row_idx[i]).collect(),
+        };
+    }
     let mut sorted = flip.gather(&row_idx);
     if !desc {
         if let Some(&first_ci) = col_indices.first() {
@@ -3529,11 +3529,8 @@ pub fn dict_lookup(d: &Dict, key: &K) -> KResult<K> {
     let K::Vector(keys_cv) = &*d.keys else {
         return Err(KError::ty("corrupt dictionary keys"));
     };
-    let target_hk = key.hash_key();
-    for i in 0..keys_cv.len() {
-        if keys_cv.get_atom(i).hash_key() == target_hk {
-            return index_k(&d.vals, &[Some(K::Long(i as i64))]);
-        }
+    if let Some(i) = keys_cv.position(key) {
+        return index_k(&d.vals, &[Some(K::Long(i as i64))]);
     }
     // (with sorted keys, a missing key has the value of the greatest key below it)
     if keys_cv.attr() == Attr::Sorted {

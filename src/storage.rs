@@ -170,7 +170,7 @@ pub fn write_splayed_table(dir: &Path, flip: &Flip) -> KResult<()> {
     write_flat_k(&dir.join(".d"), &d_vec)?;
     for (col_sym, col_vec) in flip.cols.iter().zip(&flip.vals) {
         let col_name = resolve(*col_sym);
-        write_flat_k(&dir.join(&col_name), &K::Vector(col_vec.clone()))?;
+        write_flat_k(&dir.join(col_name), &K::Vector(col_vec.clone()))?;
     }
     Ok(())
 }
@@ -368,12 +368,12 @@ fn match_partition_predicate(
     };
     let op_s = resolve(*op);
     let no_cols = |e: &Expr| !e.any(&mut |x| matches!(x, Expr::Var(s) | Expr::Field(_, s) if table_cols.contains(s)));
-    let rhs_expr = match (&**lhs, &**rhs, op_s.as_str()) {
+    let rhs_expr = match (&**lhs, &**rhs, op_s) {
         (Expr::Var(c), r, _) if *c == part_col && no_cols(r) => r,
         (l, Expr::Var(c), "=") if *c == part_col && no_cols(l) => l,
         _ => return Ok(None),
     };
-    match op_s.as_str() {
+    match op_s {
         "=" => {
             let v = eval_rhs(rhs_expr)?;
             Ok(Some(Box::new(move |pv| pv.k_cmp(&v) == std::cmp::Ordering::Equal)))
@@ -446,7 +446,7 @@ pub fn delimited_lines(delimiter: char, flip: &Flip) -> K {
         false => s,
     };
     let line = |cells: Vec<String>| K::string(&cells.join(&delimiter.to_string()));
-    let mut lines = vec![line(flip.cols.iter().map(|&c| field(resolve(c))).collect())];
+    let mut lines = vec![line(flip.cols.iter().map(|&c| field(resolve(c).into())).collect())];
     lines.extend((0..flip.nrows()).map(|r| line(flip.vals.iter().map(|c| field(c.get_atom(r).data_text())).collect())));
     K::Vector(ColVec::General(Attr::None, Arc::new(lines)))
 }

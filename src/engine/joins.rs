@@ -6,8 +6,8 @@ use crate::engine::ops::{first_rows, group_ids};
 use crate::error::{KError, KResult};
 use crate::sym::{intern, resolve, SymId};
 use crate::types::*;
+use foldhash::{HashMap, HashMapExt};
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Numbers for the rows of the key columns `left` and of `right` such that equal keys share one. The keys of `right` are

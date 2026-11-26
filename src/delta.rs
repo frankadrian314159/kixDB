@@ -30,10 +30,14 @@ pub struct Removed {
     pub attrs: Vec<Attr>,
 }
 
-/// The columns of a vector (just itself) or a table, with the column names.
+/// The columns of a vector (just itself), a dictionary of lists (keys and values) or a table, with the column names.
 fn columns(v: &K) -> Option<Columns<'_>> {
     match v {
         K::Vector(c) => Some((vec![c], [&[], &[]])),
+        K::Dict(d) => match (&*d.keys, &*d.vals) {
+            (K::Vector(keys), K::Vector(vals)) => Some((vec![keys, vals], [&[], &[]])),
+            _ => None,
+        },
         K::Table(f) => Some((f.vals.iter().collect(), [&f.cols, &[]])),
         K::KeyedTable(t) => Some((t.keys.vals.iter().chain(&t.vals.vals).collect(), [&t.keys.cols, &t.vals.cols])),
         _ => None,
@@ -176,7 +180,12 @@ fn extend(col: &mut ColVec, at: u64, tail: &ColVec) -> bool {
         ($($v:ident)*) => {
             match (col, tail) {
                 $((ColVec::$v(attr, x), ColVec::$v(new, y)) if x.len() as u64 == at => {
-                    Arc::make_mut(x).extend_from_slice(y);
+                    // (an empty column takes the tail itself, unless that holds much room to spare)
+                    if x.is_empty() && y.capacity() <= y.len() + y.len() / 8 {
+                        *x = y.clone();
+                    } else {
+                        Arc::make_mut(x).extend_from_slice(y);
+                    }
                     *attr = *new;
                     true
                 })*
@@ -187,10 +196,17 @@ fn extend(col: &mut ColVec, at: u64, tail: &ColVec) -> bool {
     on!(General Bool Guid Byte Short Int Long Real Float Char Sym Timestamp Month Date Datetime Timespan Minute Second Time)
 }
 
-/// The columns of a vector or table, to change.
+/// The columns of a vector, dictionary of lists or table, to change.
 fn columns_mut(value: &mut K) -> Option<Vec<&mut ColVec>> {
     Some(match value {
         K::Vector(c) => vec![c],
+        K::Dict(d) => {
+            let d = Arc::make_mut(d);
+            match (&mut *d.keys, &mut *d.vals) {
+                (K::Vector(keys), K::Vector(vals)) => vec![keys, vals],
+                _ => return None,
+            }
+        }
         K::Table(f) => Arc::make_mut(f).vals.iter_mut().collect(),
         K::KeyedTable(t) => {
             let t = Arc::make_mut(t);
@@ -231,7 +247,7 @@ pub fn remove(value: &mut K, removed: &Removed) -> bool {
 }
 
 /// Set rows of a column of the type of `values`.
-fn set(col: &mut ColVec, rows: &[u64], values: &ColVec) -> bool {
+pub(crate) fn set(col: &mut ColVec, rows: &[u64], values: &ColVec) -> bool {
     if rows.len() != values.len() || rows.iter().any(|&r| r >= col.len() as u64) {
         return false;
     }

@@ -28,7 +28,7 @@ const ITEMWISE_BINARY: [&str; 17] =
     ["+", "-", "*", "%", "=", "<>", "<", "<=", ">", ">=", "&", "|", "and", "or", "div", "mod", "^"];
 
 fn is_one_of(op: SymId, verbs: &[&str]) -> bool {
-    verbs.contains(&resolve(op).as_str())
+    verbs.contains(&resolve(op))
 }
 
 /// Whether row `r` of `e` depends only on row `r` of `flip`'s columns.
@@ -69,7 +69,7 @@ impl<'a> Engine<'a> {
                 false
             });
         }
-        let dynamic = names.iter().any(|&n| DYNAMIC.contains(&resolve(n).as_str()) || self.reaches_names(n));
+        let dynamic = names.iter().any(|&n| DYNAMIC.contains(&resolve(n)) || self.reaches_names(n));
         (!dynamic).then_some(names)
     }
 
@@ -121,24 +121,24 @@ impl<'a> Engine<'a> {
                 let values = self.row_values(flip, rows, arg)?;
                 let verb = resolve(*op);
                 per_group(&|g| match distinct {
-                    true => eval_unary_prim(&verb, &distinct_op(&K::Vector(values.gather(g)))?),
-                    false => aggregate_rows(&verb, &values, g),
+                    true => eval_unary_prim(verb, &distinct_op(&K::Vector(values.gather(g)))?),
+                    false => aggregate_rows(verb, &values, g),
                 })
             }
             Expr::Binary { op, lhs, rhs } if is_one_of(*op, &["wsum", "wavg"]) => {
                 let (r, l) = (self.row_values(flip, rows, rhs)?, self.row_values(flip, rows, lhs)?);
                 let verb = resolve(*op);
-                per_group(&|g| eval_binary_prim(&verb, &K::Vector(l.gather(g)), &K::Vector(r.gather(g))))
+                per_group(&|g| eval_binary_prim(verb, &K::Vector(l.gather(g)), &K::Vector(r.gather(g))))
             }
             Expr::Unary { op, arg } if is_one_of(*op, &ITEMWISE_UNARY) => {
                 let (x, verb) = (atoms(self.by_groups(flip, rows, groups, arg)?)?, resolve(*op));
-                broadcast_atoms(&x, &K::Null, |a, _| eval_unary_prim(&verb, a)).ok()
+                broadcast_atoms(&x, &K::Null, |a, _| eval_unary_prim(verb, a)).ok()
             }
             Expr::Binary { op, lhs, rhs } if is_one_of(*op, &ITEMWISE_BINARY) => {
                 let r = atoms(self.by_groups(flip, rows, groups, rhs)?)?;
                 let l = atoms(self.by_groups(flip, rows, groups, lhs)?)?;
                 let verb = resolve(*op);
-                broadcast_atoms(&l, &r, |a, b| eval_binary_prim(&verb, a, b)).ok()
+                broadcast_atoms(&l, &r, |a, b| eval_binary_prim(verb, a, b)).ok()
             }
             _ => None,
         }
@@ -654,16 +654,16 @@ impl<'a> Engine<'a> {
                         return Err(KError::ty(format!("a {} value in a {} column", sub_cv.type_name(), held.type_name())));
                     }
                 }
-                let typed_null = sub_cv.null_atom();
-                let mut atoms: Vec<K> = if let Some(ex) = work.col(cname) {
-                    (0..total).map(|r| ex.get_atom(r)).collect()
-                } else {
-                    vec![typed_null; total]
-                };
-                for (j, &orig_r) in active_rows.iter().enumerate() {
-                    atoms[orig_r] = sub_cv.get_atom(j);
+                let mut new_cv = work.col(cname).cloned().unwrap_or_else(|| ColVec::repeat(sub_cv.null_atom(), total));
+                let rows: Vec<u64> = active_rows.iter().map(|&r| r as u64).collect();
+                if matches!(new_cv, ColVec::General(..)) || !crate::delta::set(&mut new_cv, &rows, &sub_cv) {
+                    let mut atoms: Vec<K> = (0..total).map(|r| new_cv.get_atom(r)).collect();
+                    for (j, &orig_r) in active_rows.iter().enumerate() {
+                        atoms[orig_r] = sub_cv.get_atom(j);
+                    }
+                    new_cv = ColVec::from_atoms(atoms);
                 }
-                let new_cv = ColVec::from_atoms(atoms);
+                new_cv.set_attr_unchecked(Attr::None);
                 if let Some(pos) = work.col_idx(cname) {
                     work.vals[pos] = new_cv;
                 } else {
@@ -784,7 +784,7 @@ impl<'a> Engine<'a> {
     }
 
     /// The incoming rows as a flip of the table's columns (keys first), and the rows the table has.
-    fn incoming_rows(&mut self, target: &K, rows: &K) -> KResult<(Flip, usize)> {
+    pub(crate) fn incoming_rows(&mut self, target: &K, rows: &K) -> KResult<(Flip, usize)> {
         let full = match target {
             K::Table(t) => (**t).clone(),
             K::KeyedTable(kt) => kt.unkey(),

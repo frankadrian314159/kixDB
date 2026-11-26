@@ -62,7 +62,7 @@ pub fn constant(name: &str) -> Option<K> {
 fn lines(x: &K) -> Vec<String> {
     match x {
         K::Vector(ColVec::General(_, items)) => items.iter().map(|i| i.as_str().unwrap_or_else(|| i.cell_text())).collect(),
-        K::Vector(ColVec::Sym(_, names)) => names.iter().map(|&n| resolve(n)).collect(),
+        K::Vector(ColVec::Sym(_, names)) => names.iter().map(|&n| resolve(n).into()).collect(),
         one => vec![one.as_str().unwrap_or_else(|| one.cell_text())],
     }
 }
@@ -190,7 +190,7 @@ impl Engine<'_> {
         let block = |tag: &str| wrap(tag, &lines(x).iter().map(|l| format!("{l}\n")).collect::<String>());
         let anchor = |target: &str| {
             let href = match x {
-                K::Sym(s) => resolve(*s),
+                K::Sym(s) => resolve(*s).into(),
                 other => format!("\"{}\"", text(other)),
             };
             K::string(&format!("<a{target} href={href}>{}</a>", text(y)))

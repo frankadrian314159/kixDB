@@ -2,7 +2,7 @@
 use crate::engine::ops::{self, index_k};
 use crate::error::{KError, KResult};
 use crate::types::*;
-use std::collections::{HashMap, HashSet};
+use foldhash::{HashMap, HashSet, HashSetExt};
 use std::sync::Arc;
 
 /// A key standing for each row of `t`, equal for equal rows.

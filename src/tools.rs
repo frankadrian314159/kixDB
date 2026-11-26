@@ -24,7 +24,7 @@ pub fn format_flip(f: &Flip, max_rows: usize) -> String {
         return "()".into();
     }
     let show_rows = f.nrows().min(max_rows);
-    let headers: Vec<String> = f.cols.iter().map(|&c| resolve(c)).collect();
+    let headers: Vec<String> = f.cols.iter().map(|&c| resolve(c).into()).collect();
     let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count().max(1)).collect();
     let mut grid: Vec<Vec<String>> = Vec::with_capacity(show_rows);
 
@@ -68,8 +68,8 @@ pub fn format_flip(f: &Flip, max_rows: usize) -> String {
 pub fn format_keyed_table(kt: &KeyedTable, max_rows: usize) -> String {
     let total = kt.nrows();
     let show_rows = total.min(max_rows);
-    let k_headers: Vec<String> = kt.keys.cols.iter().map(|&c| resolve(c)).collect();
-    let v_headers: Vec<String> = kt.vals.cols.iter().map(|&c| resolve(c)).collect();
+    let k_headers: Vec<String> = kt.keys.cols.iter().map(|&c| resolve(c).into()).collect();
+    let v_headers: Vec<String> = kt.vals.cols.iter().map(|&c| resolve(c).into()).collect();
 
     let mut kw: Vec<usize> = k_headers.iter().map(|h| h.chars().count().max(1)).collect();
     let mut vw: Vec<usize> = v_headers.iter().map(|h| h.chars().count().max(1)).collect();

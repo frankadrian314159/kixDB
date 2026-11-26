@@ -84,7 +84,7 @@ fn write_k(buf: &mut Vec<u8>, val: &K) {
         }
         K::Sym(s) => {
             buf.push((-11i8) as u8);
-            write_nul_str(buf, &resolve(*s));
+            write_nul_str(buf, resolve(*s));
         }
         K::Timestamp(v) => {
             buf.push((-12i8) as u8);
@@ -165,7 +165,7 @@ fn write_k(buf: &mut Vec<u8>, val: &K) {
 fn write_tag(buf: &mut Vec<u8>, type_num: i8, tag: &Tag) {
     buf.push(type_num as u8);
     buf.push(tag.source as u8);
-    write_nul_str(buf, &resolve(tag.domain));
+    write_nul_str(buf, resolve(tag.domain));
 }
 
 fn write_colvec(buf: &mut Vec<u8>, cv: &ColVec) {
@@ -227,7 +227,7 @@ fn write_colvec(buf: &mut Vec<u8>, cv: &ColVec) {
         }
         ColVec::Sym(_, xs) => {
             for &s in xs.iter() {
-                write_nul_str(buf, &resolve(s));
+                write_nul_str(buf, resolve(s));
             }
         }
         // (written above)

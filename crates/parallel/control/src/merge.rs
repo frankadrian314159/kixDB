@@ -116,14 +116,14 @@ fn tree(c: &Checks, out: &mut Aggs, e: &Expr) -> Option<Tree> {
         return (!aggregates).then(|| Tree::Const(e.clone()));
     }
     match e {
-        Expr::Unary { op, arg } if UNARY.contains(&resolve(*op).as_str()) => Some(Tree::Unary(*op, Box::new(tree(c, out, arg)?))),
-        Expr::Unary { op, arg } => single(c, out, &resolve(*op), arg),
+        Expr::Unary { op, arg } if UNARY.contains(&resolve(*op)) => Some(Tree::Unary(*op, Box::new(tree(c, out, arg)?))),
+        Expr::Unary { op, arg } => single(c, out, resolve(*op), arg),
         Expr::Apply { target, args } => match (&**target, args.as_slice()) {
-            (Expr::Var(f), [Some(a)]) => single(c, out, &resolve(*f), a),
-            (Expr::Var(f), [Some(a), Some(b)]) if matches!(resolve(*f).as_str(), "wsum" | "wavg") => weighted(c, out, &resolve(*f), a, b),
+            (Expr::Var(f), [Some(a)]) => single(c, out, resolve(*f), a),
+            (Expr::Var(f), [Some(a), Some(b)]) if matches!(resolve(*f), "wsum" | "wavg") => weighted(c, out, resolve(*f), a, b),
             _ => None,
         },
-        Expr::Binary { op, lhs, rhs } => match resolve(*op).as_str() {
+        Expr::Binary { op, lhs, rhs } => match resolve(*op) {
             verb @ ("wsum" | "wavg") => weighted(c, out, verb, lhs, rhs),
             o if BINARY.contains(&o) => {
                 // right to left, as q evaluates

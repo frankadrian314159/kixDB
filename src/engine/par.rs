@@ -2,7 +2,7 @@
 //! sizes and are put together in order. (A sum of many floating point numbers may differ in its last digits from the
 //! sum added one after another.)
 use rayon::prelude::*;
-use std::collections::HashMap;
+use foldhash::{HashMap, HashMapExt};
 use std::ops::Range;
 
 /// Inputs shorter than this are not worth handing to other threads.

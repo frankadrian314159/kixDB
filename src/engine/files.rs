@@ -363,7 +363,7 @@ impl Engine<'_> {
 
 fn resolve_symbol(x: &K) -> KResult<String> {
     match x {
-        K::Sym(s) => Ok(resolve(*s)),
+        K::Sym(s) => Ok(resolve(*s).into()),
         _ => Err(KError::ty("expected a symbol")),
     }
 }

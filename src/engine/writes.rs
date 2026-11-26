@@ -18,7 +18,9 @@ fn fitted(target: &ColVec, column: &ColVec) -> KResult<Option<ColVec>> {
     if matches!(target, ColVec::General(..)) {
         return Ok(None);
     }
-    let mut fitted = target.take(0).append_strict(column)?;
+    // (a column of the target's type is taken as it is)
+    let same = target.type_num() == column.type_num() && !matches!(target, ColVec::Enum(..)) && !matches!(column, ColVec::Enum(..));
+    let mut fitted = if same { column.clone() } else { target.take(0).append_strict(column)? };
     fitted.set_attr_unchecked(Attr::None);
     Ok((fitted.type_num() == target.type_num() && fitted.len() == column.len()).then_some(fitted))
 }
@@ -46,27 +48,29 @@ pub fn row_changes(table: &K, rows: &Flip, insert: bool) -> KResult<Option<RowCh
     let len = columns.first().map_or(0, |c| c.len());
     // for each column, the rows already there that change and the incoming row that gives each its value
     let mut set: Vec<Vec<(u64, usize)>> = vec![vec![]; columns.len()];
-    // for each new row, the incoming row that gives each column its value
-    let mut new: Vec<Vec<usize>> = vec![];
-    if let K::KeyedTable(table) = table {
-        let found = match_keys(table, &incoming[..keys].iter().collect::<Vec<_>>(), n);
-        // incoming rows with one key make one new row
-        let same = group_ids(&incoming[..keys], n);
-        let mut made: Vec<Option<usize>> = vec![None; n];
-        for (r, at) in found.into_iter().enumerate() {
-            let given = (keys..columns.len()).filter(|&c| !incoming[c].get_atom(r).is_null());
-            match (at, made[same[r]]) {
-                (Some(_), _) if insert => return Err(KError::new("insert", "duplicate key in keyed table insert")),
-                (Some(at), _) => given.for_each(|c| set[c].push((at as u64, r))),
-                (None, Some(row)) => given.for_each(|c| new[row][c] = r),
-                (None, None) => {
-                    made[same[r]] = Some(new.len());
-                    new.push(vec![r; columns.len()]);
-                }
+    let K::KeyedTable(table) = table else {
+        // every incoming row is a new one: the columns are added as they are
+        let append = |(c, tail)| (c as u32, ColChange::Append { at: len as u64, tail });
+        let changes = if n == 0 { vec![] } else { incoming.into_iter().enumerate().map(append).collect() };
+        return Ok(Some(RowChanges { changes, added: (0..n).collect() }));
+    };
+    // for each column, the incoming row that gives each new row its value
+    let mut new: Vec<Vec<usize>> = vec![vec![]; columns.len()];
+    let found = match_keys(table, &incoming[..keys].iter().collect::<Vec<_>>(), n);
+    // incoming rows with one key make one new row
+    let same = group_ids(&incoming[..keys], n);
+    let mut made: Vec<Option<usize>> = vec![None; n];
+    for (r, at) in found.into_iter().enumerate() {
+        let given = (keys..columns.len()).filter(|&c| !incoming[c].get_atom(r).is_null());
+        match (at, made[same[r]]) {
+            (Some(_), _) if insert => return Err(KError::new("insert", "duplicate key in keyed table insert")),
+            (Some(at), _) => given.for_each(|c| set[c].push((at as u64, r))),
+            (None, Some(row)) => given.for_each(|c| new[c][row] = r),
+            (None, None) => {
+                made[same[r]] = Some(new[0].len());
+                new.iter_mut().for_each(|from| from.push(r));
             }
         }
-    } else {
-        new = (0..n).map(|r| vec![r; columns.len()]).collect();
     }
     let mut changes = vec![];
     for (c, mut of_column) in set.into_iter().enumerate() {
@@ -79,10 +83,9 @@ pub fn row_changes(table: &K, rows: &Flip, insert: bool) -> KResult<Option<RowCh
             changes.push((c as u32, ColChange::Set { rows: at, values: incoming[c].gather(&from) }));
         }
     }
-    let added = new.iter().map(|row| row[0]).collect();
-    if !new.is_empty() {
-        for (c, column) in incoming.iter().enumerate() {
-            let from: Vec<usize> = new.iter().map(|row| row[c]).collect();
+    let added = new[0].clone();
+    if !added.is_empty() {
+        for (c, (column, from)) in incoming.iter().zip(new).enumerate() {
             // (rows that all arrive, in order, need no copying)
             let tail = if from.iter().enumerate().all(|(i, &r)| i == r) && from.len() == n { column.clone() } else { column.gather(&from) };
             changes.push((c as u32, ColChange::Append { at: len as u64, tail }));

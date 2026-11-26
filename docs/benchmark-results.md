@@ -1,5 +1,51 @@
 # Benchmark results: scale factor 0.3
 
+## After the second round of changes
+
+Measured 2026-11-26 on the machine described under [Setup](#setup), on mains power: commit `5a15686` and the changes
+below, run back to back, one run each. **Treat these figures as provisional:** the machine's memory has still not been
+tested. On battery the same machine runs about half as fast.
+
+| Configuration | Queries, TPC-H / TPC-DS (s): `5a15686` | now | Load, TPC-H / TPC-DS (s): `5a15686` | now |
+| --- | ---: | ---: | ---: | ---: |
+| Single node | 0.49 / 0.21 | 0.42 / 0.14 | 1.92 / 0.32 | 1.71 / 0.17 |
+| 3 shards, in-process | 0.61 / 0.35 | 0.56 / 0.28 | 2.34 / 0.58 | 2.23 / 0.38 |
+
+The cluster figures are from the build before the last change to loading, which affects memory and the single node's load.
+
+Single statements on 1,000,000 rows or items, milliseconds:
+
+| Statement | `5a15686` | now |
+| --- | ---: | ---: |
+| `d[count d]: 1`, 4,000 times | 869 | 8 |
+| `x,: 1`, 40,000 times | 180 | 27 |
+| `a+: 1`, 1,000,000 times | 665 | 367 |
+| `count each s` (strings) | 306 | 108 |
+| `` `sym xasc t `` | 328 | 32 |
+| `` `u insert t `` into an empty table | 102 | 2 |
+| `update v: 0 from t` | 18 | 1.3 |
+| `` update v: 0 from t where sym = `a `` | 17 | 2.0 |
+| upsert one row of a keyed table | 11.8 | 2.1 |
+| `-8! t` (3 columns, one of symbols) | 31 | 9.5 |
+| `-9!` of that | 49 | 37 |
+
+Appending 20,000 items one at a time allocates 17 MB instead of 1.5 GB, and 5,000 dictionary inserts 6 MB instead of
+3 GB.
+
+What changed:
+
+* **Assignments change a variable where it is** ([amend.rs](../src/engine/amend.rs)): `x,: y`, `x[i]: y` and `d[k]: y`
+  for one item or key, where the value keeps its type, cost the items they touch. They are logged and replicated as those
+  changes. A log with a change to a dictionary cannot be replayed by an earlier version.
+* **Symbol names are read without a lock or a copy** ([sym.rs](../src/sym.rs)), which speeds calls of primitives,
+  sorting, and sending symbols.
+* **Writes and updates work column by column:** bulk `insert` no longer makes a list for every row, and `update` builds
+  columns of their types.
+* **`xasc` and `xdesc`** grade one typed column at a time.
+* **A faster hash function** (foldhash) for grouping, joins, `in`, indexes and the symbol table.
+* **`.Q.gc` asks the allocator to give memory back.** After the TPC-H tables were dropped, the process held 909 MB, and
+  72 MB after `.Q.gc[]`.
+
 ## After the performance changes
 
 The seven [recommendations](#recommendations) below were carried out, except that new tables are still created in two

@@ -2,9 +2,11 @@
 //!
 //! `SymId(0)` is always the empty symbol `` ` `` (the symbol null). Serialization writes the symbol's string and
 //! deserialization re-interns it, so snapshots, WAL records, and RPC messages stay valid across processes and restarts.
+//!
+//! Names are never freed, so each is held once, for good, and read without a lock.
+use foldhash::HashMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::fmt;
 use std::sync::{OnceLock, RwLock};
 
@@ -17,72 +19,54 @@ impl SymId {
     pub fn is_null(self) -> bool {
         self.0 == 0
     }
-
-    pub fn as_str_owned(self) -> String {
-        resolve(self)
-    }
 }
 
-struct Pool {
-    to_id: HashMap<String, SymId>,
-    from_id: Vec<String>,
+/// The ids of the names interned so far.
+fn pool() -> &'static RwLock<HashMap<&'static str, SymId>> {
+    static POOL: OnceLock<RwLock<HashMap<&'static str, SymId>>> = OnceLock::new();
+    POOL.get_or_init(|| RwLock::new(HashMap::from_iter([("", SymId::EMPTY)])))
 }
 
-impl Pool {
-    fn new() -> Self {
-        let mut to_id = HashMap::new();
-        to_id.insert(String::new(), SymId::EMPTY);
-        Self { to_id, from_id: vec![String::new()] }
-    }
-}
+/// The names by id, in blocks that are made as they are needed, each twice as long as the one before.
+type Block = Box<[OnceLock<&'static str>]>;
+static NAMES: [OnceLock<Block>; 23] = [const { OnceLock::new() }; 23];
+const FIRST: u64 = 1 << 10;
 
-fn pool() -> &'static RwLock<Pool> {
-    static POOL: OnceLock<RwLock<Pool>> = OnceLock::new();
-    POOL.get_or_init(|| RwLock::new(Pool::new()))
+/// The block that holds the name of symbol `id`, and its place there.
+fn place(id: u32) -> (usize, usize) {
+    let n = u64::from(id) + FIRST;
+    let block = n.ilog2() - FIRST.ilog2();
+    (block as usize, (n - (FIRST << block)) as usize)
 }
 
 pub fn intern(s: &str) -> SymId {
     if s.is_empty() {
         return SymId::EMPTY;
     }
-    {
-        let r = pool().read().unwrap_or_else(|e| e.into_inner());
-        if let Some(&id) = r.to_id.get(s) {
-            return id;
-        }
-    }
-    let mut w = pool().write().unwrap_or_else(|e| e.into_inner());
-    if let Some(&id) = w.to_id.get(s) {
+    if let Some(&id) = pool().read().unwrap_or_else(|e| e.into_inner()).get(s) {
         return id;
     }
-    let id = SymId(w.from_id.len() as u32);
-    let owned = s.to_string();
-    w.from_id.push(owned.clone());
-    w.to_id.insert(owned, id);
+    let mut ids = pool().write().unwrap_or_else(|e| e.into_inner());
+    if let Some(&id) = ids.get(s) {
+        return id;
+    }
+    let id = SymId(ids.len() as u32);
+    let (block, at) = place(id.0);
+    let name: &'static str = Box::leak(s.into());
+    // (the name is there before anyone can learn the id)
+    let _ = NAMES[block].get_or_init(|| (0..FIRST << block).map(|_| OnceLock::new()).collect())[at].set(name);
+    ids.insert(name, id);
     id
 }
 
-pub fn resolve(id: SymId) -> String {
-    if id.0 == 0 {
-        return String::new();
-    }
-    let r = pool().read().unwrap_or_else(|e| e.into_inner());
-    r.from_id.get(id.0 as usize).cloned().unwrap_or_default()
-}
-
-pub fn with_str<R>(id: SymId, f: impl FnOnce(&str) -> R) -> R {
-    if id.0 == 0 {
-        return f("");
-    }
-    let r = pool().read().unwrap_or_else(|e| e.into_inner());
-    let s = r.from_id.get(id.0 as usize).map(String::as_str).unwrap_or("");
-    f(s)
+pub fn resolve(id: SymId) -> &'static str {
+    let (block, at) = place(id.0);
+    NAMES[block].get().and_then(|names| names[at].get()).copied().unwrap_or_default()
 }
 
 /// Number of distinct symbols currently interned (used by `\w` workspace stats).
 pub fn sym_count() -> usize {
-    let r = pool().read().unwrap_or_else(|e| e.into_inner());
-    r.from_id.len()
+    pool().read().unwrap_or_else(|e| e.into_inner()).len()
 }
 
 impl Ord for SymId {
@@ -90,10 +74,7 @@ impl Ord for SymId {
         if self.0 == other.0 {
             return Ordering::Equal;
         }
-        let r = pool().read().unwrap_or_else(|e| e.into_inner());
-        let a = r.from_id.get(self.0 as usize).map(String::as_str).unwrap_or("");
-        let b = r.from_id.get(other.0 as usize).map(String::as_str).unwrap_or("");
-        a.cmp(b)
+        resolve(*self).cmp(resolve(*other))
     }
 }
 
@@ -105,19 +86,19 @@ impl PartialOrd for SymId {
 
 impl fmt::Debug for SymId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        with_str(*self, |s| write!(f, "`{s}"))
+        write!(f, "`{}", resolve(*self))
     }
 }
 
 impl fmt::Display for SymId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        with_str(*self, |s| f.write_str(s))
+        f.write_str(resolve(*self))
     }
 }
 
 impl Serialize for SymId {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        with_str(*self, |s| serializer.serialize_str(s))
+        serializer.serialize_str(resolve(*self))
     }
 }
 

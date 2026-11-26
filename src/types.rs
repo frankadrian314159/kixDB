@@ -791,7 +791,29 @@ impl ColVec {
         if n == 0 {
             return ColVec::from_atoms(vec![atom]).take(0);
         }
-        ColVec::from_atoms(vec![atom; n])
+        macro_rules! of {
+            ($($v:ident)*) => {
+                match atom {
+                    $(K::$v(x) => ColVec::$v(Attr::None, Arc::new(vec![x; n])),)*
+                    other => ColVec::from_atoms(vec![other; n]),
+                }
+            };
+        }
+        of!(Bool Guid Byte Short Int Long Real Float Char Sym Timestamp Month Date Datetime Timespan Minute Second Time)
+    }
+
+    /// The first row that holds `atom`.
+    pub fn position(&self, atom: &K) -> Option<usize> {
+        match (self, atom) {
+            (ColVec::Long(_, v), K::Long(x)) => v.iter().position(|y| y == x),
+            (ColVec::Int(_, v), K::Int(x)) => v.iter().position(|y| y == x),
+            (ColVec::Sym(_, v), K::Sym(x)) => v.iter().position(|y| y == x),
+            (ColVec::Date(_, v), K::Date(x)) => v.iter().position(|y| y == x),
+            _ => {
+                let key = atom.hash_key();
+                (0..self.len()).position(|i| self.get_atom(i).hash_key() == key)
+            }
+        }
     }
 
     /// Normalize a general list of uniform atoms into a typed vector (kdb+'s auto-collapse rule).
@@ -1300,7 +1322,7 @@ pub enum Func {
 impl Func {
     pub fn source_text(&self) -> String {
         match self {
-            Func::Prim(s) => resolve(*s),
+            Func::Prim(s) => resolve(*s).into(),
             Func::Lambda(l) => l.source.clone(),
             Func::Adverb { kind, inner } => format!("{}{}", inner.source_text(), kind.symbol()),
             Func::Proj { func, args, .. } => {
@@ -1556,7 +1578,7 @@ impl K {
     pub fn as_str(&self) -> Option<String> {
         match self {
             K::Char(c) => Some((*c as char).to_string()),
-            K::Sym(s) => Some(resolve(*s)),
+            K::Sym(s) => Some(resolve(*s).into()),
             K::Vector(v) => v.as_str(),
             K::Enum(_, v) => v.as_str(),
             _ => None,
@@ -1693,7 +1715,7 @@ impl K {
             K::Float(v) => format_float_cell(*v),
             K::Datetime(v) => if v.is_nan() { String::new() } else { format_datetime(*v) },
             K::Char(c) => (*c as char).to_string(),
-            K::Sym(s) => resolve(*s),
+            K::Sym(s) => resolve(*s).into(),
             K::Timestamp(v) => if *v == NULL_LONG { String::new() } else { format_timestamp(*v) },
             K::Month(v) => if *v == NULL_INT { String::new() } else { format_month(*v) },
             K::Date(v) => if *v == NULL_INT { String::new() } else { format_date(*v) },

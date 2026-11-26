@@ -65,7 +65,7 @@ fn constant(k: &K) -> K {
 pub fn func_of(e: &Expr, ns: &str) -> Option<Func> {
     match e {
         Expr::Lit(K::Func(f)) => Some(f.clone()),
-        Expr::Var(s) if is_builtin_verb(&resolve(*s)) => Some(Func::Prim(*s)),
+        Expr::Var(s) if is_builtin_verb(resolve(*s)) => Some(Func::Prim(*s)),
         Expr::Adverb { kind, func } => Some(Func::Adverb { kind: *kind, inner: Box::new(func_of(func, ns)?) }),
         Expr::Lambda { params, implicit, body, source } => Some(Func::Lambda(Arc::new(Lambda {
             params: params.clone(),
@@ -150,7 +150,7 @@ pub fn to_tree(e: &Expr, ns: &str) -> KResult<K> {
     Ok(match e {
         Expr::Nop => K::Null,
         Expr::Lit(k) => constant(k),
-        Expr::Var(s) if is_builtin_verb(&resolve(*s)) => K::Func(Func::Prim(*s)),
+        Expr::Var(s) if is_builtin_verb(resolve(*s)) => K::Func(Func::Prim(*s)),
         Expr::Var(s) => K::Sym(*s),
         Expr::Field(base, field) => match tree(base)? {
             K::Sym(b) => K::sym(&format!("{b}.{field}")),
@@ -167,7 +167,7 @@ pub fn to_tree(e: &Expr, ns: &str) -> KResult<K> {
         }
         Expr::Unary { op, arg } => {
             let name = resolve(*op);
-            let head = if is_operator(&name) { prim(&format!("{name}:")) } else { K::Func(Func::Prim(*op)) };
+            let head = if is_operator(name) { prim(&format!("{name}:")) } else { K::Func(Func::Prim(*op)) };
             list(vec![head, tree(arg)?])
         }
         Expr::Binary { op, lhs, rhs } => list(vec![K::Func(Func::Prim(*op)), tree(lhs)?, tree(rhs)?]),
@@ -255,7 +255,7 @@ pub fn to_expr(k: &K) -> KResult<Expr> {
     let K::Func(Func::Prim(op)) = head else { return applied(to_expr(head)?) };
     let name = resolve(*op);
     // the groupings and columns of a functional query are trees given as they are, not to be evaluated first
-    if matches!(name.as_str(), "?" | "!") && rest.len() >= 4 {
+    if matches!(name, "?" | "!") && rest.len() >= 4 {
         let args = rest.iter().enumerate().map(|(i, x)| match i {
             2 | 3 => Ok(Some(Expr::Lit(x.clone()))),
             _ => to_expr(x).map(Some),
@@ -264,7 +264,7 @@ pub fn to_expr(k: &K) -> KResult<Expr> {
     }
     // `+:` and friends: an operator before a colon
     let base = name.strip_suffix(':').filter(|b| is_operator(b));
-    Ok(match (name.as_str(), rest) {
+    Ok(match (name, rest) {
         (":", [x]) => Expr::Return(boxed(x)?),
         ("'", [x]) => Expr::Signal(boxed(x)?),
         (":" | "::", [K::Sym(target), val]) => {
@@ -300,7 +300,7 @@ pub fn to_expr(k: &K) -> KResult<Expr> {
             Expr::Adverb { kind: adverb_named(word).unwrap_or(AdverbKind::Each), func: boxed(x)? }
         }
         (_, [x]) if base.is_some() => Expr::Unary { op: intern(base.unwrap_or_default()), arg: boxed(x)? },
-        (_, [x]) if is_unary_keyword(&name) => Expr::Unary { op: *op, arg: boxed(x)? },
+        (_, [x]) if is_unary_keyword(name) => Expr::Unary { op: *op, arg: boxed(x)? },
         (_, [x, y]) => Expr::Binary { op: *op, lhs: boxed(x)?, rhs: boxed(y)? },
         _ => applied(Expr::Lit(head.clone()))?,
     })

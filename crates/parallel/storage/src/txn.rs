@@ -70,7 +70,7 @@ fn work_out(conn: &mut Connection, ops: &[TxnOp]) -> KResult<(Changes, Vec<Vec<u
                 // one write a name: the two make its new value
                 let dropped = matches!(write, Write::Value(None));
                 changes.push((name, write));
-                let value = if dropped { None } else { Some(staged_value(conn, &changes, &kixdb::sym::resolve(name))?) };
+                let value = if dropped { None } else { Some(staged_value(conn, &changes, kixdb::sym::resolve(name))?) };
                 changes.retain(|c| c.0 != name);
                 changes.push((name, Write::Value(value)));
             } else {

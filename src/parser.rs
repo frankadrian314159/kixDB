@@ -7,7 +7,7 @@
 use crate::ast::{ColSpec, Expr, QSql, QSqlKind};
 use crate::error::{KError, KResult};
 use crate::lexer::{tokenize, Tok};
-use crate::sym::{intern, SymId};
+use crate::sym::{intern, resolve, SymId};
 use crate::types::{Attr, ColVec, Func, K};
 use std::sync::Arc;
 
@@ -360,7 +360,7 @@ impl<'a> Parser<'a> {
 
         // If `lhs` is a bare unary keyword (`sum`, `til`, `neg`, `not`, ...) and more expression follows without a binary op:
         if let Expr::Var(sym) = &lhs {
-            let name = sym.as_str_owned();
+            let name = resolve(*sym).to_string();
             // (`value +[2]`: an operator with brackets after it begins the argument)
             let called = matches!(self.peek(), Tok::Op(_)) && matches!(self.peek_n(1), Tok::LBrack);
             if is_unary_keyword(&name) && !self.is_expr_end() && (called || self.peek_binary_op().is_none()) {
@@ -486,7 +486,7 @@ impl<'a> Parser<'a> {
                     self.stop_on_comma = saved_comma;
                     self.in_qsql = saved_qsql;
                     // `+[2]`: one argument in brackets leaves an operator waiting for its other
-                    let operator = matches!(&base, Expr::Lit(K::Func(Func::Prim(s))) if !s.as_str_owned().starts_with(|c: char| c.is_ascii_alphanumeric()));
+                    let operator = matches!(&base, Expr::Lit(K::Func(Func::Prim(s))) if !resolve(*s).starts_with(|c: char| c.is_ascii_alphanumeric()));
                     if operator && matches!(args.as_slice(), [Some(_)]) {
                         args.push(None);
                     }
@@ -894,7 +894,7 @@ impl<'a> Parser<'a> {
 
 /// Infer a default column name from a `qSQL` expression (`price` -> `price`, `sum price` -> `price`, `5 xbar time.minute` -> `minute`).
 pub fn infer_col_name(expr: &Expr) -> Option<SymId> {
-    if matches!(expr, Expr::Var(s) if s.as_str_owned() == "i") {
+    if matches!(expr, Expr::Var(s) if resolve(*s) == "i") {
         return Some(intern("x"));
     }
     match expr {
@@ -902,7 +902,7 @@ pub fn infer_col_name(expr: &Expr) -> Option<SymId> {
         Expr::Field(_, f) => Some(*f),
         Expr::Unary { arg, .. } => infer_col_name(arg),
         Expr::Binary { op, lhs, rhs } => {
-            let word = op.as_str_owned().starts_with(|c: char| c.is_ascii_alphabetic());
+            let word = resolve(*op).starts_with(|c: char| c.is_ascii_alphabetic());
             infer_col_name(if word { rhs } else { lhs })
         }
         Expr::Juxt { arg, .. } => infer_col_name(arg),

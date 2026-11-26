@@ -159,7 +159,7 @@ impl Inner {
         if self.topology().resizes != after.resizes {
             // (copies made beside the tables of shards that stay are thrown away, where they can be)
             // (all at once, so that a shard that does not answer is waited for once)
-            let drop = |t: &Table| LoadReq::new(moving_var(&resolve(t.name)), LoadMode::Drop, &K::Null, None);
+            let drop = |t: &Table| LoadReq::new(moving_var(resolve(t.name)), LoadMode::Drop, &K::Null, None);
             let (shards, drops): (_, Vec<LoadReq>) = (self.shards(), self.tables_to_copy().iter().map(drop).collect());
             self.wait(join_all(shards.iter().flat_map(|s| drops.iter().map(|d| s.load(d)))));
             committed?;
@@ -226,7 +226,7 @@ impl Inner {
             self.prepare_new_shard(old)?;
         }
         for t in &tables {
-            let name = resolve(t.name);
+            let name = resolve(t.name).to_string();
             let Some(layout) = Layout::of(t) else {
                 // a replicated table: the new shard is given all of it
                 if new > old {
@@ -288,7 +288,7 @@ impl Inner {
             // in the commit: shards that stay give up what left them and take in what was copied to them
             let losing: BTreeSet<usize> = moving.iter().map(|m| m.1).filter(|&from| from < new).collect();
             ops.extend(losing.into_iter().map(|me| {
-                let cols = layout.cols().iter().map(|&c| resolve(c)).collect();
+                let cols = layout.cols().iter().map(|&c| resolve(c).into()).collect();
                 let partitioned = matches!(layout, Layout::Part(_));
                 (me, TxnOp::Move(MoveReq::Keep { table: name.clone(), cols, partitioned, slots: (*after.slots).clone(), me }))
             }));

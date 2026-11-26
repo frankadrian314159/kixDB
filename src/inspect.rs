@@ -104,14 +104,14 @@ impl Connection {
         set.insert(".".to_string());
         for (&sym, _) in g.vars.iter().filter(|(&s, _)| !resolve(s).starts_with(".kix.")) {
             let full = resolve(sym);
-            let (ns, _) = split_ns(&full);
+            let (ns, _) = split_ns(full);
             if !ns.is_empty() {
                 set.insert(ns);
             }
         }
         for &sym in g.views.keys() {
             let full = resolve(sym);
-            let (ns, _) = split_ns(&full);
+            let (ns, _) = split_ns(full);
             if !ns.is_empty() {
                 set.insert(ns);
             }
@@ -134,7 +134,7 @@ impl Connection {
                 .iter()
                 .zip(&flip.vals)
                 .map(|(&c, v)| ColumnInfo {
-                    name: resolve(c),
+                    name: resolve(c).into(),
                     type_char: v.meta_type_char(),
                     type_name: v.type_name().to_string(),
                     attr: v.attr().char(),
@@ -181,7 +181,7 @@ fn table_info_from_k(name: &str, val: &K) -> Option<TableInfo> {
                 .iter()
                 .zip(&t.vals)
                 .map(|(&c, v)| ColumnInfo {
-                    name: resolve(c),
+                    name: resolve(c).into(),
                     type_char: v.meta_type_char(),
                     type_name: v.type_name().to_string(),
                     attr: v.attr().char(),
@@ -200,7 +200,7 @@ fn table_info_from_k(name: &str, val: &K) -> Option<TableInfo> {
             let mut columns = Vec::with_capacity(kt.keys.ncols() + kt.vals.ncols());
             for (&c, v) in kt.keys.cols.iter().zip(&kt.keys.vals) {
                 columns.push(ColumnInfo {
-                    name: resolve(c),
+                    name: resolve(c).into(),
                     type_char: v.meta_type_char(),
                     type_name: v.type_name().to_string(),
                     attr: v.attr().char(),
@@ -209,7 +209,7 @@ fn table_info_from_k(name: &str, val: &K) -> Option<TableInfo> {
             }
             for (&c, v) in kt.vals.cols.iter().zip(&kt.vals.vals) {
                 columns.push(ColumnInfo {
-                    name: resolve(c),
+                    name: resolve(c).into(),
                     type_char: v.meta_type_char(),
                     type_name: v.type_name().to_string(),
                     attr: v.attr().char(),
@@ -281,7 +281,7 @@ pub(crate) fn collect_objects(ws: &Workspace) -> Vec<ObjectEntry> {
         if full.starts_with(".kix.") {
             continue;
         }
-        let (ns, short) = split_ns(&full);
+        let (ns, short) = split_ns(full);
         let kind = match val {
             K::Table(_) => ObjectKind::Table,
             K::KeyedTable(_) => ObjectKind::KeyedTable,
@@ -294,13 +294,13 @@ pub(crate) fn collect_objects(ws: &Workspace) -> Vec<ObjectEntry> {
     for &sym in ws.partitioned.keys() {
         if !ws.vars.contains_key(&sym) {
             let full = resolve(sym);
-            let (ns, short) = split_ns(&full);
+            let (ns, short) = split_ns(full);
             out.push(ObjectEntry { namespace: ns, name: short, kind: ObjectKind::PartitionedTable });
         }
     }
     for &sym in ws.views.keys() {
         let full = resolve(sym);
-        let (ns, short) = split_ns(&full);
+        let (ns, short) = split_ns(full);
         out.push(ObjectEntry { namespace: ns, name: short, kind: ObjectKind::View });
     }
     out.sort_by(|a, b| (kind_rank(a.kind), &a.namespace, &a.name).cmp(&(kind_rank(b.kind), &b.namespace, &b.name)));
@@ -338,7 +338,7 @@ pub(crate) fn workspace_definition(ws: &Workspace, name: &str) -> KResult<K> {
                 .iter()
                 .zip(&flip.vals)
                 .map(|(&c, v)| ColumnInfo {
-                    name: resolve(c),
+                    name: resolve(c).into(),
                     type_char: v.meta_type_char(),
                     type_name: v.type_name().to_string(),
                     attr: v.attr().char(),
@@ -375,7 +375,7 @@ pub fn remote_objects(client: &mut IpcClient) -> Vec<ObjectEntry> {
     // Fallback for external real kdb+ servers without `.kix.objects`
     let sym_list = |c: &mut IpcClient, cmd: &str| -> Vec<String> {
         match c.query_str(cmd) {
-            Ok(K::Vector(ColVec::Sym(_, syms))) => syms.iter().map(|&s| resolve(s)).collect(),
+            Ok(K::Vector(ColVec::Sym(_, syms))) => syms.iter().map(|&s| resolve(s).into()).collect(),
             _ => vec![],
         }
     };
@@ -426,7 +426,7 @@ pub fn remote_table_info(client: &mut IpcClient, name: &str) -> Option<TableInfo
     let meta_k = client.query_str(&format!("0 ! meta {name}")).ok()?;
     let K::Table(mf) = meta_k else { return None };
     let keys_vec: Vec<String> = match client.query_str(&format!("keys {name}")).ok()? {
-        K::Vector(ColVec::Sym(_, ks)) => ks.iter().map(|&s| resolve(s)).collect(),
+        K::Vector(ColVec::Sym(_, ks)) => ks.iter().map(|&s| resolve(s).into()).collect(),
         _ => vec![],
     };
     let nrows = client

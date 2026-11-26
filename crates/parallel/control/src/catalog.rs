@@ -111,7 +111,7 @@ fn is_table(v: &K) -> bool {
 /// A variable that holds a distributed table. (One named like a built-in verb stays on the control node: the name means
 /// the verb.)
 fn is_distributed(ws: &Workspace, name: SymId) -> bool {
-    ws.vars.get(&name).is_some_and(is_table) && !is_builtin_verb(&resolve(name))
+    ws.vars.get(&name).is_some_and(is_table) && !is_builtin_verb(resolve(name))
 }
 
 /// Names as one session sees them (`ns` is its current namespace).
@@ -212,7 +212,7 @@ impl Names<'_> {
     }
 
     fn mention(&self, name: SymId, out: &mut Refs, seen: &mut HashSet<SymId>) {
-        if DYNAMIC.contains(&resolve(name).as_str()) {
+        if DYNAMIC.contains(&resolve(name)) {
             out.dynamic = true;
         }
         if let Some(t) = self.table(name) {
@@ -247,7 +247,7 @@ impl Names<'_> {
     fn walk_func(&self, f: &Func, out: &mut Refs, seen: &mut HashSet<SymId>) {
         match f {
             Func::Prim(s) => {
-                if DYNAMIC.contains(&resolve(*s).as_str()) {
+                if DYNAMIC.contains(&resolve(*s)) {
                     out.dynamic = true;
                 }
             }
@@ -279,7 +279,7 @@ impl Names<'_> {
             Expr::Var(s) => self.mention(*s, out, seen),
             Expr::Lit(k) => self.walk_literal(k, out, seen),
             Expr::Assign { name, .. } | Expr::IndexAssign { name, .. } => out.tables.extend(self.table(*name).map(|t| t.name)),
-            Expr::Unary { op, .. } | Expr::Binary { op, .. } => out.dynamic |= DYNAMIC.contains(&resolve(*op).as_str()),
+            Expr::Unary { op, .. } | Expr::Binary { op, .. } => out.dynamic |= DYNAMIC.contains(&resolve(*op)),
             Expr::Field(base, field) => {
                 if let Expr::Var(b) = &**base {
                     self.mention(intern(&format!("{b}.{field}")), out, seen);
@@ -295,7 +295,7 @@ impl Names<'_> {
 
     /// Whether the expression has no effects of its own (it assigns nothing and calls no verb with effects).
     pub fn is_pure(&self, e: &Expr) -> bool {
-        let effect = |s: &SymId| EFFECTS.contains(&resolve(*s).as_str());
+        let effect = |s: &SymId| EFFECTS.contains(&resolve(*s));
         !e.any(&mut |x| match x {
             Expr::Assign { .. } | Expr::IndexAssign { .. } | Expr::SysCmd { .. } | Expr::Do { .. } | Expr::While { .. } | Expr::If { .. } => true,
             Expr::Var(s) | Expr::Unary { op: s, .. } | Expr::Binary { op: s, .. } => effect(s),
@@ -312,7 +312,7 @@ impl Names<'_> {
                     let verb = resolve(*op);
                     // (`meta` reads the type of a general column from its items, which the mirror does not hold)
                     let answers = |t: &Table| verb != "meta" || t.schema.vals.iter().all(|v| v.type_num() != 0);
-                    if SCHEMA_VERBS.contains(&verb.as_str()) && n.table(*t).is_some_and(|t| answers(&t)) {
+                    if SCHEMA_VERBS.contains(&verb) && n.table(*t).is_some_and(|t| answers(&t)) {
                         *used = true;
                         return true;
                     }

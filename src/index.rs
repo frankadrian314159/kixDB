@@ -9,7 +9,7 @@ use crate::sym::{resolve, SymId};
 use crate::types::{Attr, ColVec, Flip, K};
 use std::any::Any;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use foldhash::{HashMap, HashMapExt};
 use std::ops::Range;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 
@@ -329,8 +329,8 @@ pub fn try_filter_where(
     let op_str = resolve(*op);
 
     // Support both `col op expr` and `expr = col`
-    let (col_sym, val_expr, eff_op) = match (&**lhs, &**rhs, op_str.as_str()) {
-        (Expr::Var(c), r, _) if flip.col(*c).is_some() && !expr_uses_table_cols(r, &flip.cols) => (*c, r, op_str.as_str()),
+    let (col_sym, val_expr, eff_op) = match (&**lhs, &**rhs, op_str) {
+        (Expr::Var(c), r, _) if flip.col(*c).is_some() && !expr_uses_table_cols(r, &flip.cols) => (*c, r, op_str),
         (l, Expr::Var(c), "=") if flip.col(*c).is_some() && !expr_uses_table_cols(l, &flip.cols) => (*c, l, "="),
         _ => return Ok(None),
     };

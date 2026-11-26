@@ -1,5 +1,6 @@
 //! `q` workspace state, session state, expression evaluator, lambdas, projections, adverbs,
 //! protected evaluation (`@[f;x;h]` / `.[f;args;h]`), views (`::`), and system commands (`\...`).
+mod amend;
 pub mod joins;
 pub mod builtins;
 mod dotz;
@@ -96,7 +97,7 @@ pub fn k_to_resultset(k: &K) -> Option<ResultSet> {
 }
 
 pub fn flip_to_resultset(f: &Flip, key_count: usize) -> ResultSet {
-    let columns: Vec<String> = f.cols.iter().map(|&s| resolve(s)).collect();
+    let columns: Vec<String> = f.cols.iter().map(|&s| resolve(s).into()).collect();
     let types: Vec<String> = f.vals.iter().map(|v| v.type_name().to_string()).collect();
     let nrows = f.nrows();
     let mut rows = Vec::with_capacity(nrows);
@@ -511,7 +512,7 @@ impl<'a> Engine<'a> {
         let logged = !self.replaying && (self.ws.persist.get_mut().is_ok_and(|p| p.is_some()) || self.ws.replicator.get_mut().is_ok_and(|r| r.is_some()));
         self.ws.writable()?;
         if self.ws.host.cluster.load(Ordering::SeqCst) {
-            let refused = |w: &(SymId, Write)| !matches!(w.1, Write::Value(None)) && NOT_ON_A_CLUSTER.contains(&resolve(w.0).as_str());
+            let refused = |w: &(SymId, Write)| !matches!(w.1, Write::Value(None)) && NOT_ON_A_CLUSTER.contains(&resolve(w.0));
             if let Some((name, _)) = writes.iter().find(|w| refused(w)) {
                 return Err(KError::nyi(format!("{} on a cluster", resolve(*name))));
             }
@@ -646,10 +647,10 @@ impl<'a> Engine<'a> {
         let s = resolve(name);
 
         // 3. Built-in keywords & `.z` / `.Q` / `.kix` namespaces
-        if is_unary_keyword(&s) || is_binary_keyword(&s) || is_nary_keyword(&s) {
+        if is_unary_keyword(s) || is_binary_keyword(s) || is_nary_keyword(s) {
             return Ok(K::Func(Func::Prim(name)));
         }
-        if let Some(sys_val) = self.eval_builtin_ns(&s)? {
+        if let Some(sys_val) = self.eval_builtin_ns(s)? {
             return Ok(sys_val);
         }
         // (a file, named by `insert`, an amend or a query, holds a value as a global does)
@@ -682,7 +683,7 @@ impl<'a> Engine<'a> {
             return Ok(K::Table(Arc::new(flip)));
         }
 
-        if let Some(namespace) = self.namespace(&s) {
+        if let Some(namespace) = self.namespace(s) {
             return Ok(namespace);
         }
         // the partitions mounted are listed under the name of their column, such as `date`
@@ -728,7 +729,7 @@ impl<'a> Engine<'a> {
             let spaces = self.ws.vars.keys().filter_map(|&n| resolve(n).strip_prefix('.')?.split_once('.').map(|(ns, _)| ns.to_string()));
             return Ok(symbols(spaces.chain(["q".to_string(), "Q".to_string(), "h".to_string()]).collect()));
         }
-        if let Some(K::Dict(space)) = self.namespace(&text) {
+        if let Some(K::Dict(space)) = self.namespace(text) {
             return Ok((*space.keys).clone());
         }
         match self.get_var(name) {
@@ -767,7 +768,7 @@ impl<'a> Engine<'a> {
                     match read.iter().position(|r| r.0 == *name) {
                         Some(i) if !read[i].1.contains(&view.name) => read[i].1.push(view.name),
                         Some(_) => {}
-                        None if !crate::parser::is_builtin_verb(&resolve(*name)) => read.push((*name, vec![view.name])),
+                        None if !crate::parser::is_builtin_verb(resolve(*name)) => read.push((*name, vec![view.name])),
                         None => {}
                     }
                 }
@@ -914,7 +915,7 @@ impl<'a> Engine<'a> {
                     return Ok(rval);
                 }
                 let lval = self.eval_step(lhs)?;
-                Ok(self.eval_binary_dispatch(&op_name, &lval, &rval)?)
+                Ok(self.eval_binary_dispatch(op_name, &lval, &rval)?)
             }
 
             Expr::Juxt { func, arg } => {
@@ -928,7 +929,7 @@ impl<'a> Engine<'a> {
                 if let Expr::Lit(K::Func(Func::Prim(op_sym))) = &**target {
                     let op_s = resolve(*op_sym);
                     if (op_s == "@" || op_s == ".") && args.len() >= 3 {
-                        return self.eval_trap_or_amend(&op_s, args);
+                        return self.eval_trap_or_amend(op_s, args);
                     }
                     if op_s == "?" && (args.len() == 4 || args.len() == 5 || args.len() == 6) {
                         return Ok(self.eval_functional_select(args)?);
@@ -979,9 +980,14 @@ impl<'a> Engine<'a> {
                 }
 
                 let rhs = self.eval_step(val)?;
+                if op.is_some_and(|op| resolve(op) == ",") {
+                    if let Some(value) = self.append_where_it_is(*name, *global, &rhs)? {
+                        return Ok(value);
+                    }
+                }
                 let final_val = if let Some(op_sym) = op {
                     let cur = self.get_var(*name)?;
-                    match (resolve(*op_sym).as_str(), &cur, &rhs) {
+                    match (resolve(*op_sym), &cur, &rhs) {
                         // what is added to an enumeration is enumerated first
                         (",", K::Vector(ColVec::Enum(tag, _)), more) => {
                             let more = self.enumerate(*tag, more)?;
@@ -1012,6 +1018,9 @@ impl<'a> Engine<'a> {
                     if let Some(e) = ix {
                         idx_vals[i] = Some(self.eval_step(e)?);
                     }
+                }
+                if self.amend_where_it_is(*name, &idx_vals, *op, &rhs)? {
+                    return Ok(K::Null);
                 }
                 let is_local = self.locals.last().is_some_and(|f| f.contains_key(name));
                 let mut target = self.get_var(*name)?;
@@ -1123,7 +1132,7 @@ impl<'a> Engine<'a> {
 
     fn eval_unary_dispatch(&mut self, op: SymId, x: &K) -> KResult<K> {
         let name = resolve(op);
-        match name.as_str() {
+        match name {
             "tables" => {
                 let mut syms: Vec<SymId> = self
                     .ws
@@ -1149,7 +1158,7 @@ impl<'a> Engine<'a> {
             "fkeys" | "meta" | "cols" | "iasc" | "idesc" if matches!(x, K::Sym(_)) => {
                 let K::Sym(table) = x else { unreachable!() };
                 let table = self.get_var(*table)?;
-                ops::eval_unary_prim(name.as_str(), &table)
+                ops::eval_unary_prim(name, &table)
             }
             "show" => {
                 self.print(Event::Message(crate::display::console(x)));
@@ -1208,11 +1217,11 @@ impl<'a> Engine<'a> {
                     ops::eval_unary_prim("value", x)
                 }
             }
-            _ => ops::eval_unary_prim(&name, x),
+            _ => ops::eval_unary_prim(name, x),
         }
     }
 
-    fn eval_binary_dispatch(&mut self, op: &str, lhs: &K, rhs: &K) -> KResult<K> {
+    pub(crate) fn eval_binary_dispatch(&mut self, op: &str, lhs: &K, rhs: &K) -> KResult<K> {
         if let (K::Sym(name), "xasc" | "xdesc" | "xkey" | "xcol" | "xcols") = (rhs, op) {
             let table = self.get_var(*name)?;
             let changed = self.eval_binary_dispatch(op, lhs, &table)?;
@@ -1299,8 +1308,8 @@ impl<'a> Engine<'a> {
             // (a cluster's control node evaluates on a workspace that its clients are not connected to)
             K::Int(0 | i32::MIN..=-1) if self.ws.host.cluster.load(Ordering::SeqCst) => Err(KError::nyi("sending to a client of a cluster")),
             // Symbol handle one-shot IPC `` `:localhost:5000 "1+1" ``
-            K::Sym(s) if resolve(*s).starts_with(':') && files::server_address(&resolve(*s)).is_some() => {
-                let mut client = self.connect_to(&resolve(*s)).unwrap_or_else(|| Err(KError::ipc("not a server")))?;
+            K::Sym(s) if resolve(*s).starts_with(':') && files::server_address(resolve(*s)).is_some() => {
+                let mut client = self.connect_to(resolve(*s)).unwrap_or_else(|| Err(KError::ipc("not a server")))?;
                 let arg = args.first().and_then(|a| a.clone()).unwrap_or(K::Null);
                 client.query_k(&arg)
             }
@@ -1388,11 +1397,11 @@ impl<'a> Engine<'a> {
             },
             Func::Prim(s) => {
                 let n = resolve(*s);
-                match n.as_str() {
+                match n {
                     "aj" | "aj0" | "ej" | "ssr" => 3,
                     "wj" | "wj1" => 4,
-                    _ if namespaces::arity(&n).is_some() => namespaces::arity(&n).unwrap_or(1),
-                    _ if is_unary_keyword(&n) => 1,
+                    _ if namespaces::arity(n).is_some() => namespaces::arity(n).unwrap_or(1),
+                    _ if is_unary_keyword(n) => 1,
                     _ => 2,
                 }
             }
@@ -1401,7 +1410,7 @@ impl<'a> Engine<'a> {
 
     fn call_prim(&mut self, sym: SymId, vals: &[K]) -> KResult<K> {
         let name = resolve(sym);
-        match (name.as_str(), vals.len()) {
+        match (name, vals.len()) {
             ("aj", 3) => joins::asof_join(&vals[0], &vals[1], &vals[2], true),
             ("aj0", 3) => joins::asof_join(&vals[0], &vals[1], &vals[2], false),
             ("ej", 3) => joins::equi_join(&vals[0], &vals[1], &vals[2]),
@@ -1409,10 +1418,10 @@ impl<'a> Engine<'a> {
             ("ssr", 3) => ops::ssr_op(&vals[0], &vals[1], &vals[2]),
             ("wj", 4) => joins::window_join(&vals[0], &vals[1], &vals[2], &vals[3], true, |f, a| self.apply_func(f, a)),
             ("wj1", 4) => joins::window_join(&vals[0], &vals[1], &vals[2], &vals[3], false, |f, a| self.apply_func(f, a)),
-            _ if namespaces::arity(&name).is_some() => self.namespace_call(&name, vals),
+            _ if namespaces::arity(name).is_some() => self.namespace_call(name, vals),
             ("enlist", 2..) => Ok(K::Vector(ColVec::from_atoms(vals.to_vec()))),
             (_, 1) => self.eval_unary_dispatch(sym, &vals[0]),
-            (_, 2) => self.eval_binary_dispatch(&name, &vals[0], &vals[1]),
+            (_, 2) => self.eval_binary_dispatch(name, &vals[0], &vals[1]),
             _ => Err(KError::rank(format!("wrong number of arguments ({}) to {name}", vals.len()))),
         }
     }
@@ -1424,7 +1433,7 @@ impl<'a> Engine<'a> {
         let K::Sym(mode_s) = vals[1] else {
             return Err(KError::ty(".kix.dist mode must be `sharded, `partitioned, or `replicated"));
         };
-        let mode = match resolve(mode_s).as_str() {
+        let mode = match resolve(mode_s) {
             "replicated" => DistMode::Replicated,
             "sharded" => match vals.get(2) {
                 None => DistMode::Sharded { key: intern("sym") },
@@ -1553,7 +1562,7 @@ impl<'a> Engine<'a> {
                 1 => {
                     // Fast paths for `+/`, `*/`, `&/`, `|/`, `,/`:
                     if let Func::Prim(s) = inner {
-                        match resolve(*s).as_str() {
+                        match resolve(*s) {
                             "+" => return ops::sum_op(&vals[0]),
                             "*" => return ops::eval_unary_prim("prd", &vals[0]),
                             "&" => return ops::minmax_op(&vals[0], true),
@@ -1622,7 +1631,7 @@ impl<'a> Engine<'a> {
             AdverbKind::Scan => match vals.len() {
                 1 => {
                     if let Func::Prim(s) = inner {
-                        match resolve(*s).as_str() {
+                        match resolve(*s) {
                             "+" => return ops::eval_unary_prim("sums", &vals[0]),
                             "*" => return ops::eval_unary_prim("prds", &vals[0]),
                             "&" => return ops::eval_unary_prim("mins", &vals[0]),
@@ -1697,7 +1706,7 @@ impl<'a> Engine<'a> {
                     let first = cv.get_atom(0);
                     out.push(match inner {
                         // a comparison compares the first item with a null; dividing it by one makes it a float
-                        Func::Prim(s) if matches!(resolve(*s).as_str(), "=" | "~" | "<>" | "<" | "<=" | ">" | ">=") => {
+                        Func::Prim(s) if matches!(resolve(*s), "=" | "~" | "<>" | "<" | "<=" | ">" | ">=") => {
                             self.apply_func(inner, &[first, cv.null_atom()])?
                         }
                         Func::Prim(s) if resolve(*s) == "%" => self.apply_func(inner, &[first, K::Long(1)])?,
@@ -1901,7 +1910,7 @@ impl<'a> Engine<'a> {
         };
         let apply_op = |cur: &K, v: &K, eng: &mut Self| -> KResult<K> {
             if let Some(op_s) = op {
-                eng.eval_binary_dispatch(&resolve(op_s), cur, v)
+                eng.eval_binary_dispatch(resolve(op_s), cur, v)
             } else {
                 Ok(v.clone())
             }
@@ -1976,7 +1985,7 @@ impl<'a> Engine<'a> {
                 if let Some(K::Sym(col)) = first {
                     let nv = if let Some(op_s) = op {
                         let cur = f.col(*col).cloned().map(K::Vector).unwrap_or(K::Null);
-                        self.eval_binary_dispatch(&resolve(op_s), &cur, rhs)?
+                        self.eval_binary_dispatch(resolve(op_s), &cur, rhs)?
                     } else {
                         rhs.clone()
                     };
@@ -2303,7 +2312,7 @@ pub(crate) fn is_ephemeral_var(name: SymId) -> bool {
 fn is_ambivalent_prim(func: &Func) -> bool {
     match func {
         Func::Prim(s) => matches!(
-            resolve(*s).as_str(),
+            resolve(*s),
             "+" | "-" | "*" | "&" | "|" | "<" | ">" | "=" | "~" | "," | "!" | "#" | "_" | "$" | "?" | "@" | "."
         ),
         Func::Adverb { kind, .. } => matches!(
