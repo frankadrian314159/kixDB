@@ -451,6 +451,13 @@ impl<'a> Parser<'a> {
             self.pos = saved_pos;
             return Ok(None);
         };
+        // as in q, nothing can be assigned through a second pair of brackets: the indices go in one
+        let first = self.pos;
+        while matches!(self.peek(), Tok::LBrack) && self.parse_bracket_args().is_ok() {}
+        if self.pos > first && matches!(self.peek(), Tok::Colon | Tok::DoubleColon | Tok::OpColon(_)) {
+            return Err(KError::new("assign", "assign through x[i;j], not x[i][j]"));
+        }
+        self.pos = first;
         let assign = match self.peek() {
             Tok::Colon | Tok::DoubleColon => {
                 let after = self.pos + 1;

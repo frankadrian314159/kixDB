@@ -59,6 +59,10 @@ Unlike kdb+, which holds positions in the domain:
 
 * assignment `:`, global `::`, amend `x[i]:v`, `x+:1`, `@[d;i;f;y]`, deep amend `.[d;path;f;y]`; `x+::1` and
   `x[i]::v` change the global from inside a function (a local of that name, where there is one, as `x::v` does)
+* assignment at depth `x[i;j]:v` and `x[i;j]+:v`: an index left empty (`x[;j]`) or a list of indices stands for each
+  of those items, and a list of values then gives one to each (`'length` otherwise). Nothing can be assigned through a
+  second pair of brackets (`x[i][j]:v` is `'assign`). A row of a table is not assigned so (`t[i;c]:v` is `'nyi`; give
+  the column first, `t[c;i]:v`, or use `update`)
 * lambdas `{[a;b] ...}` (implicit `x y z`), projections `f[1;]`, early return `:value`
 * adverbs `'` `/` `\` `':` `/:` `\:`, and the words `each`, `over`, `scan`, `prior`
 * `$[c;t;f]`, `if[...]`, `do[...]`, `while[...]`; a null condition is true; `[a;b;c]` runs expressions in turn
