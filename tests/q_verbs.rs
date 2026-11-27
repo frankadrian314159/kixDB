@@ -99,6 +99,28 @@ fn tables_as_lists_of_rows() {
 }
 
 #[test]
+fn find_gives_the_first_place_of_each() {
+    check("x: 5 7 5 9 0N; f: 1.5 -0.0 0n 1.5; s: `b`a`b; m: (1; `a; \"cd\"; 2.5); t: ([] c: (\"ab\"; \"cd\"; \"ab\")); long: (til 1000), til 1000", &[
+        ("(x ? 5; x ? 9; x ? 4; x ? 0N)", "0 3 5 4"),
+        ("(x ? 5i; x ? 5.0; x ? `a)", "5 5 5"),
+        ("(f ? 1.5; f ? 0.0; f ? 0n; f ? 2.5)", "0 1 2 4"),
+        ("(s ? `b; s ? `z)", "0 3"),
+        ("(m ? `a; m ? \"cd\"; m ? 2.5; m ? 9)", "1 2 3 4"),
+        ("x ? 9 5 4", "3 0 5"),
+        ("x ? 0#0", "`long$()"),
+        // many at once, of the list's type and of others
+        ("long ? 999 0 5 5 1000 -1 7 8 9 10", "999 0 5 5 2000 2000 7 8 9 10"),
+        ("(f ? 10#1.5 0n; s ? 10#`a`z)", "(0 2 0 2 0 2 0 2 0 2;1 3 1 3 1 3 1 3 1 3)"),
+        ("x ? 10#5.0", "5 5 5 5 5 5 5 5 5 5"),
+        ("(t`c) ? \"cd\"", "1"),
+        ("(t`c) ? 10#(\"cd\"; \"zz\")", "1 3 1 3 1 3 1 3 1 3"),
+        ("(t`c) ? (\"ab\"; \"zz\")", "0 3"),
+        // (a string that is not there is looked for as its characters, none of which is a string)
+        ("(t`c) ? \"zz\"", "3 3"),
+    ]);
+}
+
+#[test]
 fn all_and_any_give_booleans_even_of_nothing() {
     check("t: ([] c: 1 2; n: 1 0); e: 0#t", &[
         ("(all `boolean$(); any 0#0b)", "10b"),

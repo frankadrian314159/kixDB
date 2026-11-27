@@ -1,5 +1,23 @@
 # Benchmark results: scale factor 0.3
 
+## Finding items with `?`
+
+Measured 2026-11-26 **on battery**, where the machine is about half as fast: commit `d507205` and the change below, run
+back to back, one run each. Before, finding even one item numbered every item of the list. Now one item, or each of up
+to eight, is looked for by reading as far as it; many of the list's own type are found in one reading that stops when
+all are. Milliseconds a lookup:
+
+| Lookup | `d507205` | now |
+| --- | ---: | ---: |
+| one float among 5,000,000 | 3,640 | 2 |
+| one that is not there | 3,272 | 7 |
+| three floats | 3,378 | 9 |
+| 100 floats at random | 3,286 | 66 |
+| one long among 5,000,000 | 3,262 | 1 |
+| 100 longs at random | 3,328 | 31 |
+| a string that is not among 1,000,000 | 698 | 1 |
+| 100 strings | 743 | 11 |
+
 ## Copying less while filtering
 
 Measured 2026-11-26 on mains power: commit `341ec82` and the changes below, run back to back, one run each. Provisional,

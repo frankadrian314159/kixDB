@@ -822,19 +822,25 @@ impl ColVec {
         of!(Bool Guid Byte Short Int Long Real Float Char Sym Timestamp Month Date Datetime Timespan Minute Second Time)
     }
 
-    /// The first row that holds `atom`.
+    /// The first row that holds `atom`, as `hash_key`s have it (so all NaNs are one value, as are both zeros).
     pub fn position(&self, atom: &K) -> Option<usize> {
-        match (self, atom) {
-            (ColVec::Long(_, v), K::Long(x)) => v.iter().position(|y| y == x),
-            (ColVec::Int(_, v), K::Int(x)) => v.iter().position(|y| y == x),
-            (ColVec::Sym(_, v), K::Sym(x)) => v.iter().position(|y| y == x),
-            (ColVec::Date(_, v), K::Date(x)) => v.iter().position(|y| y == x),
-            (ColVec::Strings(_, v), K::Vector(ColVec::Char(_, x))) => v.iter().position(|y| y == x.as_slice()),
-            _ => {
-                let key = atom.hash_key();
-                (0..self.len()).position(|i| self.get_atom(i).hash_key() == key)
-            }
+        macro_rules! on {
+            ($($same:ident)*; $($float:ident)*) => {
+                match (self, atom) {
+                    $((ColVec::$same(_, v), K::$same(x)) => v.iter().position(|y| y == x),)*
+                    $((ColVec::$float(_, v), K::$float(x)) => v.iter().position(|y| y == x || y.is_nan() && x.is_nan()),)*
+                    (ColVec::Strings(_, v), K::Vector(ColVec::Char(_, x))) => v.iter().position(|y| y == x.as_slice()),
+                    (ColVec::Strings(..), _) => None,
+                    // a list of one type holds nothing of another
+                    _ if !self.is_list() && !matches!(self, ColVec::Enum(..)) && !matches!(atom, K::Enum(..)) && atom.type_num() != -self.type_num() => None,
+                    _ => {
+                        let key = atom.hash_key();
+                        (0..self.len()).position(|i| self.get_atom(i).hash_key() == key)
+                    }
+                }
+            };
         }
+        on!(Bool Guid Byte Short Int Long Char Sym Timestamp Month Date Timespan Minute Second Time; Real Float Datetime)
     }
 
     /// Normalize a general list of uniform atoms into a typed vector (kdb+'s auto-collapse rule).

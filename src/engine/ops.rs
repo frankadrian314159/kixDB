@@ -2795,25 +2795,53 @@ fn find_or_roll_op(lhs: &K, rhs: &K) -> KResult<K> {
                 return Ok(K::Long(idx as i64));
             }
         }
+        let miss = hay.len() as i64;
+        let place = |needle: &K| hay.position(needle).map_or(miss, |i| i as i64);
+        let places = |found: Vec<i64>| Ok(K::Vector(ColVec::Long(Attr::None, Arc::new(found))));
+        let needles = match rhs {
+            K::Vector(needles) => needles,
+            // one item, or each of a few, is looked for by reading as far as it
+            atom => return Ok(K::Long(place(atom))),
+        };
+        if needles.len() <= 8 {
+            return places((0..needles.len()).map(|i| place(&needles.get_atom(i))).collect());
+        }
+        // many of the list's own type: it is read once, no further than it takes to find them all
+        if needles.type_num() == hay.type_num() && !matches!(hay, ColVec::Enum(..)) {
+            if let (Some(have), Some(want)) = (hay.key_bits(), needles.key_bits()) {
+                return places(first_places(have.iter().copied(), &want, hay.len()));
+            }
+        }
+        if let (ColVec::Strings(_, have), Some(ColVec::Strings(_, want))) = (hay, needles.packed().as_deref()) {
+            return places(first_places(have.iter(), &want.iter().collect::<Vec<_>>(), hay.len()));
+        }
         let mut first_idx: HashMap<Vec<u8>, i64> = HashMap::with_capacity(hay.len());
         for i in 0..hay.len() {
             first_idx.entry(hay.get_atom(i).hash_key()).or_insert(i as i64);
         }
-        let miss = hay.len() as i64;
-        if let K::Vector(needles) = rhs {
-            let out: Vec<i64> = (0..needles.len())
-                .map(|i| *first_idx.get(&needles.get_atom(i).hash_key()).unwrap_or(&miss))
-                .collect();
-            return Ok(K::Vector(ColVec::Long(Attr::None, Arc::new(out))));
-        } else {
-            return Ok(K::Long(*first_idx.get(&rhs.hash_key()).unwrap_or(&miss)));
-        }
+        return places((0..needles.len()).map(|i| *first_idx.get(&needles.get_atom(i).hash_key()).unwrap_or(&miss)).collect());
     }
     if let K::Dict(d) = lhs {
         let pos = find_or_roll_op(&d.vals, rhs)?;
         return index_k(&d.keys, &[Some(pos)]);
     }
     Err(KError::ty("? requires integer LHS (roll) or vector/dict LHS (find)"))
+}
+
+/// The first place of each of the `needles` among the `len` items of a list, which is read only until all are found.
+fn first_places<T: Hash + Eq + Copy>(items: impl Iterator<Item = T>, needles: &[T], len: usize) -> Vec<i64> {
+    let miss = len as i64;
+    let mut at: HashMap<T, i64> = needles.iter().map(|&n| (n, miss)).collect();
+    let mut sought = at.len();
+    let mut items = items.enumerate();
+    while sought > 0 {
+        let Some((i, item)) = items.next() else { break };
+        if let Some(place) = at.get_mut(&item).filter(|place| **place == miss) {
+            *place = i as i64;
+            sought -= 1;
+        }
+    }
+    needles.iter().map(|n| at[n]).collect()
 }
 
 fn in_op(lhs: &K, rhs: &K) -> KResult<K> {
