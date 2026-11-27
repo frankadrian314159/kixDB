@@ -115,8 +115,18 @@ fn find_gives_the_first_place_of_each() {
         ("(t`c) ? \"cd\"", "1"),
         ("(t`c) ? 10#(\"cd\"; \"zz\")", "1 3 1 3 1 3 1 3 1 3"),
         ("(t`c) ? (\"ab\"; \"zz\")", "0 3"),
-        // (a string that is not there is looked for as its characters, none of which is a string)
-        ("(t`c) ? \"zz\"", "3 3"),
+        ("(t`c) ? \"zz\"", "3"),
+        // a list of lists is searched for a simple list as a whole, as q does
+        ("((\"ab\"; \"cd\") ? \"cd\"; (\"ab\"; \"cd\") ? \"xy\"; (\"ab\"; \"cd\") ? \"a\")", "1 2 2"),
+        ("(((0; 1 2); 3 4; 5 6) ? 5 6; (1 2; 3 4) ? 5 6; (1 2; 3 4; `a`b) ? `a`b; (1 2; 3 4) ? 0#0)", "2 2 2 2"),
+        // and for each of a list of lists
+        ("(\"ab\"; \"cd\") ? (\"cd\"; \"xy\")", "1 2"),
+        ("d: `a`b!(\"ab\"; \"cd\"); (d ? \"cd\"; d ? \"xy\")", "`b`"),
+        // a list of mixed values is looked for item by item, even where it is itself an item (q's reference examples)
+        ("u: (\"abcde\"; 10 2 -6; (2 3; `ab)); (u ? 10 2 -6; u ? \"abcde\")", "1 0"),
+        ("u ? (2 3; `ab)", "3 3"),
+        // while a simple list is still found among values that are not all lists
+        ("((1; `a; \"cd\") ? \"cd\"; (1; `a; \"cd\") ? (\"cd\"; 1))", "(2;2 0)"),
     ]);
 }
 

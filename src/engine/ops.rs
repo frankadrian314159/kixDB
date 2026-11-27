@@ -2775,13 +2775,18 @@ fn find_or_roll_op(lhs: &K, rhs: &K) -> KResult<K> {
 
     // 2. Find (`vec ? x`): first index of each item of `rhs` in `lhs` (`count lhs` if not found, as in kdb+!)
     if let K::Vector(hay) = lhs {
-        if let (ColVec::Strings(_, s), K::Vector(ColVec::Char(_, needle))) = (hay, rhs) {
-            if let Some(i) = s.iter().position(|item| item == needle.as_slice()) {
-                return Ok(K::Long(i as i64));
-            }
+        // a list of lists is searched for a simple list as a whole: one that it does not hold is just past its end
+        let of_lists = match hay {
+            ColVec::Strings(..) => true,
+            ColVec::General(_, items) => items.first().is_some_and(|first| !first.is_atom()),
+            _ => false,
+        };
+        if of_lists && matches!(rhs, K::Vector(wanted) if !wanted.is_list()) {
+            return Ok(K::Long(hay.position(rhs).unwrap_or(hay.len()) as i64));
         }
-        if let (ColVec::General(_, items), K::Vector(_)) = (hay, rhs) {
-            if let Some(i) = items.iter().position(|item| item == rhs) {
+        // (a list of mixed values is looked for item by item, as q does, even where it is itself an item)
+        if let (ColVec::General(_, items), K::Vector(wanted)) = (hay, rhs) {
+            if let Some(i) = items.iter().position(|item| item == rhs).filter(|_| !wanted.is_list()) {
                 return Ok(K::Long(i as i64));
             }
         }
