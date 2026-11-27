@@ -61,6 +61,8 @@ pub(crate) struct Shared {
     next_session_id: AtomicU64,
     crashed: AtomicBool,
     interceptor: Mutex<Option<Arc<InterceptorFactory>>>,
+    /// The workspace's, which can be had while a statement holds the workspace.
+    pub(crate) host: Arc<engine::Host>,
 }
 
 impl Drop for Shared {
@@ -93,19 +95,36 @@ impl Server {
     /// Let (or stop letting) the workspace run commands of the operating system (`\ls`, `system "ls"`), which it does
     /// not at first. Binding a `Listener` sets this to what its configuration says.
     pub fn allow_shell_commands(&self, allow: bool) {
-        self.read_workspace(|ws| ws.host.shell.store(allow, Ordering::SeqCst));
+        self.shared.host.shell.store(allow, Ordering::SeqCst);
     }
 
-    /// Create a transient in-memory workspace (nothing written to disk).
-    pub fn new() -> Self {
+    /// Let `\p` open ports: `open` is given the number of one, or 0 to close what it opened.
+    pub fn when_asked_to_listen(&self, open: impl Fn(Server, u16) -> KResult<()> + Send + Sync + 'static) {
+        let server = Arc::downgrade(&self.shared);
+        let opener = move |port| server.upgrade().map_or(Ok(()), |shared| open(Server { shared }, port));
+        let _ = self.shared.host.opener.set(engine::Opener(Box::new(opener)));
+    }
+
+    /// Whether a port is open or the timer runs, so that the process has something left to do.
+    pub fn is_serving(&self) -> bool {
+        self.shared.host.port.load(Ordering::SeqCst) != 0 || self.shared.host.timer_ms.load(Ordering::SeqCst) != 0
+    }
+
+    fn around(ws: engine::Workspace) -> Self {
         Self {
             shared: Arc::new(Shared {
-                ws: RwLock::new(Workspace::new()),
+                host: ws.host.clone(),
+                ws: RwLock::new(ws),
                 next_session_id: AtomicU64::new(1),
                 crashed: AtomicBool::new(false),
                 interceptor: Mutex::new(None),
             }),
         }
+    }
+
+    /// Create a transient in-memory workspace (nothing written to disk).
+    pub fn new() -> Self {
+        Self::around(Workspace::new())
     }
 
     /// Open (or create) a durable workspace in `dir` backed by a checksummed WAL (`kix.wal`), atomic snapshots (`kix.snap`),
@@ -117,14 +136,7 @@ impl Server {
     pub fn open_with(dir: impl AsRef<Path>, opts: StorageOptions) -> KResult<Self> {
         let (p, ws) = persist::Persist::open(dir.as_ref(), opts)?;
         *ws.persist.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
-        Ok(Self {
-            shared: Arc::new(Shared {
-                ws: RwLock::new(ws),
-                next_session_id: AtomicU64::new(1),
-                crashed: AtomicBool::new(false),
-                interceptor: Mutex::new(None),
-            }),
-        })
+        Ok(Self::around(ws))
     }
 
     pub fn connect(&self) -> Connection {
@@ -193,8 +205,7 @@ impl Server {
     pub fn private_copy(&self) -> Server {
         let mut copy = self.read_workspace(engine::Workspace::snapshot);
         copy.read_only = false;
-        let copy = RwLock::new(copy);
-        Server { shared: Arc::new(Shared { ws: copy, next_session_id: AtomicU64::new(1), crashed: AtomicBool::new(false), interceptor: Mutex::new(None) }) }
+        Server::around(copy)
     }
 
     /// Log the next change to each variable the engine now holds as its whole new value: for the first start of a

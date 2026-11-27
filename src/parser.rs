@@ -203,11 +203,13 @@ struct Parser<'a> {
     stop_on_comma: bool,
     /// When true, top-level keywords `by`, `from`, `where` terminate an expression inside a qSQL statement.
     in_qsql: bool,
+    /// Whether the expression just parsed ends in a verb that waits for its argument, as `x+` and `f value@` do.
+    open_verb: bool,
 }
 
 impl<'a> Parser<'a> {
     fn new(toks: &'a [Tok]) -> Self {
-        Self { toks, pos: 0, stop_on_comma: false, in_qsql: false }
+        Self { toks, pos: 0, stop_on_comma: false, in_qsql: false, open_verb: false }
     }
 
     fn peek(&self) -> &Tok {
@@ -356,6 +358,9 @@ impl<'a> Parser<'a> {
                     return Ok(Expr::Lit(K::Func(Func::Prim(intern(&op_str)))));
                 }
                 let rhs = self.parse_expr()?;
+                if self.waits(&rhs) {
+                    return Ok(Expr::Compose(Box::new(Expr::Lit(K::Func(Func::Prim(intern(&op_str))))), Box::new(rhs)));
+                }
                 return Ok(Expr::Unary { op: intern(&op_str), arg: Box::new(rhs) });
             }
         }
@@ -370,6 +375,9 @@ impl<'a> Parser<'a> {
             let called = matches!(self.peek(), Tok::Op(_)) && matches!(self.peek_n(1), Tok::LBrack);
             if is_unary_keyword(&name) && !self.is_expr_end() && (called || self.peek_binary_op().is_none()) {
                 let rhs = self.parse_expr()?;
+                if self.waits(&rhs) {
+                    return Ok(Expr::Compose(Box::new(lhs), Box::new(rhs)));
+                }
                 return Ok(Expr::Unary { op: *sym, arg: Box::new(rhs) });
             }
         }
@@ -378,6 +386,8 @@ impl<'a> Parser<'a> {
         if !self.is_expr_end()
             && matches!(self.peek(), Tok::Op(_) | Tok::Comma | Tok::Ident(_) | Tok::LBrace { .. })
             && matches!(self.peek_n(1), Tok::Adverb(_))
+            // (`neg union/[x]` applies `neg` to what the brackets give)
+            && !matches!(self.peek_n(2), Tok::LBrack)
         {
             let adv_fn = self.parse_term()?;
             let rhs = self.parse_expr()?;
@@ -391,21 +401,34 @@ impl<'a> Parser<'a> {
         if !self.is_expr_end() {
             if let Some(bin_op) = self.peek_binary_op() {
                 self.next();
+                let target = Box::new(Expr::Lit(K::Func(Func::Prim(intern(&bin_op)))));
                 if self.is_expr_end() {
-                    let target = Box::new(Expr::Lit(K::Func(Func::Prim(intern(&bin_op)))));
+                    self.open_verb = true;
                     return Ok(Expr::Apply { target, args: vec![Some(lhs), None] });
                 }
                 // Special case: `0N!x` (debug print and return `x`) vs dict `!`
                 let rhs = self.parse_expr()?;
+                if self.waits(&rhs) {
+                    let outer = Expr::Apply { target, args: vec![Some(lhs), None] };
+                    return Ok(Expr::Compose(Box::new(outer), Box::new(rhs)));
+                }
                 return Ok(Expr::Binary { op: intern(&bin_op), lhs: Box::new(lhs), rhs: Box::new(rhs) });
             }
 
             // Juxtaposition application (`f x`, e.g. `{x+1} 5`, `(+/) 1 2 3`, `myfn 10`, `t 0`, `` `s#1 2 3 `` already handled by `#`)!
             let rhs = self.parse_expr()?;
+            if self.waits(&rhs) {
+                return Ok(Expr::Compose(Box::new(lhs), Box::new(rhs)));
+            }
             return Ok(Expr::Juxt { func: Box::new(lhs), arg: Box::new(rhs) });
         }
 
         Ok(lhs)
+    }
+
+    /// Whether `e`, just parsed, ends in a verb that waits for its argument.
+    fn waits(&self, e: &Expr) -> bool {
+        self.open_verb && matches!(e, Expr::Apply { .. } | Expr::Compose(..))
     }
 
     fn peek_prefix_op(&self) -> Option<String> {
@@ -423,7 +446,7 @@ impl<'a> Parser<'a> {
         match self.peek() {
             Tok::Op(s) => Some(s.clone()),
             Tok::Comma if !self.stop_on_comma => Some(",".into()),
-            Tok::Ident(s) if is_binary_keyword(s) => {
+            Tok::Ident(s) if is_binary_keyword(s) && !(matches!(self.peek_n(1), Tok::Adverb(_)) && matches!(self.peek_n(2), Tok::LBrack)) => {
                 // Only treat as infix binary operator if NOT followed by `[` with no rhs, wait: `t lj kt[0]` -> `lj` is infix, `kt[0]` is rhs!
                 // What if `x mavg[3; y]`? Nobody writes `lhs binverb[a;b]`; if `[` immediately follows `binverb`, wait: `1 + mavg[2; 1 2 3]` has `+` before `mavg`!
                 // Here `lhs` was ALREADY parsed, so `lhs binverb ...` is ALWAYS infix `binverb`!
@@ -515,6 +538,7 @@ impl<'a> Parser<'a> {
             }
         }
 
+        self.open_verb = false;
         Ok(base)
     }
 

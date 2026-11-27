@@ -42,6 +42,32 @@ fn multiply(a: &[Vec<f64>], b: &[Vec<f64>]) -> KResult<Vec<Vec<f64>>> {
     Ok(a.iter().map(|row| (0..width).map(|j| row.iter().zip(b).map(|(x, r)| x * r[j]).sum()).collect()).collect())
 }
 
+/// `x mmu y`, which `x$y` of floats is too: the product of matrices, where a list on the left stands for a row and
+/// one on the right for a column.
+pub(crate) fn mmu(x: &K, y: &K) -> KResult<K> {
+    let list = |k: &K| matches!(k, K::Vector(v) if v.is_numeric());
+    // of two vectors, their dot product
+    if list(x) && list(y) {
+        if x.count() != y.count() {
+            return Err(KError::length("the lists do not fit each other"));
+        }
+        return eval_binary_prim("wsum", x, y);
+    }
+    let numbers = |k: &K| match k {
+        K::Vector(v) => v.as_f64_vec().unwrap_or_default(),
+        _ => vec![],
+    };
+    let a = if list(x) { vec![numbers(x)] } else { matrix(x)? };
+    let b = if list(y) { numbers(y).into_iter().map(|n| vec![n]).collect() } else { matrix(y)? };
+    let product = multiply(&a, &b)?;
+    let floats = |row: Vec<f64>| K::Vector(ColVec::Float(Attr::None, Arc::new(row)));
+    Ok(match (list(x), list(y)) {
+        (true, _) => floats(product.into_iter().next().unwrap_or_default()),
+        (_, true) => floats(product.into_iter().flatten().collect()),
+        _ => from_matrix(product),
+    })
+}
+
 fn transpose(m: &[Vec<f64>]) -> Vec<Vec<f64>> {
     (0..m.first().map_or(0, Vec::len)).map(|j| m.iter().map(|row| row[j]).collect()).collect()
 }
@@ -134,11 +160,7 @@ pub fn binary(op: &str, x: &K, y: &K) -> Option<KResult<K>> {
             let n = x.count() as f64;
             Ok(K::Float(c.as_f64()? * n / (n - 1.0)))
         }),
-        "mmu" => match (x, y) {
-            // of two vectors, their dot product
-            (K::Vector(a), K::Vector(b)) if a.is_numeric() && b.is_numeric() => eval_binary_prim("wsum", x, y),
-            _ => matrix(x).and_then(|a| multiply(&a, &matrix(y)?)).map(from_matrix),
-        },
+        "mmu" => mmu(x, y),
         // the `w` with `w mmu y` closest to `x`
         "lsq" => matrix(x).and_then(|a| {
             let b = matrix(y)?;

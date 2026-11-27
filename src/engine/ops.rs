@@ -4,9 +4,10 @@ use crate::sym::{intern, resolve, SymId};
 use crate::types::*;
 use foldhash::{HashMap, HashMapExt, HashSet};
 use rayon::prelude::*;
-use chrono::Datelike;
+use rand::Rng;
 use regex::Regex;
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::hash::Hash;
 use std::ops::Range;
@@ -15,6 +16,30 @@ use crate::engine::rows::Set as SetOp;
 use crate::engine::par;
 use crate::temporal;
 use std::sync::Arc;
+
+// ----- Calendar settings ----------------------------------------------------
+
+/// `\W`, the day that weeks start on (0 is Saturday, 2 Monday), and `\z`, whether `"D"$` reads a day before its month.
+#[derive(Clone, Copy, Debug)]
+pub struct Calendar {
+    pub week_start: u8,
+    pub day_first: bool,
+}
+
+impl Default for Calendar {
+    fn default() -> Self {
+        Calendar { week_start: 2, day_first: false }
+    }
+}
+
+thread_local! {
+    static CALENDAR: Cell<Calendar> = Cell::new(Calendar::default());
+}
+
+/// Read dates and weeks as `calendar` says, on this thread.
+pub fn use_calendar(calendar: Calendar) {
+    CALENDAR.set(calendar);
+}
 
 // ----- Temporal / Dict / Table `.field` Extraction --------------------------
 
@@ -91,13 +116,8 @@ fn date_part(days: i32, field: &str) -> Option<K> {
         "dd" => Some(K::Int(d as i32)),
         "month" => Some(K::Month((y - 2000) * 12 + (m as i32 - 1))),
         "date" => Some(K::Date(days)),
-        "week" => {
-            // Monday of week in kdb+
-            let epoch = chrono::NaiveDate::from_ymd_opt(2000, 1, 1)?;
-            let nd = epoch.checked_add_signed(chrono::Duration::days(days as i64))?;
-            let wd = nd.weekday().num_days_from_monday() as i32;
-            Some(K::Date(days - wd))
-        }
+        // (day 0, 2000.01.01, was a Saturday)
+        "week" => Some(K::Date(days - (days - i32::from(CALENDAR.get().week_start)).rem_euclid(7))),
         _ => None,
     }
 }
@@ -2233,6 +2253,10 @@ fn take_or_attr_op(lhs: &K, rhs: &K) -> KResult<K> {
 
     let n = lhs.as_i64()?;
     match rhs {
+        // (an empty general list is an item to take, as in `3#()`)
+        K::Vector(ColVec::General(_, items)) if items.is_empty() => {
+            Ok(K::Vector(ColVec::General(Attr::None, Arc::new(vec![rhs.clone(); n.unsigned_abs() as usize]))))
+        }
         K::Vector(cv) => Ok(K::Vector(cv.take(n))),
         K::Table(t) => Ok(K::Table(Arc::new(t.take(n)))),
         K::KeyedTable(kt) => Ok(K::KeyedTable(Arc::new(KeyedTable { keys: kt.keys.take(n), vals: kt.vals.take(n) }))),
@@ -2370,7 +2394,15 @@ pub fn cast_op(lhs: &K, rhs: &K) -> KResult<K> {
     if let K::Short(n) = lhs {
         let letter = "bg?xhijefcspmdznuvt".chars().nth((*n as usize).wrapping_sub(1)).filter(|&c| c != '?');
         let name = letter.and_then(type_name_from_char).ok_or_else(|| KError::domain(format!("no type {n}h")))?;
-        return cast_by_name(name, rhs);
+        return cast_op(&K::sym(name), rhs);
+    }
+    // `x$y` of float lists and matrices is their product
+    let floats = |k: &K| match k {
+        K::Vector(ColVec::General(_, rows)) => !rows.is_empty() && rows.iter().all(|r| matches!(r, K::Vector(ColVec::Float(..)))),
+        other => matches!(other, K::Vector(ColVec::Float(..))),
+    };
+    if floats(lhs) && floats(rhs) {
+        return builtins::mmu(lhs, rhs);
     }
     // 1. Padding `width $ string` (`10$"abc"`, `-10$"abc"`)
     if let Ok(width) = lhs.as_i64() {
@@ -2422,7 +2454,7 @@ pub fn cast_op(lhs: &K, rhs: &K) -> KResult<K> {
             return parse_from_string_type(c.to_ascii_lowercase(), rhs);
         } else {
             let tname = type_name_from_char(c).ok_or_else(|| KError::domain(format!("unknown cast char '{c}'")))?;
-            return cast_by_name(tname, rhs);
+            return cast_op(&K::sym(tname), rhs);
         }
     }
 
@@ -2634,6 +2666,9 @@ pub fn parse_atom_from_str(type_ch: char, s: &str) -> K {
             // a year written last follows the month and the day
             if parts.len() == 3 && parts[2].len() == 4 {
                 parts.rotate_right(1);
+                if CALENDAR.get().day_first {
+                    parts.swap(1, 2);
+                }
             }
             let date = match parts.as_slice() {
                 [y, m, d] => y.parse().ok().zip(m.parse().ok()).zip(d.parse().ok()).and_then(|((y, m), d)| date_from_ymd(y, m, d)),
@@ -2720,57 +2755,59 @@ fn like_bound(drawn: Vec<i64>, bound: &K) -> KResult<K> {
     }
 }
 
+/// `n?y`: `n` items drawn from a list, or numbers below a bound, symbols of that many letters or guids; with `n`
+/// negative, numbers each drawn once.
+pub fn roll(n: i64, rhs: &K, rng: &mut impl Rng) -> KResult<K> {
+    let un = n.unsigned_abs() as usize;
+    if let K::Vector(cv) = rhs {
+        if cv.is_empty() {
+            return Err(KError::domain("cannot sample from empty vector"));
+        }
+        let idx: Vec<usize> = (0..un).map(|_| rng.gen_range(0..cv.len())).collect();
+        return Ok(K::Vector(cv.gather(&idx)));
+    }
+    if let K::Sym(s) = rhs {
+        let slen: usize = resolve(*s).parse().unwrap_or(4);
+        let syms: Vec<SymId> = (0..un)
+            .map(|_| {
+                let word: String = (0..slen).map(|_| (b'a' + rng.gen_range(0..26)) as char).collect();
+                intern(&word)
+            })
+            .collect();
+        return Ok(K::Vector(ColVec::Sym(Attr::None, Arc::new(syms))));
+    }
+    if matches!(rhs, K::Guid(_)) {
+        // (guids are to differ from run to run, whatever the seed)
+        let out: Vec<[u8; 16]> = (0..un).map(|_| rand::thread_rng().gen()).collect();
+        return Ok(K::Vector(ColVec::Guid(Attr::None, Arc::new(out))));
+    }
+    if let K::Float(bound) = rhs {
+        let out: Vec<f64> = (0..un).map(|_| rng.gen_range(0.0..*bound)).collect();
+        return Ok(K::Vector(ColVec::Float(Attr::None, Arc::new(out))));
+    }
+    let bound = rhs.as_i64()?;
+    if bound <= 0 {
+        return Err(KError::domain("roll bound must be positive"));
+    }
+    if n >= 0 {
+        return like_bound((0..un).map(|_| rng.gen_range(0..bound)).collect(), rhs);
+    }
+    if (un as i64) > bound {
+        return Err(KError::length("deal count exceeds bound"));
+    }
+    let mut pool: Vec<i64> = (0..bound).collect();
+    for i in 0..un {
+        let j = rng.gen_range(i..pool.len());
+        pool.swap(i, j);
+    }
+    pool.truncate(un);
+    like_bound(pool, rhs)
+}
+
 fn find_or_roll_op(lhs: &K, rhs: &K) -> KResult<K> {
-    // 1. Roll / Deal / Sample (`5 ? 100` -> 5 random longs in `0..100`; `-5 ? 100` -> without replacement; `5 ? \`3` -> random 3-letter syms; `5 ? vec` -> sample from vec!)
+    // 1. Roll / deal / sample. (A whole number on the left is always this: a list is searched.)
     if matches!(lhs, K::Long(_) | K::Int(_)) {
-        let n = lhs.as_i64()?;
-        // Wait: if LHS is a vector (`10 20 30 ? 20`), `lhs` is `K::Vector`, NOT `K::Long`! So scalar integer LHS is ALWAYS roll/deal in kdb+!
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        let un = n.unsigned_abs() as usize;
-        if let K::Vector(cv) = rhs {
-            if cv.is_empty() {
-                return Err(KError::domain("cannot sample from empty vector"));
-            }
-            let idx: Vec<usize> = (0..un).map(|_| rng.gen_range(0..cv.len())).collect();
-            return Ok(K::Vector(cv.gather(&idx)));
-        }
-        if let K::Sym(s) = rhs {
-            let slen: usize = resolve(*s).parse().unwrap_or(4);
-            let syms: Vec<SymId> = (0..un)
-                .map(|_| {
-                    let word: String = (0..slen).map(|_| (b'a' + rng.gen_range(0..26)) as char).collect();
-                    intern(&word)
-                })
-                .collect();
-            return Ok(K::Vector(ColVec::Sym(Attr::None, Arc::new(syms))));
-        }
-        if matches!(rhs, K::Guid(_)) {
-            let out: Vec<[u8; 16]> = (0..un).map(|_| rng.gen()).collect();
-            return Ok(K::Vector(ColVec::Guid(Attr::None, Arc::new(out))));
-        }
-        if let K::Float(bound) = rhs {
-            let out: Vec<f64> = (0..un).map(|_| rng.gen_range(0.0..*bound)).collect();
-            return Ok(K::Vector(ColVec::Float(Attr::None, Arc::new(out))));
-        }
-        let bound = rhs.as_i64()?;
-        if bound <= 0 {
-            return Err(KError::domain("roll bound must be positive"));
-        }
-        if n < 0 {
-            if (un as i64) > bound {
-                return Err(KError::length("deal count exceeds bound"));
-            }
-            let mut pool: Vec<i64> = (0..bound).collect();
-            for i in 0..un {
-                let j = rng.gen_range(i..pool.len());
-                pool.swap(i, j);
-            }
-            pool.truncate(un);
-            return like_bound(pool, rhs);
-        } else {
-            return like_bound((0..un).map(|_| rng.gen_range(0..bound)).collect(), rhs);
-        }
+        return roll(lhs.as_i64()?, rhs, &mut rand::thread_rng());
     }
 
     // 2. Find (`vec ? x`): first index of each item of `rhs` in `lhs` (`count lhs` if not found, as in kdb+!)

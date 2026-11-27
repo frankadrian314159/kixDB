@@ -11,10 +11,10 @@ use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 /// Verbs with effects: an expression that uses one is never pushed down.
-pub const EFFECTS: [&str; 27] = [
+pub const EFFECTS: [&str; 30] = [
     "insert", "upsert", "set", "system", "value", "get", "eval", "hopen", "hclose", "hcount", "hdel", "read0", "read1",
     "save", "load", "rsave", "rload", "show", ".Q.chk", ".Q.dpft", ".Q.dpfts", ".Q.en", ".Q.ens", ".Q.view", ".Q.fs",
-    ".Q.fsn", ".kix.dist",
+    ".Q.fsn", ".kix.dist", ".Q.dpt", ".Q.dpts", ".Q.hdpf",
 ];
 /// Verbs that need only a table's schema.
 const SCHEMA_VERBS: [&str; 4] = ["cols", "keys", "meta", "type"];

@@ -120,10 +120,13 @@ impl Connection {
         }
     }
 
-    /// The answer to a client's message: what `.z.pg` (`.z.ps` for an asynchronous one) makes of it, or else its value.
-    pub(crate) fn answer(&mut self, message: &K, sync: bool) -> KResult<K> {
+    /// The answer to a client's message: what `.z.pg` (`.z.ps` for an asynchronous one) makes of it, or else its value;
+    /// and whether the answer to a synchronous one was put off (`-30!`).
+    pub(crate) fn answer(&mut self, message: &K, sync: bool) -> (KResult<K>, bool) {
         let name = if sync { ".z.pg" } else { ".z.ps" };
-        self.callback(name, std::slice::from_ref(message)).unwrap_or_else(|| self.eval_ipc_message(message))
+        self.session.deferred = sync.then_some(false);
+        let answer = self.callback(name, std::slice::from_ref(message)).unwrap_or_else(|| self.eval_ipc_message(message));
+        (answer, self.session.deferred.take() == Some(true))
     }
 
     /// Give `.z.bm` a message that could not be read; whether there is one (the connection is then closed).

@@ -323,8 +323,10 @@ pub fn tokenize(src: &str) -> KResult<Vec<Tok>> {
         }
 
         // Identifiers & `.namespace.name` (note: `.` followed by letter starts a namespace ident when not directly on a value)
+        // (after `]`, as in `del[x].z.w`, a name of one of q's own namespaces is what is applied to, not a field)
+        let own_name = || i > 0 && bytes[i - 1] == b']' && matches!(bytes.get(i + 1..i + 3), Some([b'z' | b'Q' | b'h' | b'j', b'.']));
         if b.is_ascii_alphabetic()
-            || (b == b'.' && i + 1 < len && bytes[i + 1].is_ascii_alphabetic() && (after_ws || prev != PrevKind::Value))
+            || (b == b'.' && i + 1 < len && bytes[i + 1].is_ascii_alphabetic() && (after_ws || prev != PrevKind::Value || own_name()))
         {
             let start = i;
             if b == b'.' {
@@ -383,7 +385,7 @@ pub fn tokenize(src: &str) -> KResult<Vec<Tok>> {
         if matches!(b, b'+' | b'-' | b'*' | b'%' | b'&' | b'|' | b'^' | b'=' | b'<' | b'>' | b'~' | b'!' | b'#' | b'_' | b'@' | b'?') {
             let op_ch = (b as char).to_string();
             // Check compound assignment `+:`, `&:`, etc. (note: `0:` / `1:` / `2:` are lexed in numeric sequence if preceded by digit)
-            if i + 1 < len && bytes[i + 1] == b':' && matches!(b, b'+' | b'-' | b'*' | b'%' | b'&' | b'|' | b'^' | b'#' | b'_' | b'!') {
+            if i + 1 < len && bytes[i + 1] == b':' && matches!(b, b'+' | b'-' | b'*' | b'%' | b'&' | b'|' | b'^' | b'#' | b'_' | b'!' | b'@') {
                 out.push(Tok::OpColon(op_ch));
                 i += 2;
             } else {

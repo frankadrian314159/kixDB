@@ -95,7 +95,27 @@ neg[h] "a line"                   / add lines (a string or a list of strings)
 h 100 200; hclose h               / add items to a file that holds a list, otherwise the values' bytes
 ```
 
-Adding to a file that holds a list rewrites it, so each addition costs as much as the file is long.
+Adding to a file that holds a simple list (`1 2 3`) rewrites it, so each addition costs as much as the file is long.
+A file that holds a general list is a log.
+
+### Logs
+
+```q
+.[`:day; (); :; ()]               / an empty log
+h: hopen `:day
+h enlist (`upd; `trade; x)        / add a message: it costs only itself
+-11!`:day                         / run the messages, as asynchronous ones from a client are (.z.ps, else their values)
+-11!(100; `:day)                  / the first 100
+-11!(-2; `:day)                   / run none: how many are good, with the bytes they take if the log is damaged
+```
+
+* The first addition to a file that holds a general list rewrites it as a log; later ones are appended. `get` gives the
+  list, and `-11!` also replays one that `set` wrote.
+* Each message is stored with its length and a checksum. Replaying a log that is cut short or damaged runs the good
+  messages and then signals `'badtail`; `get` of it signals `'os`. To cut it to its good part:
+  ``(`:good) 1: read1 (`:day; 0; last -11!(-2; `:day))``.
+* **The format is kixdb's own:** a log that kdb+ wrote cannot be read, nor can kdb+ read this one.
+* Additions are not flushed to the disk one by one: a failure of the machine can lose the last of them.
 
 ### Delimited, fixed-width and key-value text
 
@@ -143,6 +163,14 @@ whose partitions belong to it too.
 * Mounting a directory loads its tables and values; it does not run the scripts in it. `\l` looks in the workspace's
   directory first, then in the process's.
 * A linked column (`` `other!rows ``) is not followed from one partitioned table to another.
+* `.Q.par[dir; partition; table]` says where a table goes: in `dir`, or in the segment that `par.txt` gives the
+  partition to, each in turn. `.Q.dpft` and the others write there. `.Q.dpt[dir; partition; table]` (`.Q.dpts` with a
+  domain) writes without sorting by a field.
+* `.Q.hdpf[address; dir; partition; field]` ends a day: it writes every table of the root namespace, empties it and,
+  if a process listens at `address`, has it run `\l .`. The tables are not mounted in the process that writes them.
+* `.Q.cn table` counts the rows of each partition shown, from the table given; `.Q.pn` does so for every table, reading
+  a column of each partition. `.Q.pd` and `.Q.PD` are the partitions' directories (shown, all), `.Q.P` the segments.
+  `.Q.MAP[]` does nothing: nothing is held mapped.
 
 * Any `where` clause on the partition column prunes partitions (`=`, `<`, `<=`, `>`, `>=`, `in`, `within`), whether it is
   the first clause or appears after other row-wise filters.
@@ -151,5 +179,6 @@ whose partitions belong to it too.
   columns that are read are copied.
 * Column attributes accelerate lookups and joins: `` `s# `` uses `O(log N)` binary search (`=`, `<`, `<=`, `>`, `>=`, `in`,
   `within`, `?`, keyed joins), while `` `u# ``, `` `p# `` (such as HDB `sym` written by `.Q.dpft`) and `` `g# `` maintain
-  cached `O(1)` hash, run-range, and inverted indexes.
+  cached `O(1)` hash, run-range, and inverted indexes. A column keeps `` `g# `` as it is added to (`insert`, `,:`); its
+  index is built the second time the column is looked in without having changed.
 * Selected partitions are loaded into memory for each query; nothing is memory-mapped.

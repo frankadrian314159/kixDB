@@ -27,7 +27,8 @@ fn tail(list: &ColVec, more: &K) -> Option<ColVec> {
         (_, atom) if typed(list) && atom.type_num() == -list.type_num() => ColVec::from_atoms(vec![atom.clone()]),
         _ => return None,
     };
-    tail.set_attr_unchecked(Attr::None);
+    // (a grouped list stays so as it grows)
+    tail.set_attr_unchecked(if list.attr() == Attr::Grouped { Attr::Grouped } else { Attr::None });
     Some(tail)
 }
 

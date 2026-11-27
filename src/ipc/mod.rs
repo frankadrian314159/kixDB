@@ -4,6 +4,7 @@
 //! - Multi-client `Listener` (`kix-serve`, `kix -p`, `kix-gui`, and `kix-cluster`) and synchronous/async `IpcClient` (`hopen`)
 //! - What a server sends to its clients, in `outbox`
 use crate::engine::tree::func_of;
+use crate::engine::Host;
 use crate::error::{KError, KResult};
 use crate::parser::parse_script;
 use crate::sym::{intern, resolve};
@@ -527,7 +528,7 @@ fn read_nul_str(data: &[u8], start: usize) -> KResult<(String, usize)> {
     Ok((s, start + rel + 1))
 }
 
-fn encode_error_payload(err: &KError) -> Vec<u8> {
+pub(crate) fn encode_error_payload(err: &KError) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.push((-128i8) as u8);
     let text = if err.detail.is_empty() {
@@ -964,6 +965,7 @@ pub struct Listener {
     addr: SocketAddr,
     stop: Arc<AtomicBool>,
     accept_thread: Option<JoinHandle<()>>,
+    host: Arc<Host>,
 }
 
 impl Listener {
@@ -972,6 +974,7 @@ impl Listener {
         let addr = tcp.local_addr()?;
         // (whatever a client sets, a callback or the timer included, runs in this process)
         server.allow_shell_commands(cfg.allow_shell);
+        let host = server.shared.host.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_bg = stop.clone();
         let cfg = Arc::new(RwLock::new(cfg));
@@ -991,10 +994,12 @@ impl Listener {
             }
         });
 
+        host.port.store(addr.port(), Ordering::SeqCst);
         Ok(Self {
             addr,
             stop,
             accept_thread: Some(accept_thread),
+            host,
         })
     }
 
@@ -1011,6 +1016,8 @@ impl Listener {
 
 impl Drop for Listener {
     fn drop(&mut self) {
+        // (unless another has been opened since)
+        let _ = self.host.port.compare_exchange(self.addr.port(), 0, Ordering::SeqCst, Ordering::SeqCst);
         self.stop.store(true, Ordering::SeqCst);
         let _ = TcpStream::connect(self.addr);
     }
@@ -1138,8 +1145,9 @@ fn serve_client(
             }
         };
 
-        let res = conn.answer(&req_k, msg_type == MSG_SYNC);
-        if msg_type == MSG_SYNC {
+        let (res, deferred) = conn.answer(&req_k, msg_type == MSG_SYNC);
+        // (an error is answered at once, even if the answer was to be put off)
+        if msg_type == MSG_SYNC && (!deferred || res.is_err() && outbox.undefer()) {
             outbox.respond(match res {
                 Ok(val) => encode_k_payload(&val.untagged()),
                 Err(err) => encode_error_payload(&err),

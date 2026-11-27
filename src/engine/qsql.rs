@@ -145,6 +145,19 @@ impl<'a> Engine<'a> {
     }
 
     pub fn eval_qsql(&mut self, q: &QSql) -> KResult<K> {
+        // `delete a, b from `.` removes names from a namespace
+        if let (QSqlKind::DeleteCols, Expr::Lit(K::Sym(namespace))) = (&q.kind, &*q.from) {
+            let name = resolve(*namespace);
+            let is_namespace = name == "." || name.starts_with('.') && !self.ws.vars.contains_key(namespace) && self.namespace(name).is_some();
+            if is_namespace {
+                let prefix = name.trim_end_matches('.');
+                let full = |n: SymId| if prefix.is_empty() { n } else { intern(&format!("{prefix}.{}", resolve(n))) };
+                let named = q.cols.iter().filter_map(|c| c.name.or_else(|| infer_col_name(&c.expr))).map(full);
+                let held: Vec<SymId> = named.filter(|n| self.ws.vars.contains_key(n) || self.ws.views.contains_key(n)).collect();
+                self.set_globals(held.into_iter().map(|n| (n, None)).collect())?;
+                return Ok(K::Sym(*namespace));
+            }
+        }
         // Check if `from` is a symbol `` `table `` (in-place `update` / `delete`, or reading a named table)
         let mut inplace_target: Option<SymId> = None;
         // the names a `select`/`exec` with an explicit column list mentions: all a partitioned table has to load
@@ -214,7 +227,7 @@ impl<'a> Engine<'a> {
                 None => K::Table(Arc::new(res_flip)),
             };
             if let Some(sym) = inplace_target {
-                self.set_global(sym, out_k)?;
+                self.set_named(sym, out_k)?;
                 return Ok(K::Sym(sym));
             }
             return Ok(out_k);
@@ -274,7 +287,7 @@ impl<'a> Engine<'a> {
                 };
                 let out_k = restore_keys(res_flip, orig_key_cols)?;
                 if let Some(sym) = inplace_target {
-                    self.set_global(sym, out_k)?;
+                    self.set_named(sym, out_k)?;
                     return Ok(K::Sym(sym));
                 }
                 Ok(out_k)
@@ -285,7 +298,7 @@ impl<'a> Engine<'a> {
                 let out_flip = self.exec_update(&base_flip, &selected, &q.cols, q.by.as_deref())?;
                 let out_k = restore_keys(out_flip, orig_key_cols)?;
                 if let Some(sym) = inplace_target {
-                    self.set_global(sym, out_k)?;
+                    self.set_named(sym, out_k)?;
                     return Ok(K::Sym(sym));
                 }
                 Ok(out_k)
@@ -767,6 +780,9 @@ impl<'a> Engine<'a> {
         let is_list = |r: &K| matches!(r, K::Vector(v) if v.is_list());
         if !upsert && matches!(rows, K::Vector(ColVec::General(_, items)) if !items.is_empty() && items.iter().all(is_list)) {
             return Err(KError::ty("insert takes columns, a table or dictionaries, not a list of rows"));
+        }
+        if self.names_the_roots(name) {
+            return self.in_root(|engine| engine.add_rows(name, rows, upsert));
         }
         let current = match self.get_var(name) {
             // a table that is not there yet is made of the rows

@@ -1,6 +1,7 @@
 //! Commands of the operating system (`\ls`, `system "ls"`), and the directory they run in (`\cd`).
 use crate::engine::{files, Engine};
 use crate::error::{KError, KResult};
+use crate::storage;
 use crate::types::*;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -24,10 +25,10 @@ fn system_shell(command: &str) -> Command {
 }
 
 impl Engine<'_> {
-    /// The directory that relative paths are taken from: the workspace's, else the process's.
+    /// The directory that relative paths are taken from: that of `\cd`, else the workspace's, else the process's.
     pub(crate) fn directory(&self) -> KResult<PathBuf> {
-        Ok(match &self.ws.data_dir {
-            Some(dir) => dir.clone(),
+        Ok(match storage::base_directory(self.ws) {
+            Some(dir) => dir,
             None => std::env::current_dir()?,
         })
     }

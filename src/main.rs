@@ -1,7 +1,7 @@
 //! `kix` — interactive `q` shell / REPL and script runner for `kixdb`.
 //!
 //! ```text
-//! kix [DATA_DIR | SCRIPT.q] [-D dir] [-p port] [--connect host[:port]] [-U user -P pass]
+//! kix [DATA_DIR | SCRIPT.q] [-D dir] [-p port] [-t ms] [--connect host[:port]] [-U user -P pass]
 //!     [-q|-Q expr]... [-f|-i script.q]... [--allow-shell]
 //! ```
 use kixdb::inspect::ObjectKind;
@@ -11,7 +11,8 @@ use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::Path;
 use std::process::ExitCode;
-use std::time::Instant;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 const HELP: &str = "\
 Enter q / qSQL expressions at the q) prompt. Backslash commands match kdb+, and dot commands mirror tsql:
@@ -42,7 +43,7 @@ Dot commands:
   .checkpoint                fold WAL into an atomic snapshot now
   .help                      show this help";
 
-const USAGE: &str = "usage: kix [DATA_DIR | SCRIPT.q] [-D dir] [-p port] [--connect host[:port]] [-U user -P pass] [-Q expr]... [-i script.q]... [--allow-shell] [-- ARGS]
+const USAGE: &str = "usage: kix [DATA_DIR | SCRIPT.q] [-D dir] [-p port] [-t ms] [--connect host[:port]] [-U user -P pass] [-Q expr]... [-i script.q]... [--allow-shell] [-- ARGS]
 
 Without a data directory the workspace lives in memory only. Passing a .q file loads it before entering the REPL
 (or exits if -Q/-q is also given). --connect attaches the shell to a remote kix-serve / kix-cluster over kdb+ IPC.
@@ -53,9 +54,8 @@ enum Target {
     Local {
         conn: Connection,
         server: Server,
-        listener: Option<Listener>,
-        /// Keep shell commands on while listening (`--allow-shell`).
-        allow_shell: bool,
+        /// The port that `-p` or `\p` opened.
+        listener: Arc<Mutex<Option<Listener>>>,
     },
     Remote {
         client: IpcClient,
@@ -76,6 +76,7 @@ fn main() -> ExitCode {
     let mut preload_scripts: Vec<String> = Vec::new();
     let mut jobs: Vec<String> = Vec::new();
     let mut listen_port: Option<u16> = None;
+    let mut timer_ms: Option<u64> = None;
     let mut remote_addr: Option<String> = None;
     let mut user = String::from("admin");
     let mut pass = String::new();
@@ -95,6 +96,10 @@ fn main() -> ExitCode {
                 println!("{USAGE}\n\n{HELP}");
                 return ExitCode::SUCCESS;
             }
+            "-t" => match args.next().and_then(|v| v.parse::<u64>().ok()) {
+                Some(ms) => timer_ms = Some(ms),
+                None => return bad("-t needs milliseconds"),
+            },
             "-D" | "--data" => match args.next() {
                 Some(d) => data_dir = Some(d),
                 None => return bad("-D needs a directory"),
@@ -160,18 +165,26 @@ fn main() -> ExitCode {
             None => Server::new(),
         };
         server.allow_shell_commands(true);
-        let listener = match listen_port {
-            Some(p) => match listen(&server, p, allow_shell) {
-                Ok(l) => Some(l),
+        let listener = Arc::new(Mutex::new(None));
+        let held = Arc::downgrade(&listener);
+        server.when_asked_to_listen(move |server, port| {
+            let opened = if port == 0 { None } else { Some(listen(&server, port, allow_shell)?) };
+            if let Some(held) = held.upgrade() {
+                *locked(&held) = opened;
+            }
+            Ok(())
+        });
+        if let Some(p) = listen_port {
+            match listen(&server, p, allow_shell) {
+                Ok(l) => *locked(&listener) = Some(l),
                 Err(e) => {
                     eprintln!("cannot listen on port {p}: {e}");
                     return ExitCode::FAILURE;
                 }
-            },
-            None => None,
-        };
+            }
+        }
         let conn = server.connect_as_trusted(&user);
-        Target::Local { conn, server, listener, allow_shell }
+        Target::Local { conn, server, listener }
     };
 
     let mut sh = Shell { target, timer: false, failed: false };
@@ -180,6 +193,9 @@ fn main() -> ExitCode {
         Target::Local { server, .. } => Some(server.start_background()),
         Target::Remote { .. } => None,
     };
+    if let Some(ms) = timer_ms {
+        sh.run_code(&format!("\\t {ms}"));
+    }
     for s in &preload_scripts {
         sh.run_code(s);
     }
@@ -196,7 +212,7 @@ fn main() -> ExitCode {
     if interactive {
         match &sh.target {
             Target::Local { listener, .. } => {
-                let port_note = listener.as_ref().map(|l| format!(", IPC {}", l.local_addr())).unwrap_or_default();
+                let port_note = locked(listener).as_ref().map(|l| format!(", IPC {}", l.local_addr())).unwrap_or_default();
                 let loc = data_dir.as_deref().unwrap_or("in-memory");
                 println!("kixDB 0.1 ({loc}{port_note})   (.help for commands, \\\\ to exit)");
             }
@@ -205,9 +221,19 @@ fn main() -> ExitCode {
             }
         }
     }
-    sh.repl(interactive);
+    let quit = sh.repl(interactive);
+    // as q does, a process fed from a script or from nothing goes on while it listens or its timer runs
+    if let Target::Local { server, .. } = &sh.target {
+        while !quit && !interactive && server.is_serving() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
     sh.leave(0);
     ExitCode::SUCCESS
+}
+
+fn locked<T>(shared: &Mutex<T>) -> MutexGuard<'_, T> {
+    shared.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Listen for clients on this machine's `port`.
@@ -216,7 +242,8 @@ fn listen(server: &Server, port: u16, allow_shell: bool) -> kixdb::KResult<Liste
 }
 
 impl Shell {
-    fn repl(&mut self, interactive: bool) {
+    /// Run what is typed or piped in; whether it ended with a command to leave rather than at the end of the input.
+    fn repl(&mut self, interactive: bool) -> bool {
         let stdin = io::stdin();
         let mut buf = String::new();
         loop {
@@ -243,13 +270,9 @@ impl Shell {
             let trimmed = line.trim();
             if buf.trim().is_empty() {
                 if matches!(trimmed, "\\\\" | "exit" | "quit" | ".quit") {
-                    break;
+                    return true;
                 }
                 if trimmed.is_empty() {
-                    continue;
-                }
-                if let Some(rest) = trimmed.strip_prefix("\\p") {
-                    self.handle_port_cmd(rest.trim());
                     continue;
                 }
                 let head = trimmed.split_whitespace().next().unwrap_or("");
@@ -272,7 +295,7 @@ impl Shell {
                         | ".checkpoint"
                 ) {
                     if !self.dot_command(trimmed) {
-                        break;
+                        return true;
                     }
                     continue;
                 }
@@ -288,6 +311,7 @@ impl Shell {
         if !buf.trim().is_empty() {
             self.run_code(&buf);
         }
+        false
     }
 
     fn leave(&mut self, code: i32) {
@@ -309,24 +333,6 @@ impl Shell {
             Some(Err(e)) => eprintln!("{e}"),
         }
         true
-    }
-
-    fn handle_port_cmd(&mut self, arg: &str) {
-        if let Target::Local { server, listener, allow_shell, .. } = &mut self.target {
-            if arg.is_empty() {
-                let p = listener.as_ref().map(|l| l.local_addr().port() as i32).unwrap_or(0);
-                println!("{p}i");
-            } else if arg == "0" {
-                *listener = None;
-            } else if let Ok(p) = arg.parse::<u16>() {
-                match listen(server, p, *allow_shell) {
-                    Ok(l) => *listener = Some(l),
-                    Err(e) => eprintln!("{e}"),
-                }
-            } else {
-                eprintln!("'domain: invalid port '{arg}'");
-            }
-        }
     }
 
     fn run_code(&mut self, code: &str) {
