@@ -90,7 +90,7 @@ impl<'a> Engine<'a> {
         }
         match self.eval_in_rows(flip, rows.clone(), e).ok()? {
             // a computed general list may not have the type that a group's own values would
-            K::Vector(v) if v.len() == flip.nrows() && (matches!(e, Expr::Var(_)) || !matches!(v, ColVec::General(..))) => Some(v),
+            K::Vector(v) if v.len() == flip.nrows() && (matches!(e, Expr::Var(_)) || !v.is_list()) => Some(v),
             _ => None,
         }
     }
@@ -110,7 +110,7 @@ impl<'a> Engine<'a> {
         };
         // the other verbs apply to each group's atom in turn, as they would group by group (`not` takes a vector of dates
         // but no single date), and not to the lists that `first` of a nested column gives
-        let atoms = |k: K| (!matches!(k, K::Vector(ColVec::General(..)))).then_some(k);
+        let atoms = |k: K| (!matches!(&k, K::Vector(v) if v.is_list())).then_some(k);
         match e {
             Expr::Lit(k) if k.is_atom() => Some(k.clone()),
             Expr::Unary { op, arg } if is_one_of(*op, &AGGREGATES) => {
@@ -650,7 +650,7 @@ impl<'a> Engine<'a> {
                     atom => ColVec::repeat(atom, active_rows.len()),
                 };
                 if let Some(held) = work.col(cname) {
-                    if !matches!(held, ColVec::General(..)) && held.type_num() != sub_cv.type_num() && !active_rows.is_empty() {
+                    if !held.is_list() && held.type_num() != sub_cv.type_num() && !active_rows.is_empty() {
                         return Err(KError::ty(format!("a {} value in a {} column", sub_cv.type_name(), held.type_name())));
                     }
                 }
@@ -735,7 +735,7 @@ impl<'a> Engine<'a> {
 
     /// Add rows to the table named `name` (`upsert`: setting those whose keys it has). The rows it had and how many came.
     fn add_rows(&mut self, name: SymId, rows: &K, upsert: bool) -> KResult<(usize, usize)> {
-        let is_list = |r: &K| matches!(r, K::Vector(ColVec::General(..)));
+        let is_list = |r: &K| matches!(r, K::Vector(v) if v.is_list());
         if !upsert && matches!(rows, K::Vector(ColVec::General(_, items)) if !items.is_empty() && items.iter().all(is_list)) {
             return Err(KError::ty("insert takes columns, a table or dictionaries, not a list of rows"));
         }

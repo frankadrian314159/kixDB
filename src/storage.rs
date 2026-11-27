@@ -6,7 +6,7 @@
 use crate::ast::Expr;
 use crate::engine::Workspace;
 use crate::error::{KError, KResult};
-use crate::ipc::{decode_k_payload, encode_k_payload};
+use crate::ipc::{decode_k_payload, encode_k_stored};
 use crate::sym::{intern, resolve, SymId};
 use crate::types::*;
 use std::fs;
@@ -116,7 +116,7 @@ pub fn read_bytes(ws: &Workspace, x: &K) -> KResult<Vec<u8>> {
 
 pub fn write_flat_k(path: &Path, val: &K) -> KResult<()> {
     create_parent(path)?;
-    let payload = encode_k_payload(val);
+    let payload = encode_k_stored(val);
     let mut buf = Vec::with_capacity(8 + payload.len());
     buf.extend_from_slice(&FLAT_MAGIC);
     buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -130,7 +130,8 @@ pub fn read_flat_k(path: &Path) -> KResult<K> {
     if buf.len() < 8 || buf[..4] != FLAT_MAGIC {
         return Err(KError::io(format!("invalid kixdb binary file '{}'", path.display())));
     }
-    let (k, _) = decode_k_payload(&buf[8..], 0)?;
+    let (mut k, _) = decode_k_payload(&buf[8..], 0)?;
+    k.pack();
     Ok(k)
 }
 
@@ -187,9 +188,10 @@ pub fn read_splayed_table(dir: &Path, needed_cols: Option<&[SymId]>) -> KResult<
     let mut vals = Vec::with_capacity(cols_to_read.len());
     for &c in &cols_to_read {
         let ck = read_flat_k(&dir.join(resolve(c)))?;
-        let K::Vector(cv) = ck else {
+        let K::Vector(mut cv) = ck else {
             return Err(KError::io(format!("corrupt splayed column '{}'", resolve(c))));
         };
+        cv.pack();
         vals.push(cv);
     }
     Flip::new(cols_to_read, vals)

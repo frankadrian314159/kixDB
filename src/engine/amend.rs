@@ -10,12 +10,13 @@ use std::sync::Arc;
 
 /// Whether the items of a column are all of the type that its name says.
 fn typed(column: &ColVec) -> bool {
-    !matches!(column, ColVec::General(..) | ColVec::Enum(..))
+    !column.is_list() && !matches!(column, ColVec::Enum(..))
 }
 
 /// What `list,more` adds to the end of `list`, where it keeps its type.
 fn tail(list: &ColVec, more: &K) -> Option<ColVec> {
     let mut tail = match (list, more) {
+        (ColVec::Strings(..), K::Vector(added)) if added.packed().is_some() => added.clone(),
         // a general list that holds a list stays general whatever is added
         (ColVec::General(_, items), K::Vector(added)) if items.first().is_some_and(|i| !i.is_atom()) => {
             ColVec::General(Attr::None, Arc::new((0..added.len()).map(|i| added.get_atom(i)).collect()))

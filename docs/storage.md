@@ -24,12 +24,29 @@ record, at the risk of losing the latest changes in a crash.
 
 An `insert` or `upsert` into a global table changes it where it is: it copies no more than the rows it touches (but a
 column that a running query still reads is copied first), and an `upsert` looks once through the keys. It rebuilds the
-table if a column holds mixed values or would change type. For other changes the old and new values are compared to
+table if a column holds mixed values or would change type (a [column of strings](#columns-of-strings) is neither). For other changes the old and new values are compared to
 find what changed, which takes time in proportion to their size. An `upsert` into a keyed table that holds a key twice
 sets the first such row and keeps the others (unless the table is rebuilt, which keeps one row a key).
 
 Earlier versions cannot read these records. Before going back to one, close the server cleanly, which folds the log into
 the snapshot: an earlier version discards the log from the first record it cannot read.
+
+## Columns of strings
+
+A column of a stored table that holds nothing but strings is kept **packed**: the text in one block and 8 bytes a
+string, where a list of character vectors takes some 80 bytes a string besides the text. To `q` it is that list, in
+every way (type `0h`). This is automatic, for every table that becomes a global or is read from a file; a list of
+strings that is not a table's column is left as it is.
+
+* `count`, indexing, filtering, joins, sorting, grouping, `distinct`, appending, `like`, `in`, `?`, `~`, `count each`,
+  `upper`, `lower`, `trim` and `` `$ `` and other casts from text read the packed strings. Other verbs are given the
+  list, which is made for as long as they run.
+* An item taken out is a copy of its text.
+* Setting rows (`update ... where`) rebuilds the column. A value that is not a string makes a list of it; once it holds
+  only strings again it is packed again.
+* Saved files, splayed and partitioned tables, the log, snapshots, replication and the messages between the nodes of a
+  cluster hold the packed form. **Earlier versions cannot read them**; later ones read what earlier ones wrote.
+  Programs connected over IPC, and `-8!`, are given ordinary lists, as the kdb+ protocol has them.
 
 ## Files and tables on disk
 

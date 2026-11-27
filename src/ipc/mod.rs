@@ -31,7 +31,15 @@ pub const MSG_RESPONSE: u8 = 2;
 
 pub fn encode_k_payload(val: &K) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
-    write_k(&mut buf, val);
+    write_k(&mut buf, val, false);
+    buf
+}
+
+/// As `encode_k_payload`, but for saved files and the other nodes of a cluster, which read kixdb's packed strings
+/// (type 21) too: other programs are sent the lists those stand for.
+pub fn encode_k_stored(val: &K) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64);
+    write_k(&mut buf, val, true);
     buf
 }
 
@@ -40,7 +48,7 @@ fn write_nul_str(buf: &mut Vec<u8>, s: &str) {
     buf.push(0);
 }
 
-fn write_k(buf: &mut Vec<u8>, val: &K) {
+fn write_k(buf: &mut Vec<u8>, val: &K, stored: bool) {
     match val {
         K::Null => {
             buf.push(101u8);
@@ -120,32 +128,32 @@ fn write_k(buf: &mut Vec<u8>, val: &K) {
         }
         K::Enum(tag, v) => {
             write_tag(buf, -20, tag);
-            write_k(buf, v);
+            write_k(buf, v, stored);
         }
-        K::Vector(cv) => write_colvec(buf, cv),
+        K::Vector(cv) => write_colvec(buf, cv, stored),
         K::Table(t) => {
             // kdb+ IPC table (`98`): `[98, 0(attr), 99(dict), sym_vec(cols), general_list(vals)]`
             buf.push(98);
             buf.push(0);
             buf.push(99);
-            write_colvec(buf, &ColVec::Sym(Attr::None, Arc::new(t.cols.clone())));
+            write_colvec(buf, &ColVec::Sym(Attr::None, Arc::new(t.cols.clone())), stored);
             buf.push(0);
             buf.push(0);
             buf.extend_from_slice(&(t.vals.len() as u32).to_le_bytes());
             for v in &t.vals {
-                write_colvec(buf, v);
+                write_colvec(buf, v, stored);
             }
         }
         K::KeyedTable(kt) => {
             // kdb+ IPC keyed table (`99`): dictionary mapping `Table(keys) -> Table(vals)`
             buf.push(99);
-            write_k(buf, &K::Table(Arc::new(kt.keys.clone())));
-            write_k(buf, &K::Table(Arc::new(kt.vals.clone())));
+            write_k(buf, &K::Table(Arc::new(kt.keys.clone())), stored);
+            write_k(buf, &K::Table(Arc::new(kt.vals.clone())), stored);
         }
         K::Dict(d) => {
             buf.push(99);
-            write_k(buf, &d.keys);
-            write_k(buf, &d.vals);
+            write_k(buf, &d.keys, stored);
+            write_k(buf, &d.vals, stored);
         }
         K::Func(f) => {
             buf.push(100);
@@ -155,7 +163,7 @@ fn write_k(buf: &mut Vec<u8>, val: &K) {
                 write_nul_str(buf, "");
             }
             let src = f.source_text();
-            write_colvec(buf, &ColVec::Char(Attr::None, Arc::new(src.into_bytes())));
+            write_colvec(buf, &ColVec::Char(Attr::None, Arc::new(src.into_bytes())), stored);
         }
     }
 }
@@ -168,10 +176,26 @@ fn write_tag(buf: &mut Vec<u8>, type_num: i8, tag: &Tag) {
     write_nul_str(buf, resolve(tag.domain));
 }
 
-fn write_colvec(buf: &mut Vec<u8>, cv: &ColVec) {
+fn write_colvec(buf: &mut Vec<u8>, cv: &ColVec, stored: bool) {
+    if let ColVec::Strings(attr, s) = cv {
+        // type 21: the attribute, the count, each length and then the text; otherwise a general list of strings
+        buf.extend_from_slice(&[if stored { 21 } else { 0 }, attr.ipc_byte()]);
+        buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        if stored {
+            s.lengths().for_each(|n| buf.extend_from_slice(&n.to_le_bytes()));
+            buf.extend_from_slice(s.text());
+        } else {
+            for item in s.iter() {
+                buf.extend_from_slice(&[10, 0]);
+                buf.extend_from_slice(&(item.len() as u32).to_le_bytes());
+                buf.extend_from_slice(item);
+            }
+        }
+        return;
+    }
     if let ColVec::Enum(tag, values) = cv {
         write_tag(buf, 20, tag);
-        return write_colvec(buf, values);
+        return write_colvec(buf, values, stored);
     }
     buf.push(cv.type_num() as u8);
     buf.push(cv.attr().ipc_byte());
@@ -179,7 +203,7 @@ fn write_colvec(buf: &mut Vec<u8>, cv: &ColVec) {
     match cv {
         ColVec::General(_, xs) => {
             for x in xs.iter() {
-                write_k(buf, x);
+                write_k(buf, x, stored);
             }
         }
         ColVec::Bool(_, xs) => {
@@ -231,7 +255,7 @@ fn write_colvec(buf: &mut Vec<u8>, cv: &ColVec) {
             }
         }
         // (written above)
-        ColVec::Enum(..) => {}
+        ColVec::Enum(..) | ColVec::Strings(..) => {}
     }
 }
 
@@ -311,6 +335,18 @@ fn decode_k_endian(data: &[u8], mut p: usize, le: bool) -> KResult<(K, usize)> {
         -17 => Ok((K::Minute(read_i32(data, p)?), p + 4)),
         -18 => Ok((K::Second(read_i32(data, p)?), p + 4)),
         -19 => Ok((K::Time(read_i32(data, p)?), p + 4)),
+
+        21 => {
+            let attr = Attr::from_ipc_byte(*data.get(p).ok_or_else(|| KError::ipc("truncated vec attr"))?);
+            let n = read_u32(data, p + 1)? as usize;
+            let text = p + 5 + n.saturating_mul(4);
+            let lengths = (0..n).map(|i| read_u32(data, p + 5 + i * 4)).collect::<KResult<Vec<u32>>>();
+            let lengths = lengths.map_err(|_| KError::ipc("truncated strings"))?;
+            let end = text + lengths.iter().map(|&len| len as usize).sum::<usize>();
+            let bytes = data.get(text..end).ok_or_else(|| KError::ipc("truncated strings"))?.to_vec();
+            let strings = crate::strings::Strings::from_parts(lengths, bytes).ok_or_else(|| KError::ipc("bad strings"))?;
+            Ok((K::Vector(ColVec::of_strings(attr, strings)), end))
+        }
 
         0..=19 => {
             let attr = Attr::from_ipc_byte(*data.get(p).ok_or_else(|| KError::ipc("truncated vec attr"))?);

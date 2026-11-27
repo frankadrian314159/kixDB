@@ -1,5 +1,50 @@
 # Benchmark results: scale factor 0.3
 
+## Packed string columns
+
+Measured 2026-11-26 on mains power: commit `305ae9c` and [packed columns of strings](storage.md#columns-of-strings),
+run back to back, one run each. Provisional, as below.
+
+| | `305ae9c` | now |
+| --- | ---: | ---: |
+| TPC-H tables in memory | 460 MB | **270 MB** |
+| `lineitem.l_comment`, bytes a row | 104 | 32 |
+| TPC-DS tables (few strings) | 107 MB | 107 MB |
+| TPC-H load, 3 shards in-process | 2.28 s | 1.12 s |
+| TPC-H load, single node | 1.84 s | 2.00 s |
+| Queries, TPC-H / TPC-DS, single node | 0.44 / 0.15 s | 0.47 / 0.16 s |
+| Queries, TPC-H / TPC-DS, 3 shards | 0.53 / 0.28 s | 0.54 / 0.30 s |
+
+The single node's TPC-H total includes one run of Q1 at 85 ms against 54; Q1, Q10 and Q13 run again alone, one after
+the other, took the same on both. The load's peak memory (1.0 GB) is unchanged: the generator holds lists while the
+tables are packed.
+
+A table of 1,000,000 rows with two columns of strings, milliseconds a statement:
+
+| Statement | `305ae9c` | now |
+| --- | ---: | ---: |
+| insert one row | 75 | 0.07 |
+| `count each s` | 187 | 2 |
+| `where c ~\: "alpha"` | 231 | 11 |
+| `where c in ("alpha"; "delta")` | 100 | 20 |
+| `distinct c` | 77 | 15 |
+| `select count i by c` | 82 | 19 |
+| join on a string key | 107 | 25 |
+| `upper s` | 249 | 81 |
+| `` `$c `` | 73 | 24 |
+| `` `s xasc t `` | 88 | 34 |
+| `where s like "*12*"` | 32 | 22 |
+| filter that keeps the strings | 22 | 14 |
+| `update ... where` setting a string | 24 | 17 |
+| `-8! t` | 59 | 25 |
+| save / load the splayed table | 76 / 227 | 40 / 33 |
+| **slower:** `` t[`c] = t`c `` (the verb is given a list) | 399 | 650 |
+| **slower:** `` t[`s] ,\: "!" `` | 497 | 608 |
+| **slower:** `` {x, "!"} each t`s `` | 639 | 809 |
+
+A string taken from a packed column is a copy, where an item of a list was shared: this is what makes the last three
+slower, and some queries allocate more for it (TPC-H Q13, 37 to 67 MB).
+
 ## After the second round of changes
 
 Measured 2026-11-26 on the machine described under [Setup](#setup), on mains power: commit `5a15686` and the changes

@@ -15,6 +15,14 @@ pub struct RowChanges {
 
 /// `column` with the type of `target`, as `insert` converts it; `None` where the column would have to change type.
 fn fitted(target: &ColVec, column: &ColVec) -> KResult<Option<ColVec>> {
+    // strings are added to strings where they are; other lists are made anew
+    if let ColVec::Strings(..) = target {
+        let packed = column.packed().map(|c| c.into_owned());
+        return Ok(packed.map(|mut c| {
+            c.set_attr_unchecked(Attr::None);
+            c
+        }));
+    }
     if matches!(target, ColVec::General(..)) {
         return Ok(None);
     }

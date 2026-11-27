@@ -508,7 +508,13 @@ impl<'a> Engine<'a> {
 
     /// Write several fully qualified globals as one log record, so that a crash or a replica sees all of the writes or
     /// none. Ephemeral `.kix.tmp.*` shuffle/broadcast tables stay in memory only.
-    pub fn write_globals(&mut self, writes: Vec<(SymId, Write)>) -> KResult<()> {
+    pub fn write_globals(&mut self, mut writes: Vec<(SymId, Write)>) -> KResult<()> {
+        // (tables are logged and held with their strings packed)
+        writes.iter_mut().for_each(|w| {
+            if let Write::Value(Some(val)) = &mut w.1 {
+                val.pack();
+            }
+        });
         let logged = !self.replaying && (self.ws.persist.get_mut().is_ok_and(|p| p.is_some()) || self.ws.replicator.get_mut().is_ok_and(|r| r.is_some()));
         self.ws.writable()?;
         if self.ws.host.cluster.load(Ordering::SeqCst) {
@@ -993,7 +999,7 @@ impl<'a> Engine<'a> {
                             let more = self.enumerate(*tag, more)?;
                             self.eval_binary_dispatch(",", &cur, &more)?
                         }
-                        (",", K::Vector(list), more) if !matches!(list, ColVec::General(..)) && more.type_num().abs() != list.type_num() && more.count() > 0 => {
+                        (",", K::Vector(list), more) if !list.is_list() && more.type_num().abs() != list.type_num() && more.count() > 0 => {
                             return Err(KError::ty("what is added must have the type of the list").into());
                         }
                         (",", K::Table(_), _) => self.append_to_table(&cur, &rhs, false)?.0,
@@ -1132,6 +1138,7 @@ impl<'a> Engine<'a> {
 
     fn eval_unary_dispatch(&mut self, op: SymId, x: &K) -> KResult<K> {
         let name = resolve(op);
+        let x = &*ops::unary_given(name, x);
         match name {
             "tables" => {
                 let mut syms: Vec<SymId> = self
@@ -1222,6 +1229,8 @@ impl<'a> Engine<'a> {
     }
 
     pub(crate) fn eval_binary_dispatch(&mut self, op: &str, lhs: &K, rhs: &K) -> KResult<K> {
+        let (lhs, rhs) = ops::binary_given(op, lhs, rhs);
+        let (lhs, rhs) = (&*lhs, &*rhs);
         if let (K::Sym(name), "xasc" | "xdesc" | "xkey" | "xcol" | "xcols") = (rhs, op) {
             let table = self.get_var(*name)?;
             let changed = self.eval_binary_dispatch(op, lhs, &table)?;
@@ -1415,10 +1424,10 @@ impl<'a> Engine<'a> {
             ("aj0", 3) => joins::asof_join(&vals[0], &vals[1], &vals[2], false),
             ("ej", 3) => joins::equi_join(&vals[0], &vals[1], &vals[2]),
             ("::", 1) => Ok(vals[0].clone()),
-            ("ssr", 3) => ops::ssr_op(&vals[0], &vals[1], &vals[2]),
+            ("ssr", 3) => ops::ssr_op(&vals[0].unpacked(), &vals[1], &vals[2]),
             ("wj", 4) => joins::window_join(&vals[0], &vals[1], &vals[2], &vals[3], true, |f, a| self.apply_func(f, a)),
             ("wj1", 4) => joins::window_join(&vals[0], &vals[1], &vals[2], &vals[3], false, |f, a| self.apply_func(f, a)),
-            _ if namespaces::arity(name).is_some() => self.namespace_call(name, vals),
+            _ if namespaces::arity(name).is_some() => self.namespace_call(name, &vals.iter().map(|v| v.unpacked().into_owned()).collect::<Vec<_>>()),
             ("enlist", 2..) => Ok(K::Vector(ColVec::from_atoms(vals.to_vec()))),
             (_, 1) => self.eval_unary_dispatch(sym, &vals[0]),
             (_, 2) => self.eval_binary_dispatch(name, &vals[0], &vals[1]),
@@ -1514,6 +1523,11 @@ impl<'a> Engine<'a> {
                     let K::Vector(cv) = &vals[0] else {
                         return self.apply_func(inner, vals);
                     };
+                    if let (ColVec::Strings(_, s), Func::Prim(p)) = (cv, inner) {
+                        if resolve(*p) == "count" {
+                            return Ok(K::Vector(ColVec::Long(Attr::None, Arc::new(s.lengths().map(i64::from).collect()))));
+                        }
+                    }
                     let mut out = Vec::with_capacity(cv.len());
                     for i in 0..cv.len() {
                         out.push(self.apply_func(inner, &[cv.get_atom(i)])?);
@@ -1562,12 +1576,13 @@ impl<'a> Engine<'a> {
                 1 => {
                     // Fast paths for `+/`, `*/`, `&/`, `|/`, `,/`:
                     if let Func::Prim(s) = inner {
+                        let whole = vals[0].unpacked();
                         match resolve(*s) {
-                            "+" => return ops::sum_op(&vals[0]),
-                            "*" => return ops::eval_unary_prim("prd", &vals[0]),
-                            "&" => return ops::minmax_op(&vals[0], true),
-                            "|" => return ops::minmax_op(&vals[0], false),
-                            "," => return ops::raze_op(&vals[0]),
+                            "+" => return ops::sum_op(&whole),
+                            "*" => return ops::eval_unary_prim("prd", &whole),
+                            "&" => return ops::minmax_op(&whole, true),
+                            "|" => return ops::minmax_op(&whole, false),
+                            "," => return ops::raze_op(&whole),
                             _ => {}
                         }
                     }
@@ -1736,6 +1751,9 @@ impl<'a> Engine<'a> {
                 if vals.len() != 2 {
                     return Err(KError::rank("/: requires 2 arguments"));
                 }
+                if let Some(found) = matching(inner, &vals[1], &vals[0]) {
+                    return Ok(found);
+                }
                 let lhs = &vals[0];
                 let K::Vector(cv) = &vals[1] else {
                     return self.apply_func(inner, vals);
@@ -1750,6 +1768,9 @@ impl<'a> Engine<'a> {
             AdverbKind::EachLeft => {
                 if vals.len() != 2 {
                     return Err(KError::rank("\\: requires 2 arguments"));
+                }
+                if let Some(found) = matching(inner, &vals[0], &vals[1]) {
+                    return Ok(found);
                 }
                 let K::Vector(cv) = &vals[0] else {
                     return self.apply_func(inner, vals);
@@ -2068,7 +2089,7 @@ impl<'a> Engine<'a> {
         let mut out = [K::Null, K::Bool(false), K::Null];
         for (slot, arg) in out.iter_mut().zip(args.iter().skip(1)) {
             if let Some(e) = arg {
-                *slot = self.eval_expr(e)?;
+                *slot = self.eval_expr(e)?.unpacked().into_owned();
             }
         }
         Ok(out)
@@ -2307,6 +2328,13 @@ fn log_of_value(old: Option<&K>, name: SymId, val: &K) -> LogOp {
 pub(crate) fn is_ephemeral_var(name: SymId) -> bool {
     let s = resolve(name);
     s.starts_with(".kix.tmp.") || s.starts_with(".kix.ord..kix.tmp.")
+}
+
+/// `strings ~\: one` and `one ~/: strings` of packed strings, which need not be made to be compared.
+fn matching(inner: &Func, strings: &K, one: &K) -> Option<K> {
+    let (Func::Prim(p), K::Vector(ColVec::Strings(_, s)), K::Vector(ColVec::Char(_, text))) = (inner, strings, one) else { return None };
+    let equal = || s.iter().map(|item| item == text.as_slice()).collect();
+    (resolve(*p) == "~").then(|| K::Vector(ColVec::Bool(Attr::None, Arc::new(equal()))))
 }
 
 fn is_ambivalent_prim(func: &Func) -> bool {

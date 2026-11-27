@@ -179,7 +179,7 @@ pub fn set(a: &Flip, b: &Flip, kind: Set) -> KResult<K> {
 pub fn from_rows(cols: &[crate::sym::SymId], proto: &[ColVec], rows: &[K]) -> Option<KResult<Flip>> {
     let fits = |value: &K, column: &ColVec| {
         let (value, column) = (value.plain(), column.plain());
-        matches!(column, ColVec::General(..)) || value.type_num().abs() == column.type_num() || column.is_numeric() && matches!(*value, K::Long(_) | K::Int(_))
+        column.is_list() || value.type_num().abs() == column.type_num() || column.is_numeric() && matches!(*value, K::Long(_) | K::Int(_))
     };
     let row = |r: &K| -> Option<Vec<K>> {
         match r {

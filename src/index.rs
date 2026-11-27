@@ -36,6 +36,7 @@ fn backing_identity(cv: &ColVec) -> (CacheKey, Arc<dyn Any + Send + Sync>) {
     }
     match cv {
         ColVec::General(_, v) => id!(v),
+        ColVec::Strings(_, v) => id!(v),
         ColVec::Bool(_, v) => id!(v),
         ColVec::Guid(_, v) => id!(v),
         ColVec::Byte(_, v) => id!(v),
@@ -178,7 +179,7 @@ pub fn sorted_eq_range(cv: &ColVec, needle: &K) -> Range<usize> {
 pub fn finds(hay: &ColVec) -> bool {
     match hay.attr() {
         Attr::None => false,
-        Attr::Sorted => !matches!(hay, ColVec::General(..)),
+        Attr::Sorted => !hay.is_list(),
         _ => true,
     }
 }
