@@ -86,6 +86,19 @@ fn csv_zero_colon_and_bulk_import() {
     let count = kixdb::tools::bulk_import(&mut c, &csv_path, "bulk_tbl", ',', true, true, 2, None, None).unwrap();
     assert_eq!(count, 3);
     assert_eq!(c.eval("exec sum qty from bulk_tbl").unwrap().to_string(), "60");
+
+    // Quoted commas, escaped quotes, embedded newlines, booleans, dates, and packed strings in one pass
+    let rich_csv = "id,ok,dt,note\n1,true,2026-11-27,\"hello, \"\"world\"\"\"\n2,false,2026-11-28,\"line1\nline2\"\n";
+    let rich_path = tmp.path().join("rich.csv");
+    std::fs::write(&rich_path, rich_csv).unwrap();
+    let rich_str = rich_path.display().to_string().replace('\\', "/");
+    assert_eq!(kixdb::tools::import_csv(&mut c, rich_csv, "imp_tbl", true).unwrap(), 2);
+    assert_eq!(kixdb::tools::bulk_import(&mut c, &rich_path, "bulk_rich", ',', true, true, 1, None, None).unwrap(), 2);
+    assert_eq!(c.eval("imp_tbl ~ bulk_rich").unwrap().to_string(), "1b");
+    assert_eq!(
+        c.eval(&format!("((\"JBDC\"; enlist \",\") 0: `:{rich_str}) ~ imp_tbl")).unwrap().to_string(),
+        "1b"
+    );
 }
 
 #[test]

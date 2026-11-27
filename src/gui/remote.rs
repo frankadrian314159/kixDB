@@ -64,6 +64,10 @@ impl Backend for RemoteBackend {
         self.client.query_str(code)
     }
 
+    fn send_message(&mut self, msg: &K) -> KResult<K> {
+        self.client.query_k(msg)
+    }
+
     fn execute(&mut self, code: &str) -> BatchResult {
         match self.client.query_str(code) {
             Ok(K::Null) => BatchResult { events: vec![] },

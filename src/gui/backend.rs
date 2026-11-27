@@ -1,10 +1,12 @@
 //! Abstraction over an embedded `kixdb::Connection` or a remote kdb+ IPC server (`RemoteBackend`).
 use kixdb::inspect::{ObjectEntry, TableInfo};
-use kixdb::{BatchResult, Connection, KResult, K};
+use kixdb::{Attr, BatchResult, ColVec, Connection, Flip, KResult, K};
+use std::sync::Arc;
 
 pub trait Backend: Send {
     fn execute(&mut self, code: &str) -> BatchResult;
     fn eval(&mut self, code: &str) -> KResult<K>;
+    fn send_message(&mut self, msg: &K) -> KResult<K>;
     fn table_info(&mut self, name: &str) -> Option<TableInfo>;
     fn objects(&mut self) -> Vec<ObjectEntry>;
     fn definition(&mut self, name: &str) -> Option<String>;
@@ -20,6 +22,9 @@ impl Backend for Connection {
     }
     fn eval(&mut self, code: &str) -> KResult<K> {
         Connection::eval(self, code)
+    }
+    fn send_message(&mut self, msg: &K) -> KResult<K> {
+        Connection::eval_ipc_message(self, msg)
     }
     fn table_info(&mut self, name: &str) -> Option<TableInfo> {
         Connection::table_info(self, name)
@@ -50,5 +55,16 @@ impl<'a> kixdb::tools::QSession for dyn Backend + 'a {
     }
     fn describe_table(&mut self, name: &str) -> Option<TableInfo> {
         self.table_info(name)
+    }
+    fn upsert_batch(&mut self, table_name: &str, batch: Flip) -> KResult<()> {
+        let msg = K::Vector(ColVec::General(
+            Attr::None,
+            Arc::new(vec![
+                K::string("upsert"),
+                K::Sym(kixdb::sym::intern(table_name)),
+                K::Table(Arc::new(batch)),
+            ]),
+        ));
+        self.send_message(&msg).map(|_| ())
     }
 }

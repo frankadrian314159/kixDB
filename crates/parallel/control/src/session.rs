@@ -116,11 +116,11 @@ impl ClusterSession {
 
     /// Run `code` here, under a permit of the master's, if another node of this node's group is the master and every
     /// statement reads tables and changes nothing. `None`: it is to be run some other way.
-    fn read_here(&mut self, code: &str) -> Option<KResult<K>> {
+    fn read_here(&mut self, code: &str, cached: &mut Option<KResult<Vec<Expr>>>) -> Option<KResult<K>> {
         if self.inner.is_master() {
             return None;
         }
-        let statements = parse_script(code).ok()?;
+        let statements = cached.get_or_insert_with(|| parse_script(code)).as_ref().ok()?.clone();
         let names = self.names();
         if statements.is_empty() || !statements.iter().all(|e| !names.refs(e).none() && names.is_pure(e)) {
             return None;
@@ -142,8 +142,8 @@ impl ClusterSession {
     }
 
     /// The answer to `code` if this node does not run it as master: read here, or given by the master.
-    fn elsewhere(&mut self, code: &str) -> Option<KResult<K>> {
-        self.read_here(code).or_else(|| {
+    fn elsewhere(&mut self, code: &str, cached: &mut Option<KResult<Vec<Expr>>>) -> Option<KResult<K>> {
+        self.read_here(code, cached).or_else(|| {
             self.plan.clear();
             self.passed_on(|| Forwarded::Eval(code.to_string()))
         })
@@ -175,14 +175,15 @@ impl ClusterSession {
     /// Run `q` source (or a cluster command) and return the value of the last statement.
     pub fn eval(&mut self, code: &str) -> KResult<K> {
         self.plan.clear();
-        if let Some(r) = self.elsewhere(code) {
+        let mut cached = None;
+        if let Some(r) = self.elsewhere(code, &mut cached) {
             return r;
         }
         if let Some(r) = self.command(code) {
             return r;
         }
         let mut last = K::Null;
-        for s in parse_script(code)? {
+        for s in cached.unwrap_or_else(|| parse_script(code))? {
             last = self.statement(&s)?;
         }
         Ok(last)
@@ -195,12 +196,13 @@ impl ClusterSession {
             Some(rs) => Event::Rows(rs),
             None => Event::Value(v),
         };
+        let mut cached = None;
         // (a node that is not the master gives the value of the last statement)
-        if let Some(r) = self.elsewhere(code).or_else(|| self.command(code)) {
+        if let Some(r) = self.elsewhere(code, &mut cached).or_else(|| self.command(code)) {
             return BatchResult { events: vec![r.map(show).unwrap_or_else(Event::Error)] };
         }
         let mut events = vec![];
-        match parse_script(code) {
+        match cached.unwrap_or_else(|| parse_script(code)) {
             Ok(statements) => {
                 for s in statements {
                     match self.statement(&s) {

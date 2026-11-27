@@ -3281,36 +3281,28 @@ pub fn parse_atom_from_str(type_ch: char, s: &str) -> K {
         }
         'p' => {
             let norm = t.replace('-', ".").replace(['T', ' '], "D");
-            if let Ok(mut toks) = crate::lexer::tokenize(&norm) {
-                if let Some(crate::lexer::Tok::Lit(K::Timestamp(ns))) = toks.drain(..1).next() {
-                    return K::Timestamp(ns);
-                }
+            if let Ok((K::Timestamp(ns), None)) = crate::lexer::parse_scalar_token(&norm) {
+                return K::Timestamp(ns);
             }
             K::Timestamp(NULL_LONG)
         }
         't' => {
-            if let Ok(mut toks) = crate::lexer::tokenize(t) {
-                if let Some(crate::lexer::Tok::Lit(k)) = toks.drain(..1).next() {
-                    if let Ok(K::Time(ms)) = cast_atom_by_name("time", &k) {
-                        return K::Time(ms);
-                    }
+            if let Ok((k, None)) = crate::lexer::parse_scalar_token(t) {
+                if let Ok(K::Time(ms)) = cast_atom_by_name("time", &k) {
+                    return K::Time(ms);
                 }
             }
             K::Time(NULL_INT)
         }
         'u' => {
-            if let Ok(mut toks) = crate::lexer::tokenize(t) {
-                if let Some(crate::lexer::Tok::Lit(K::Minute(m))) = toks.drain(..1).next() {
-                    return K::Minute(m);
-                }
+            if let Ok((K::Minute(m), None)) = crate::lexer::parse_scalar_token(t) {
+                return K::Minute(m);
             }
             K::Minute(NULL_INT)
         }
         'v' => {
-            if let Ok(mut toks) = crate::lexer::tokenize(t) {
-                if let Some(crate::lexer::Tok::Lit(K::Second(sec))) = toks.drain(..1).next() {
-                    return K::Second(sec);
-                }
+            if let Ok((K::Second(sec), None)) = crate::lexer::parse_scalar_token(t) {
+                return K::Second(sec);
             }
             K::Second(NULL_INT)
         }

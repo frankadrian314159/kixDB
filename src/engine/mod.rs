@@ -394,6 +394,14 @@ impl<'a> Engine<'a> {
         }
     }
 
+    pub fn eval_stmts(&mut self, stmts: &[Expr]) -> KResult<K> {
+        let mut last = K::Null;
+        for s in stmts {
+            last = self.eval_expr(s)?;
+        }
+        Ok(last)
+    }
+
     pub fn eval_str(&mut self, src: &str) -> KResult<K> {
         if let Some(q) = src.trim().strip_prefix("EXPLAIN ") {
             let stmts = parse_script(q)?;
@@ -405,25 +413,11 @@ impl<'a> Engine<'a> {
             return Ok(K::Vector(ColVec::General(Attr::None, Arc::new(lines))));
         }
         let stmts = parse_script(src)?;
-        if stmts.is_empty() {
-            return Ok(K::Null);
-        }
-        let mut last = K::Null;
-        for s in &stmts {
-            last = self.eval_expr(s)?;
-        }
-        Ok(last)
+        self.eval_stmts(&stmts)
     }
 
-    pub fn run_batch(&mut self, src: &str) -> Vec<Event> {
+    pub fn run_stmts(&mut self, stmts: &[Expr]) -> Vec<Event> {
         let mut events = Vec::new();
-        let stmts = match parse_script(src) {
-            Ok(s) => s,
-            Err(e) => {
-                events.push(Event::Error(e));
-                return events;
-            }
-        };
         for (i, s) in stmts.iter().enumerate() {
             let result = self.eval_expr(s);
             events.append(&mut self.messages);
@@ -447,6 +441,13 @@ impl<'a> Engine<'a> {
             }
         }
         events
+    }
+
+    pub fn run_batch(&mut self, src: &str) -> Vec<Event> {
+        match parse_script(src) {
+            Ok(stmts) => self.run_stmts(&stmts),
+            Err(e) => vec![Event::Error(e)],
+        }
     }
 
     pub fn has_partitioned(&self, name: SymId) -> bool {

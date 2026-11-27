@@ -349,14 +349,16 @@ impl Connection {
                 return res;
             }
         }
-        if let Some(statements) = parser::parse_script(q_code).ok().filter(|_| !q_code.trim_start().starts_with("EXPLAIN ")) {
-            if let Some(result) = self.read(&statements, |eng| eng.eval_str(q_code)) {
-                return result;
-            }
+        if q_code.trim_start().starts_with("EXPLAIN ") {
+            let mut ws = self.server.shared.ws.write().unwrap_or_else(|e| e.into_inner());
+            return Engine::new(&mut ws, &mut self.session).eval_str(q_code);
+        }
+        let statements = parser::parse_script(q_code)?;
+        if let Some(result) = self.read(&statements, |eng| eng.eval_stmts(&statements)) {
+            return result;
         }
         let mut ws = self.server.shared.ws.write().unwrap_or_else(|e| e.into_inner());
-        let mut eng = Engine::new(&mut ws, &mut self.session);
-        eng.eval_str(q_code)
+        Engine::new(&mut ws, &mut self.session).eval_stmts(&statements)
     }
 
     /// Evaluate with `eval` on a copy of the workspace, holding no lock while it runs, if `statements` only read.
@@ -407,21 +409,22 @@ impl Connection {
             }
         }
         // (a script that only reads runs beside others, as `eval` does)
-        if let Ok(statements) = parser::parse_script(q_code) {
-            let copy = {
-                let ws = self.server.shared.ws.read().unwrap_or_else(|e| e.into_inner());
-                engine::pure::reads_only(&ws, &self.session.current_ns, &statements).then(|| ws.snapshot())
-            };
-            if let Some(mut copy) = copy {
-                let events = Engine::new(&mut copy, &mut self.session).run_batch(q_code);
-                if !events.iter().any(|e| matches!(e, Event::Error(e) if e.signal == "snapshot")) {
-                    return BatchResult { events };
-                }
+        let statements = match parser::parse_script(q_code) {
+            Ok(s) => s,
+            Err(e) => return BatchResult { events: vec![Event::Error(e)] },
+        };
+        let copy = {
+            let ws = self.server.shared.ws.read().unwrap_or_else(|e| e.into_inner());
+            engine::pure::reads_only(&ws, &self.session.current_ns, &statements).then(|| ws.snapshot())
+        };
+        if let Some(mut copy) = copy {
+            let events = Engine::new(&mut copy, &mut self.session).run_stmts(&statements);
+            if !events.iter().any(|e| matches!(e, Event::Error(e) if e.signal == "snapshot")) {
+                return BatchResult { events };
             }
         }
         let mut ws = self.server.shared.ws.write().unwrap_or_else(|e| e.into_inner());
-        let mut eng = Engine::new(&mut ws, &mut self.session);
-        BatchResult { events: eng.run_batch(q_code) }
+        BatchResult { events: Engine::new(&mut ws, &mut self.session).run_stmts(&statements) }
     }
 
     /// Run a query returning a tabular `ResultSet` rows vector, or an error.
@@ -555,12 +558,22 @@ pub(crate) fn describe_expr_plan(e: &ast::Expr, ws: &Workspace) -> String {
     }
 }
 
+fn upsert_message(table_name: &str, batch: Flip) -> K {
+    K::Vector(ColVec::General(
+        Attr::None,
+        Arc::new(vec![K::string("upsert"), K::Sym(sym::intern(table_name)), K::Table(Arc::new(batch))]),
+    ))
+}
+
 impl tools::QSession for Connection {
     fn run_q(&mut self, code: &str) -> KResult<()> {
         self.eval(code).map(|_| ())
     }
     fn describe_table(&mut self, name: &str) -> Option<inspect::TableInfo> {
         self.table_info(name)
+    }
+    fn upsert_batch(&mut self, table_name: &str, batch: Flip) -> KResult<()> {
+        self.eval_ipc_message(&upsert_message(table_name, batch)).map(|_| ())
     }
 }
 
@@ -570,5 +583,8 @@ impl tools::QSession for ipc::IpcClient {
     }
     fn describe_table(&mut self, name: &str) -> Option<inspect::TableInfo> {
         inspect::remote_table_info(self, name)
+    }
+    fn upsert_batch(&mut self, table_name: &str, batch: Flip) -> KResult<()> {
+        self.query_k(&upsert_message(table_name, batch)).map(|_| ())
     }
 }
