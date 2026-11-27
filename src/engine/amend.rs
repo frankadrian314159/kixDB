@@ -1,5 +1,6 @@
 //! `x,:y` and `x[i]:y` as changes to the variable that is there (see `delta.rs`), so that they cost the items they touch
 //! and not a copy of the value. What cannot be done so, as when a value changes its type, is done by making a new value.
+//! And assignments at depth, `x[i;j]:y`.
 use crate::delta::{ColChange, Changes};
 use crate::engine::writes::row_changes;
 use crate::engine::{ops, Engine, Write};
@@ -30,7 +31,54 @@ fn tail(list: &ColVec, more: &K) -> Option<ColVec> {
     Some(tail)
 }
 
+/// The keys that a step of an assignment at depth names, where it names several: all of them (`::`, or none given), or
+/// those of a list that is not itself a key.
+pub(super) fn several(target: &K, step: Option<&K>) -> KResult<Option<Vec<K>>> {
+    let items = |k: &K| (0..k.count()).map(|i| ops::index_k(k, &[Some(K::Long(i as i64))])).collect::<KResult<Vec<_>>>();
+    Ok(match (target, step) {
+        (K::Dict(d), None | Some(K::Null)) => Some(items(&d.keys)?),
+        (_, None | Some(K::Null)) => Some(items(&ops::til_op(target.count() as i64)?)?),
+        (K::Dict(d), Some(key @ K::Vector(v))) if matches!(v, ColVec::Char(..)) || items(&d.keys)?.contains(key) => None,
+        (_, Some(keys @ K::Vector(_))) => Some(items(keys)?),
+        _ => None,
+    })
+}
+
+/// What the `n`th of `count` items assigned to is given: `y` itself, unless it is a list, which has one for each.
+pub(super) fn part(y: &K, n: usize, count: usize) -> KResult<K> {
+    match y {
+        K::Vector(v) if v.len() == count => Ok(v.get_atom(n)),
+        K::Vector(_) => Err(KError::length("a list assigned to several items needs one for each")),
+        all => Ok(all.clone()),
+    }
+}
+
 impl Engine<'_> {
+    /// `x[i;j;...]:y`, or with `op` `x[i;j;...]+:y`: the first index chooses what the rest assign to.
+    pub(super) fn amend_deep(&mut self, mut target: K, indices: &[Option<K>], op: Option<SymId>, rhs: &K) -> KResult<K> {
+        let Some((first, rest)) = indices.split_first() else { return Ok(rhs.clone()) };
+        let Some(keys) = several(&target, first.as_ref())? else {
+            let step = [first.clone()];
+            let new = self.amend_in_place(ops::index_k(&target, &step)?, rest, op, rhs)?;
+            return self.amend_in_place(target, &step, None, &new);
+        };
+        let count = keys.len();
+        // the items of a list are changed in turn and the list made once
+        if let K::Vector(list) = &target {
+            let mut items: Vec<K> = (0..list.len()).map(|i| list.get_atom(i)).collect();
+            for (n, key) in keys.iter().enumerate() {
+                let item = usize::try_from(key.as_i64()?).ok().and_then(|i| items.get_mut(i)).ok_or_else(|| KError::domain("index out of bounds"))?;
+                *item = self.amend_in_place(std::mem::replace(item, K::Null), rest, op, &part(rhs, n, count)?)?;
+            }
+            return Ok(K::Vector(ColVec::from_atoms(items)));
+        }
+        for (n, key) in keys.into_iter().enumerate() {
+            let full: Vec<Option<K>> = std::iter::once(Some(key)).chain(rest.iter().cloned()).collect();
+            target = self.amend_deep(target, &full, op, &part(rhs, n, count)?)?;
+        }
+        Ok(target)
+    }
+
     /// The value that an assignment to `name` changes (`global`: a `::` or an indexed assignment, which reaches a
     /// global from inside a lambda), with the global's full name where it is one.
     fn changeable(&self, name: SymId, global: bool) -> Option<(Option<SymId>, &K)> {

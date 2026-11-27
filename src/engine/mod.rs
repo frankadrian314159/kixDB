@@ -1900,21 +1900,13 @@ impl<'a> Engine<'a> {
                 None => self.apply_func(f, &[target]),
             };
         };
-        // `::` before further steps stands for every item
-        if matches!(head, K::Null) && !rest.is_empty() {
-            let every = match &target {
-                K::Dict(d) => (*d.keys).clone(),
-                list => ops::til_op(list.count() as i64)?,
-            };
-            let mut target = target;
-            for i in 0..every.count() {
-                let step = ops::index_k(&every, &[Some(K::Long(i as i64))])?;
-                let mut full = vec![step];
-                full.extend_from_slice(rest);
-                let part = match y {
-                    Some(K::Vector(v)) if v.len() == every.count() => Some(v.get_atom(i)),
-                    other => other.cloned(),
-                };
+        // `::` or a list of indices before further steps stands for each of the items it names
+        let named = if rest.is_empty() { None } else { amend::several(&target, Some(head))? };
+        if let Some(keys) = named {
+            let (mut target, count) = (target, keys.len());
+            for (n, key) in keys.into_iter().enumerate() {
+                let full: Vec<K> = std::iter::once(key).chain(rest.iter().cloned()).collect();
+                let part = y.map(|y| amend::part(y, n, count)).transpose()?;
                 target = self.amend_path(target, &full, f, part.as_ref())?;
             }
             return Ok(target);
@@ -1929,6 +1921,9 @@ impl<'a> Engine<'a> {
         let Some(first) = indices.first() else {
             return Ok(rhs.clone());
         };
+        if indices.len() > 1 {
+            return self.amend_deep(target, indices, op, rhs);
+        }
         let apply_op = |cur: &K, v: &K, eng: &mut Self| -> KResult<K> {
             if let Some(op_s) = op {
                 eng.eval_binary_dispatch(resolve(op_s), cur, v)
@@ -1962,7 +1957,7 @@ impl<'a> Engine<'a> {
                     Some(K::Vector(icv)) => {
                         let is = icv.as_i64_vec().ok_or_else(|| KError::ty("index must be integer"))?;
                         for (pos, &idx) in is.iter().enumerate() {
-                            let item_v = if let K::Vector(rv) = rhs { rv.get_atom(pos) } else { rhs.clone() };
+                            let item_v = amend::part(rhs, pos, is.len())?;
                             let cur = cv.get_atom(idx as usize);
                             let nv = apply_op(&cur, &item_v, self)?;
                             cv.set_at(idx as usize, nv)?;
@@ -1985,10 +1980,7 @@ impl<'a> Engine<'a> {
                     Some(k) => (vec![k.clone()], true),
                 };
                 for (n, key) in named.iter().enumerate() {
-                    let value = match rhs {
-                        K::Vector(rv) if !one && rv.len() == named.len() => rv.get_atom(n),
-                        all => all.clone(),
-                    };
+                    let value = if one { rhs.clone() } else { amend::part(rhs, n, named.len())? };
                     match keys.iter().position(|k| k == key) {
                         Some(i) => vals[i] = apply_op(&vals[i].clone(), &value, self)?,
                         None => {

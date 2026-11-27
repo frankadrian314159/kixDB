@@ -48,6 +48,45 @@ fn a_second_colon_changes_the_global() {
 }
 
 #[test]
+fn assigning_at_depth() {
+    check("o: (1 2 3; 4 5 6); n: `a`b!(`x`y!1 2; `x`y!3 4); L: (1 2; (3 4; 5 6)); t: ([] a: 1 2 3)", &[
+        ("m: o; m[1;2]: 99; m", "(1 2 3;4 5 99)"),
+        ("m: o; m[0;1]+: 100; m", "(1 102 3;4 5 6)"),
+        // a place left empty stands for all of them, and a list of values gives one to each
+        ("m: o; m[;0]: 7 8; m", "(7 2 3;8 5 6)"),
+        ("m: o; m[;0]: 9; m", "(9 2 3;9 5 6)"),
+        ("m: o; m[1;]: 10 11 12; m", "(1 2 3;10 11 12)"),
+        ("m: o; m[0 1; 2]: 30 60; m", "(1 2 30;4 5 60)"),
+        ("m: o; m[0 1; 0 1]: (10 20; 30 40); m", "(10 20 3;30 40 6)"),
+        ("m: o; m[; 1 2]+: 100; m", "(1 102 103;4 105 106)"),
+        // what cannot be done changes nothing
+        ("m: o; m[5;0]: 1", "'domain"),
+        ("m[1;2]: `a", "'type"),
+        ("m[;0]: 1 2 3", "'length"),
+        ("m[0; 0 1]: 7 8 9", "'length"),
+        ("m", "(1 2 3;4 5 6)"),
+        ("m[1][2]: 9", "'assign"),
+        ("m[1][2]+: 9", "'assign"),
+        ("(m[1][2]; m[1;2])", "6 6"),
+        ("n[`a;`y]: 50; (value n`a; value n`b)", "(1 50;3 4)"),
+        ("n[`a`b; `x]: 0 7; (value n`a; value n`b)", "(0 50;7 4)"),
+        ("n[; `y]+: 1; (value n`a; value n`b)", "(0 51;7 5)"),
+        ("L[1;1;0]: 42; L", "(1 2;(3 4;42 6))"),
+        ("s: (\"ab\"; \"cd\")!(1 2; 3 4); s[\"cd\"; 1]: 9; s \"cd\"", "3 9"),
+        ("t[`a; 1]: 20; t`a", "1 20 3"),
+        ("t[1; `a]: 5", "'nyi"),
+        ("t`a", "1 20 3"),
+        ("f: {[m] m[0;0]: 99; m}; (f o; o)", "((99 2 3;4 5 6);(1 2 3;4 5 6))"),
+        ("g: {o[0;0]: 50; 0}; g 0; o", "(50 2 3;4 5 6)"),
+        // the functional form takes lists of indices as the brackets do
+        (".[(1 2 3; 4 5 6); (0 1; 2); :; 10 20]", "(1 2 10;4 5 20)"),
+        (".[(1 2 3; 4 5 6); (::; 0); +; 100]", "(101 2 3;104 5 6)"),
+        ("x: 1 2 3; x[0 1]: 7 8 9", "'length"),
+        ("x[0 1]: 7 8; x", "7 8 3"),
+    ]);
+}
+
+#[test]
 fn appending_rows_to_a_table() {
     check("t: ([] c: `a`b; n: 1 2); u: t", &[
         ("t,: ([] c: enlist `c; n: enlist 3); (t`c; u`c)", "(`a`b`c;`a`b)"),
