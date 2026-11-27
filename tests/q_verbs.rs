@@ -125,6 +125,13 @@ fn find_gives_the_first_place_of_each() {
         // a list of mixed values is looked for item by item, even where it is itself an item (q's reference examples)
         ("u: (\"abcde\"; 10 2 -6; (2 3; `ab)); (u ? 10 2 -6; u ? \"abcde\")", "1 0"),
         ("u ? (2 3; `ab)", "3 3"),
+        // a simple list is searched for each item of a list that holds lists, however deep they lie
+        ("w: 10 -8 3 5 -1 2 3; w ? (10 5 -1; -8; 3 17)", "(0 3 4;1;2 7)"),
+        ("w ? (3; (5 -1; 10))", "(2;(3 4;0))"),
+        ("\"hello\" ? (\"he\"; \"lo\")", "(0 1;2 4)"),
+        ("\"hello\" ? (t`c)", "(5 5;5 5;5 5)"),
+        ("w ? ()", "`long$()"),
+        ("(`a`b`c ! 10 -8 3) ? (3 10; -8)", "(`c`a;`b)"),
         // while a simple list is still found among values that are not all lists
         ("((1; `a; \"cd\") ? \"cd\"; (1; `a; \"cd\") ? (\"cd\"; 1))", "(2;2 0)"),
     ]);
