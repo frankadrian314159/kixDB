@@ -236,6 +236,15 @@ impl<'a> Engine<'a> {
                 active_rows = Some(Arc::new(indexed));
                 continue;
             }
+            // while most rows are kept, testing every row costs less than copying out the ones that are
+            if let Some(cur) = active_rows.as_ref().filter(|cur| cur.len() * 2 >= total_nrows && row_by_row(&base_flip, wc)) {
+                if let Ok(K::Vector(ColVec::Bool(_, test))) = self.eval_in_table_scope(&base_flip, wc) {
+                    if test.len() == total_nrows {
+                        active_rows = Some(Arc::new(cur.iter().copied().filter(|&r| test[r]).collect()));
+                        continue;
+                    }
+                }
+            }
             match &active_rows {
                 None => {
                     let pred_k = self.eval_in_table_scope(&base_flip, wc)?;
@@ -285,14 +294,22 @@ impl<'a> Engine<'a> {
             QSqlKind::Select | QSqlKind::Exec => {
                 // without a column list the result has every column
                 let read = if q.cols.is_empty() { base_flip.clone() } else { self.columns_read(&base_flip, outputs()) };
+                // A query that groups most of the rows by columns of theirs reads them where they are.
+                let plain = |b: &ColSpec| matches!(&b.expr, Expr::Var(v) if read.col(*v).is_some() && b.name.is_none_or(|name| name == *v));
+                let kept = active_rows.as_ref().filter(|rows| {
+                    let grouped = q.by.as_ref().is_some_and(|by| !by.is_empty() && by.iter().all(plain));
+                    q.kind == QSqlKind::Select && grouped && !q.cols.is_empty() && !rows.is_empty() && rows.len() * 2 >= total_nrows
+                });
                 let filtered = match &active_rows {
-                    None => read,
-                    Some(rows) => read.gather(rows),
+                    Some(rows) if kept.is_none() => read.gather(rows),
+                    _ => read,
                 };
                 if q.kind == QSqlKind::Exec {
                     return self.exec_query_exec(&filtered, &active_rows, &q.cols, q.by.as_deref());
                 }
-                let mut res = self.exec_select(&filtered, &active_rows, &q.cols, q.by.as_deref(), orig_key_cols)?;
+                let numbers = if kept.is_some() { &None } else { &active_rows };
+                let kept = kept.map(|rows| rows.as_slice());
+                let mut res = self.exec_select(&filtered, numbers, kept, &q.cols, q.by.as_deref(), orig_key_cols)?;
                 if q.distinct {
                     if let K::Table(_) = &res {
                         res = distinct_op(&res)?;
@@ -313,6 +330,8 @@ impl<'a> Engine<'a> {
         &mut self,
         filtered: &Flip,
         rows: &RowNumbers,
+        // the rows of `filtered` to group, where it holds others too (`by` then names columns of it)
+        kept: Option<&[usize]>,
         cols: &[ColSpec],
         by: Option<&[ColSpec]>,
         orig_keys: Option<Vec<SymId>>,
@@ -424,7 +443,10 @@ impl<'a> Engine<'a> {
                 for bs in by_specs {
                     let v = self.eval_in_rows(filtered, rows.clone(), &bs.expr)?;
                     match v {
-                        K::Vector(cv) if cv.len() == filtered.nrows() => by_vecs.push(cv),
+                        K::Vector(cv) if cv.len() == filtered.nrows() => by_vecs.push(match kept {
+                            Some(kept) => cv.gather(kept),
+                            None => cv,
+                        }),
                         atom if atom.is_atom() => by_vecs.push(ColVec::repeat(atom, filtered.nrows())),
                         _ => return Err(KError::length("by expression length must match table row count")),
                     }
@@ -441,13 +463,17 @@ impl<'a> Engine<'a> {
                 }
 
                 // Group row indices by composite `by` key
-                let (first_rows, mut groups) = group_rows(&by_vecs, filtered.nrows());
+                let (first_rows, mut groups) = group_rows(&by_vecs, kept.map_or(filtered.nrows(), <[usize]>::len));
 
                 // Sort groups ascending by `by_vecs` keys (matching kdb+ `select ... by k from t`!)
                 let keys: Vec<ColVec> = by_vecs.iter().map(|bv| bv.gather(&first_rows)).collect();
                 let group_order = sort_order(&keys, first_rows.len());
                 let mut key_vals: Vec<ColVec> = keys.iter().map(|k| k.gather(&group_order)).collect();
-                let sorted_groups: Vec<Vec<usize>> = group_order.into_iter().map(|g| std::mem::take(&mut groups[g])).collect();
+                let mut sorted_groups: Vec<Vec<usize>> = group_order.into_iter().map(|g| std::mem::take(&mut groups[g])).collect();
+                // (the groups' rows as rows of `filtered`)
+                if let Some(kept) = kept {
+                    sorted_groups.iter_mut().for_each(|group| group.iter_mut().for_each(|r| *r = kept[*r]));
+                }
 
                 if by_vecs.len() == 1 && !key_vals.is_empty() {
                     key_vals[0].set_attr_unchecked(Attr::Sorted);
@@ -469,7 +495,8 @@ impl<'a> Engine<'a> {
 
                 // bind the `by` names too, so `select ... by bar: 5 xbar t` can reference `bar`
                 let mut scope = filtered.clone();
-                for (bn, bv) in by_names.iter().zip(by_vecs) {
+                // (where the rows grouped are among others, the `by` columns are there already)
+                for (bn, bv) in by_names.iter().zip(by_vecs).filter(|_| kept.is_none()) {
                     match scope.col_idx(*bn) {
                         Some(pos) => scope.vals[pos] = bv,
                         None => {
@@ -510,7 +537,7 @@ impl<'a> Engine<'a> {
     fn exec_query_exec(&mut self, filtered: &Flip, rows: &RowNumbers, cols: &[ColSpec], by: Option<&[ColSpec]>) -> KResult<K> {
         if let Some(by_specs) = by {
             // `exec val by key from t` -> dictionary `keys ! vals`
-            let tbl = self.exec_select(filtered, rows, cols, Some(by_specs), None)?;
+            let tbl = self.exec_select(filtered, rows, None, cols, Some(by_specs), None)?;
             if let K::KeyedTable(kt) = &tbl {
                 return Ok(exec_by_result(kt));
             }

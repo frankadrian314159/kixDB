@@ -88,7 +88,7 @@ pub fn true_rows(bs: &[bool]) -> Vec<usize> {
 /// Number the groups of rows with the keys `keys` (a column of 64-bit values each) into `ids`, in order of first
 /// appearance, a piece at a time: `number` numbers the rows of one piece the same way, from 0. `false` (and nothing
 /// to be relied on in `ids`) when there are so many groups that putting the pieces together would cost what it saves.
-pub fn group(keys: &[Vec<u64>], ids: &mut [usize], number: impl Fn(Range<usize>, &mut [usize]) + Sync) -> bool {
+pub fn group<K: AsRef<[u64]> + Sync>(keys: &[K], ids: &mut [usize], number: impl Fn(Range<usize>, &mut [usize]) + Sync) -> bool {
     // a sample tells whether rows mostly share groups
     let sample = PIECE.min(ids.len());
     number(0..sample, &mut ids[..sample]);
@@ -118,7 +118,7 @@ pub fn group(keys: &[Vec<u64>], ids: &mut [usize], number: impl Fn(Range<usize>,
         .map(|rows| {
             let mut number_of = |row: usize| {
                 let next = seen.len();
-                *seen.entry(keys.iter().map(|k| k[row]).collect()).or_insert(next)
+                *seen.entry(keys.iter().map(|k| k.as_ref()[row]).collect()).or_insert(next)
             };
             rows.iter().map(|&r| number_of(r)).collect()
         })

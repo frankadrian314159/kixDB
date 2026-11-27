@@ -1,5 +1,30 @@
 # Benchmark results: scale factor 0.3
 
+## Copying less while filtering
+
+Measured 2026-11-26 on mains power: commit `341ec82` and the changes below, run back to back, one run each. Provisional,
+as below.
+
+| | `341ec82` | now |
+| --- | ---: | ---: |
+| Queries, TPC-H / TPC-DS, single node | 0.49 / 0.16 s | 0.44 / 0.13 s |
+| Queries, TPC-H / TPC-DS, 3 shards | 0.62 / 0.31 s | 0.48 / 0.26 s |
+| Memory allocated by the TPC-H queries, once each | 1,646 MB | 1,249 MB |
+| Memory allocated by the TPC-DS queries | 493 MB | 374 MB |
+| Most memory a TPC-H query adds while it runs | 125 MB | 83 MB |
+| TPC-H queries/s, 12 clients, 6 threads | 51 | 64 |
+| Processor time a query then | 119 ms | 91 ms |
+| TPC-H queries/s, 1 client | 45 | 54 |
+
+What changed:
+
+* While at least half of a table's rows are kept, a later `where` clause that looks at one row at a time is tested on
+  the whole columns, instead of on a copy of the rows kept so far.
+* A query that keeps at least half of the rows and groups them by columns of the table reads them where they are.
+* Keys that are `long`s, timestamps or timespans are read where they are for grouping, joins and `in`, instead of being
+  copied.
+* `avg` of floats by group adds the values where they are.
+
 ## Threads and keyed tables
 
 Measured 2026-11-26 on mains power (6 cores, 12 threads), one run each. Provisional, as below.

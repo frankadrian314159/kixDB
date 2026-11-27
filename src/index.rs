@@ -8,6 +8,7 @@ use crate::error::KResult;
 use crate::sym::{resolve, SymId};
 use crate::types::{Attr, ColVec, Flip, K};
 use std::any::Any;
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use foldhash::{HashMap, HashMapExt};
 use std::hash::{BuildHasher, Hasher};
@@ -138,7 +139,7 @@ pub struct KeyIndex {
 
 impl KeyIndex {
     /// The code of the key in row `r` of the columns whose bits these are.
-    fn code(bits: &[Vec<u64>], r: usize) -> u64 {
+    fn code(bits: &[Cow<'_, [u64]>], r: usize) -> u64 {
         match bits {
             [one] => one[r],
             several => {
@@ -153,7 +154,8 @@ impl KeyIndex {
     fn extend(&mut self, columns: &[ColVec]) -> Option<()> {
         let end = columns.first()?.len();
         let from = self.len;
-        let bits: Vec<Vec<u64>> = columns.iter().map(|c| if from == 0 { c.key_bits() } else { c.drop_n(from as i64).key_bits() }).collect::<Option<_>>()?;
+        let added = |c: &ColVec| c.drop_n(from as i64).key_bits().map(|bits| Cow::Owned(bits.into_owned()));
+        let bits: Vec<Cow<'_, [u64]>> = columns.iter().map(|c| if from == 0 { c.key_bits() } else { added(c) }).collect::<Option<_>>()?;
         for r in 0..end - from {
             let row = u32::try_from(from + r).ok()?;
             let first = *self.rows.entry(Self::code(&bits, r)).or_insert(row);
@@ -169,7 +171,7 @@ impl KeyIndex {
     }
 
     /// The row of `columns` with the key that row `r` of the wanted columns holds, whose bits are `bits`.
-    fn row(&self, columns: &[ColVec], wanted: &[&ColVec], bits: &[Vec<u64>], r: usize) -> Option<usize> {
+    fn row(&self, columns: &[ColVec], wanted: &[&ColVec], bits: &[Cow<'_, [u64]>], r: usize) -> Option<usize> {
         let row = *self.rows.get(&Self::code(bits, r))? as usize;
         // (of several columns, another key may have the same code)
         (columns.len() == 1 || columns.iter().zip(wanted).all(|(c, w)| c.get_atom(row) == w.get_atom(r))).then_some(row)
@@ -238,7 +240,7 @@ pub fn key_rows(columns: &[ColVec], wanted: &[&ColVec], n: usize) -> Option<Vec<
         return None;
     }
     let index = key_index(columns)?;
-    let bits: Vec<Vec<u64>> = wanted.iter().map(|w| w.key_bits()).collect::<Option<_>>()?;
+    let bits: Vec<Cow<'_, [u64]>> = wanted.iter().map(|w| w.key_bits()).collect::<Option<_>>()?;
     Some((0..n).map(|r| index.row(columns, wanted, &bits, r)).collect())
 }
 

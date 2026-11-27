@@ -1023,12 +1023,16 @@ impl ColVec {
 
     /// Each element of a fixed-width vector as 64 bits, two being equal exactly when the elements' `hash_key`s are
     /// (so all NaNs are one value, as are both zeros).
-    pub fn key_bits(&self) -> Option<Vec<u64>> {
+    pub fn key_bits(&self) -> Option<Cow<'_, [u64]>> {
         fn float(v: f64) -> u64 {
             if v.is_nan() { f64::NAN.to_bits() } else if v == 0.0 { 0 } else { v.to_bits() }
         }
         use crate::engine::par::map as par;
-        Some(match self {
+        if let ColVec::Long(_, v) | ColVec::Timestamp(_, v) | ColVec::Timespan(_, v) = self {
+            // SAFETY: the two are as large and as aligned, and every pattern of bits is a value of each
+            return Some(Cow::Borrowed(unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u64>(), v.len()) }));
+        }
+        Some(Cow::Owned(match self {
             ColVec::Bool(_, v) => par(v, |&x| u64::from(x)),
             ColVec::Byte(_, v) | ColVec::Char(_, v) => par(v, |&x| u64::from(x)),
             ColVec::Short(_, v) => par(v, |&x| x as u64),
@@ -1038,13 +1042,13 @@ impl ColVec {
             | ColVec::Minute(_, v)
             | ColVec::Second(_, v)
             | ColVec::Time(_, v) => par(v, |&x| x as u64),
-            ColVec::Long(_, v) | ColVec::Timestamp(_, v) | ColVec::Timespan(_, v) => par(v, |&x| x as u64),
+            ColVec::Long(..) | ColVec::Timestamp(..) | ColVec::Timespan(..) => unreachable!("read above"),
             ColVec::Real(_, v) => par(v, |&x| float(f64::from(x))),
             ColVec::Float(_, v) | ColVec::Datetime(_, v) => par(v, |&x| float(x)),
             ColVec::Sym(_, v) => par(v, |&x| u64::from(x.0)),
             ColVec::General(..) | ColVec::Guid(..) | ColVec::Strings(..) => return None,
             ColVec::Enum(_, v) => return v.key_bits(),
-        })
+        }))
     }
 
     pub fn is_numeric(&self) -> bool {

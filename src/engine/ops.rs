@@ -760,7 +760,7 @@ pub(crate) fn group_ids(cols: &[ColVec], nrows: usize) -> Vec<usize> {
         count
     }
     // the rows `of` alone, by the columns' keys
-    let number = |keys: &[Vec<u64>], of: Range<usize>, ids: &mut [usize]| {
+    let number = |keys: &[Cow<'_, [u64]>], of: Range<usize>, ids: &mut [usize]| {
         let (mut groups, n) = (1, of.len());
         ids.fill(0);
         for keys in keys.iter().map(|k| &k[of.clone()]) {
@@ -781,7 +781,7 @@ pub(crate) fn group_ids(cols: &[ColVec], nrows: usize) -> Vec<usize> {
     let mut ids = vec![0; nrows];
     for c in cols {
         match (c.key_bits(), c) {
-            (Some(keys), _) => refine(&mut ids, keys.into_iter()),
+            (Some(keys), _) => refine(&mut ids, keys.iter().copied()),
             (None, ColVec::Strings(_, s)) => refine(&mut ids, s.iter()),
             (None, _) => refine(&mut ids, (0..nrows).map(|r| c.get_atom(r).hash_key())),
         };
@@ -827,6 +827,11 @@ pub fn aggregate_rows(verb: &str, values: &ColVec, rows: &[usize]) -> KResult<K>
         ("first", _) => values.get_atom(rows[0]),
         ("sum", ColVec::Float(_, xs)) => K::Float(rows.iter().map(|&r| xs[r]).filter(|v| !v.is_nan()).sum()),
         ("sum", ColVec::Long(_, xs)) => K::Long(rows.iter().map(|&r| xs[r]).filter(|&v| v != NULL_LONG).fold(0, i64::wrapping_add)),
+        ("avg", ColVec::Float(_, xs)) => {
+            let add = |piece: &[usize]| piece.iter().map(|&r| xs[r]).filter(|v| !v.is_nan()).fold((0.0, 0usize), |a, v| (a.0 + v, a.1 + 1));
+            let (sum, n) = par::pieces(rows, add).into_iter().fold((0.0, 0), |a, p| (a.0 + p.0, a.1 + p.1));
+            K::Float(if n == 0 { f64::NAN } else { sum / n as f64 })
+        }
         _ => eval_unary_prim(verb, &K::Vector(values.gather(rows)))?,
     })
 }
@@ -2828,7 +2833,7 @@ fn in_op(lhs: &K, rhs: &K) -> KResult<K> {
                     want.iter().for_each(|x| slots[x.wrapping_sub(lo) as usize] = true);
                     have.iter().map(|x| slots.get(x.wrapping_sub(lo) as usize) == Some(&true)).collect()
                 } else {
-                    let set: HashSet<u64> = want.into_iter().collect();
+                    let set: HashSet<u64> = want.iter().copied().collect();
                     have.iter().map(|x| set.contains(x)).collect()
                 }));
             }
