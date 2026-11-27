@@ -6,26 +6,38 @@
 use crate::ast::Expr;
 use crate::error::KResult;
 use crate::sym::{resolve, SymId};
-use crate::types::{Attr, ColVec, Flip, K};
+use crate::types::{Attr, ColVec, Flip, KeyedTable, K};
 use std::any::Any;
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use foldhash::{HashMap, HashMapExt};
 use std::hash::{BuildHasher, Hasher};
 use std::ops::Range;
-use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
+use std::sync::{Arc, LazyLock, OnceLock, RwLock, Weak};
 
 enum AttrIndex {
-    Unique(HashMap<Vec<u8>, usize>),
-    Parted(HashMap<Vec<u8>, Range<usize>>),
-    Grouped(HashMap<Vec<u8>, Vec<usize>>),
+    UniqueBits(HashMap<u64, usize>),
+    UniqueBytes(HashMap<Vec<u8>, usize>),
+    PartedBits(HashMap<u64, Range<usize>>),
+    PartedBytes(HashMap<Vec<u8>, Range<usize>>),
+    GroupedBits(HashMap<u64, Vec<usize>>),
+    GroupedBytes(HashMap<Vec<u8>, Vec<usize>>),
 }
 
 type CacheKey = (usize, usize, u8);
 /// A column and its index, if that has been built.
 type CacheEntry = (Weak<dyn Any + Send + Sync>, Option<Arc<AttrIndex>>);
 
-static INDEX_CACHE: LazyLock<Mutex<HashMap<CacheKey, CacheEntry>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+const INDEX_SHARD_COUNT: usize = 64;
+static INDEX_SHARDS: LazyLock<[RwLock<HashMap<CacheKey, CacheEntry>>; INDEX_SHARD_COUNT]> =
+    LazyLock::new(|| std::array::from_fn(|_| RwLock::new(HashMap::new())));
+
+#[inline]
+fn index_shard(key: CacheKey) -> &'static RwLock<HashMap<CacheKey, CacheEntry>> {
+    let h = (key.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) & (INDEX_SHARD_COUNT - 1);
+    &INDEX_SHARDS[h]
+}
 
 fn backing_identity(cv: &ColVec) -> (CacheKey, Arc<dyn Any + Send + Sync>) {
     let ab = cv.attr().ipc_byte();
@@ -69,8 +81,8 @@ fn get_or_build_index(cv: &ColVec) -> Option<Arc<AttrIndex>> {
     }
     let (key, backing) = backing_identity(cv);
     let held = {
-        let cache = INDEX_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        cache.get(&key).filter(|(weak, _)| weak.upgrade().is_some()).map(|(_, index)| index.clone())
+        let cache = index_shard(key).read().unwrap_or_else(|e| e.into_inner());
+        cache.get(&key).filter(|(weak, _)| weak.strong_count() > 0).map(|(_, index)| index.clone())
     };
     if let Some(Some(index)) = held {
         return Some(index);
@@ -82,36 +94,70 @@ fn get_or_build_index(cv: &ColVec) -> Option<Arc<AttrIndex>> {
         return None;
     }
     let n = cv.len();
-    let built = match attr {
-        Attr::Unique => {
-            let mut m = HashMap::with_capacity(n);
-            for i in 0..n {
-                m.entry(cv.get_atom(i).hash_key()).or_insert(i);
-            }
-            AttrIndex::Unique(m)
-        }
-        Attr::Parted => {
-            let mut m = HashMap::new();
-            let mut i = 0;
-            while i < n {
-                let hk = cv.get_atom(i).hash_key();
-                let mut j = i + 1;
-                while j < n && cv.get_atom(j).hash_key() == hk {
-                    j += 1;
+    let built = if let Some(bits) = cv.key_bits() {
+        match attr {
+            Attr::Unique => {
+                let mut m = HashMap::with_capacity(n);
+                for (i, &b) in bits.iter().enumerate() {
+                    m.entry(b).or_insert(i);
                 }
-                m.entry(hk).or_insert(i..j);
-                i = j;
+                AttrIndex::UniqueBits(m)
             }
-            AttrIndex::Parted(m)
-        }
-        Attr::Grouped => {
-            let mut m: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
-            for i in 0..n {
-                m.entry(cv.get_atom(i).hash_key()).or_default().push(i);
+            Attr::Parted => {
+                let mut m = HashMap::new();
+                let mut i = 0;
+                while i < n {
+                    let b = bits[i];
+                    let mut j = i + 1;
+                    while j < n && bits[j] == b {
+                        j += 1;
+                    }
+                    m.entry(b).or_insert(i..j);
+                    i = j;
+                }
+                AttrIndex::PartedBits(m)
             }
-            AttrIndex::Grouped(m)
+            Attr::Grouped => {
+                let mut m: HashMap<u64, Vec<usize>> = HashMap::new();
+                for (i, &b) in bits.iter().enumerate() {
+                    m.entry(b).or_default().push(i);
+                }
+                AttrIndex::GroupedBits(m)
+            }
+            _ => return None,
         }
-        _ => return None,
+    } else {
+        match attr {
+            Attr::Unique => {
+                let mut m = HashMap::with_capacity(n);
+                for i in 0..n {
+                    m.entry(cv.get_atom(i).hash_key()).or_insert(i);
+                }
+                AttrIndex::UniqueBytes(m)
+            }
+            Attr::Parted => {
+                let mut m = HashMap::new();
+                let mut i = 0;
+                while i < n {
+                    let hk = cv.get_atom(i).hash_key();
+                    let mut j = i + 1;
+                    while j < n && cv.get_atom(j).hash_key() == hk {
+                        j += 1;
+                    }
+                    m.entry(hk).or_insert(i..j);
+                    i = j;
+                }
+                AttrIndex::PartedBytes(m)
+            }
+            Attr::Grouped => {
+                let mut m: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
+                for i in 0..n {
+                    m.entry(cv.get_atom(i).hash_key()).or_default().push(i);
+                }
+                AttrIndex::GroupedBytes(m)
+            }
+            _ => return None,
+        }
     };
     let arc_idx = Arc::new(built);
     remember_index(key, &backing, Some(arc_idx.clone()));
@@ -119,10 +165,10 @@ fn get_or_build_index(cv: &ColVec) -> Option<Arc<AttrIndex>> {
 }
 
 fn remember_index(key: CacheKey, backing: &Arc<dyn Any + Send + Sync>, index: Option<Arc<AttrIndex>>) {
-    let mut cache = INDEX_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut cache = index_shard(key).write().unwrap_or_else(|e| e.into_inner());
     // (an index goes with the column it was made from)
     cache.retain(|_, (w, _)| w.strong_count() > 0);
-    if cache.len() >= 256 {
+    if cache.len() >= 16 {
         cache.clear();
     }
     cache.insert(key, (Arc::downgrade(backing), index));
@@ -187,87 +233,126 @@ impl KeyIndex {
     }
 }
 
-/// The columns of an index, to learn when one is gone.
-type Held = Vec<Weak<dyn Any + Send + Sync>>;
-/// The columns of an index and what is known of them: `None` while they have been asked for only once. The cache knows
-/// them by where each is held and how long it is.
-type KeyEntry = (Held, Option<Arc<KeyIndex>>);
-static KEY_CACHE: LazyLock<Mutex<HashMap<Vec<CacheKey>, KeyEntry>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+#[derive(Default)]
+struct KeyState {
+    hits: AtomicU8,
+    built: OnceLock<Option<Arc<KeyIndex>>>,
+}
 
-/// What stands for `columns` in the cache, if they are of kinds that are indexed: keys that are equal as `=` has them
-/// when their bits are, which floats are not.
-fn identity(columns: &[ColVec]) -> Option<(Vec<CacheKey>, Held)> {
+impl KeyState {
+    fn with_built(index: Option<Arc<KeyIndex>>) -> Self {
+        let built = OnceLock::new();
+        let _ = built.set(index);
+        Self {
+            hits: AtomicU8::new(2),
+            built,
+        }
+    }
+}
+
+/// Inline lock-free lazy key index attached to `KeyedTable`, copy-on-write across snapshots.
+#[derive(Clone, Default)]
+pub struct KeySlot(Arc<KeyState>);
+
+impl std::fmt::Debug for KeySlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("KeySlot")
+    }
+}
+
+impl PartialEq for KeySlot {
+    #[inline]
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for KeySlot {}
+
+/// Whether `columns` are of kinds and length that are indexed: keys equal under `=` iff their bits are (excluding floats).
+fn is_indexable(columns: &[ColVec]) -> bool {
     let kind = |c: &ColVec| matches!(c.type_num(), 1 | 4..=7 | 10..=14 | 16..=19) && !matches!(c, ColVec::Enum(..));
-    if columns.first()?.len() < MANY_ROWS || !columns.iter().all(kind) {
-        return None;
-    }
-    Some(columns.iter().map(|c| {
-        let (key, held) = backing_identity(c);
-        (key, Arc::downgrade(&held))
-    }).unzip())
+    columns.first().is_some_and(|c| c.len() >= MANY_ROWS) && columns.iter().all(kind)
 }
 
-fn remember(id: Vec<CacheKey>, entry: KeyEntry) {
-    let mut cache = KEY_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if cache.len() >= 256 {
-        cache.retain(|_, (held, _)| held.iter().all(|w| w.strong_count() > 0));
-        if cache.len() >= 256 {
-            cache.clear();
+impl KeySlot {
+    #[inline]
+    pub fn get_or_build(&self, columns: &[ColVec]) -> Option<Arc<KeyIndex>> {
+        if let Some(cached) = self.0.built.get() {
+            return cached.clone();
         }
+        if !is_indexable(columns) {
+            return None;
+        }
+        let prev = self
+            .0
+            .hits
+            .fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |h| Some(h.saturating_add(1)))
+            .unwrap_or(0);
+        if prev == 0 {
+            return None;
+        }
+        self.0
+            .built
+            .get_or_init(|| {
+                let mut index = KeyIndex {
+                    rows: HashMap::with_capacity(columns[0].len()),
+                    len: 0,
+                    unique: true,
+                };
+                index.extend(columns)?;
+                Some(Arc::new(index))
+            })
+            .clone()
     }
-    cache.insert(id, entry);
+
+    pub(crate) fn extend_after_append(&mut self, columns: &[ColVec]) {
+        if !is_indexable(columns) {
+            if Arc::strong_count(&self.0) > 1 {
+                self.0 = Arc::new(KeyState::default());
+            }
+            return;
+        }
+        if let Some(state) = Arc::get_mut(&mut self.0) {
+            if let Some(slot) = state.built.get_mut() {
+                if let Some(arc_idx) = slot {
+                    if Arc::make_mut(arc_idx).extend(columns).is_none() {
+                        *slot = None;
+                    }
+                }
+            }
+            return;
+        }
+        self.0 = match self.0.built.get() {
+            Some(Some(old)) => {
+                let mut cloned = (**old).clone();
+                let next = cloned.extend(columns).map(|()| Arc::new(cloned));
+                Arc::new(KeyState::with_built(next))
+            }
+            Some(None) => Arc::new(KeyState::with_built(None)),
+            None => Arc::new(KeyState {
+                hits: AtomicU8::new(self.0.hits.load(AtomicOrdering::Relaxed)),
+                built: OnceLock::new(),
+            }),
+        };
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.0 = Arc::new(KeyState::default());
+    }
 }
 
-/// The index of the key `columns`, if they have been asked for before.
-fn key_index(columns: &[ColVec]) -> Option<Arc<KeyIndex>> {
-    let (id, held) = identity(columns)?;
-    let known = {
-        let cache = KEY_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        cache.get(&id).filter(|(held, _)| held.iter().all(|w| w.strong_count() > 0)).map(|(_, index)| index.clone())
-    };
-    match known {
-        Some(Some(index)) => Some(index),
-        None => {
-            remember(id, (held, None));
-            None
-        }
-        Some(None) => {
-            let mut index = KeyIndex { rows: HashMap::with_capacity(columns[0].len()), len: 0, unique: true };
-            index.extend(columns)?;
-            let index = Arc::new(index);
-            remember(id, (held, Some(index.clone())));
-            Some(index)
-        }
-    }
-}
-
-/// The first row of the key `columns` that holds each of the `n` keys in `wanted`. `None`: look some other way (the
+/// The first row of `kt` that holds each of the `n` keys in `wanted`. `None`: look some other way (the
 /// keys are too few or not indexed, there are too many to look up for an index to help, or this is the first time).
-pub fn key_rows(columns: &[ColVec], wanted: &[&ColVec], n: usize) -> Option<Vec<Option<usize>>> {
+pub fn key_rows(kt: &KeyedTable, wanted: &[&ColVec], n: usize) -> Option<Vec<Option<usize>>> {
+    let columns = &kt.keys.vals;
     let alike = columns.len() == wanted.len() && columns.iter().zip(wanted).all(|(c, w)| c.type_num() == w.type_num() && w.len() == n);
     if !alike || n.saturating_mul(4) >= columns.first()?.len() {
         return None;
     }
-    let index = key_index(columns)?;
+    let index = kt.key_index.get_or_build(columns)?;
     let bits: Vec<Cow<'_, [u64]>> = wanted.iter().map(|w| w.key_bits()).collect::<Option<_>>()?;
     Some((0..n).map(|r| index.row(columns, wanted, &bits, r)).collect())
-}
-
-/// Take the index of `columns` out of the cache, to be given back by `keep_keys` once rows have been added to them. (Left
-/// there, it would hold on to the columns, which would then be copied to be changed.)
-pub(crate) fn take_keys(columns: &[ColVec]) -> Option<KeyEntry> {
-    let (id, _) = identity(columns)?;
-    KEY_CACHE.lock().unwrap_or_else(|e| e.into_inner()).remove(&id)
-}
-
-/// The index that `take_keys` gave, for the columns as they are with rows added.
-pub(crate) fn keep_keys(columns: &[ColVec], taken: KeyEntry) {
-    let Some((id, held)) = identity(columns) else { return };
-    let index = taken.1.and_then(|mut index| {
-        Arc::make_mut(&mut index).extend(columns)?;
-        Some(index)
-    });
-    remember(id, (held, index));
 }
 
 /// Binary-search lower bound: first index `i` where `cv[i] >= target`.
@@ -350,12 +435,17 @@ pub fn find_first(hay: &ColVec, needle: &K) -> Option<usize> {
             Some(if r.start < r.end { r.start } else { hay.len() })
         }
         Attr::Unique | Attr::Parted | Attr::Grouped => {
+            if !hay.is_list() && needle.plain().type_num() != -hay.plain().type_num() {
+                return Some(hay.len());
+            }
             let idx = get_or_build_index(hay)?;
-            let hk = needle.hash_key();
             let found = match &*idx {
-                AttrIndex::Unique(m) => m.get(&hk).copied(),
-                AttrIndex::Parted(m) => m.get(&hk).map(|r| r.start),
-                AttrIndex::Grouped(m) => m.get(&hk).and_then(|v| v.first().copied()),
+                AttrIndex::UniqueBits(m) => needle.atom_key_bits().and_then(|b| m.get(&b).copied()),
+                AttrIndex::PartedBits(m) => needle.atom_key_bits().and_then(|b| m.get(&b).map(|r| r.start)),
+                AttrIndex::GroupedBits(m) => needle.atom_key_bits().and_then(|b| m.get(&b).and_then(|v| v.first().copied())),
+                AttrIndex::UniqueBytes(m) => m.get(&needle.hash_key()).copied(),
+                AttrIndex::PartedBytes(m) => m.get(&needle.hash_key()).map(|r| r.start),
+                AttrIndex::GroupedBytes(m) => m.get(&needle.hash_key()).and_then(|v| v.first().copied()),
             };
             Some(found.unwrap_or_else(|| hay.len()))
         }
@@ -395,20 +485,34 @@ fn append_eq_rows(cv: &ColVec, needle: &K, out: &mut Vec<usize>) -> bool {
         Attr::Sorted => out.extend(sorted_eq_range(cv, target)),
         Attr::Unique | Attr::Parted | Attr::Grouped => {
             let Some(idx) = get_or_build_index(cv) else { return false };
-            let hk = target.hash_key();
             match &*idx {
-                AttrIndex::Unique(m) => {
-                    if let Some(&r) = m.get(&hk) {
+                AttrIndex::UniqueBits(m) => {
+                    if let Some(&r) = target.atom_key_bits().and_then(|b| m.get(&b)) {
                         out.push(r);
                     }
                 }
-                AttrIndex::Parted(m) => {
-                    if let Some(rng) = m.get(&hk) {
+                AttrIndex::PartedBits(m) => {
+                    if let Some(rng) = target.atom_key_bits().and_then(|b| m.get(&b)) {
                         out.extend(rng.clone());
                     }
                 }
-                AttrIndex::Grouped(m) => {
-                    if let Some(rows) = m.get(&hk) {
+                AttrIndex::GroupedBits(m) => {
+                    if let Some(rows) = target.atom_key_bits().and_then(|b| m.get(&b)) {
+                        out.extend_from_slice(rows);
+                    }
+                }
+                AttrIndex::UniqueBytes(m) => {
+                    if let Some(&r) = m.get(&target.hash_key()) {
+                        out.push(r);
+                    }
+                }
+                AttrIndex::PartedBytes(m) => {
+                    if let Some(rng) = m.get(&target.hash_key()) {
+                        out.extend(rng.clone());
+                    }
+                }
+                AttrIndex::GroupedBytes(m) => {
+                    if let Some(rows) = m.get(&target.hash_key()) {
                         out.extend_from_slice(rows);
                     }
                 }
@@ -476,7 +580,7 @@ fn expr_uses_table_cols(e: &Expr, cols: &[SymId]) -> bool {
 /// Attempt to evaluate a `qSQL` `where` predicate directly against an attributed column of `flip`.
 pub fn try_filter_where(
     flip: &Flip,
-    key: Option<SymId>,
+    key_table: Option<&KeyedTable>,
     active: Option<&[usize]>,
     wc: &Expr,
     eval_rhs: &mut impl FnMut(&Expr) -> KResult<K>,
@@ -494,8 +598,8 @@ pub fn try_filter_where(
     let cv = flip.col(col_sym).unwrap();
     if cv.attr() == Attr::None {
         // the one key of a keyed table is found by the index of its keys, where no key is there twice
-        if key == Some(col_sym) && eff_op == "=" && active.is_none() {
-            if let Some(index) = key_index(std::slice::from_ref(cv)).filter(|index| index.unique) {
+        if let Some(kt) = key_table.filter(|kt| kt.keys.cols == [col_sym] && eff_op == "=" && active.is_none()) {
+            if let Some(index) = kt.key_index.get_or_build(&kt.keys.vals).filter(|index| index.unique) {
                 let v = eval_rhs(val_expr)?;
                 if v.type_num() == -cv.type_num() {
                     let wanted = ColVec::from_atoms(vec![v]);

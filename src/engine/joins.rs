@@ -3,10 +3,12 @@
 //! - `aj` / `aj0` (as-of join on symbol/entity keys + monotonic time column, binary-searched per entity!)
 //! - `wj` / `wj1` (window join aggregating quote windows `[lo; hi]` per trade row!)
 use crate::engine::ops::{first_rows, group_ids};
+use crate::engine::par;
 use crate::error::{KError, KResult};
 use crate::sym::{intern, resolve, SymId};
 use crate::types::*;
 use foldhash::{HashMap, HashMapExt};
+use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
@@ -37,7 +39,7 @@ fn key_buckets(left: &[&ColVec], nleft: usize, right: &[&ColVec], nright: usize)
 /// The row of `kt` with the key of each row of `keys` (`None` where it has none): one pass over the keys of `kt`,
 /// without copying them where there is one key column.
 pub fn match_keys(kt: &KeyedTable, keys: &[&ColVec], nrows: usize) -> Vec<Option<usize>> {
-    if let Some(found) = crate::index::key_rows(&kt.keys.vals, keys, nrows) {
+    if let Some(found) = crate::index::key_rows(kt, keys, nrows) {
         return found;
     }
     if let ([have], [want]) = (kt.keys.vals.as_slice(), keys) {
@@ -59,11 +61,15 @@ pub fn match_keys(kt: &KeyedTable, keys: &[&ColVec], nrows: usize) -> Vec<Option
 
 /// Probe row index in `kt` for each row of `left_key_cols` (`None` on miss).
 fn probe_keyed_table(kt: &KeyedTable, left_key_cols: &[&ColVec], nrows: usize) -> Vec<Option<usize>> {
-    if let Some(found) = crate::index::key_rows(&kt.keys.vals, left_key_cols, nrows) {
+    let nright = kt.nrows();
+    if nrows == 0 || nright == 0 {
+        return vec![None; nrows];
+    }
+    if let Some(found) = crate::index::key_rows(kt, left_key_cols, nrows) {
         return found;
     }
     // The index that a key column's attribute gives spares a few probes of a large table from reading every key.
-    let few = nrows.saturating_mul(4) < kt.nrows();
+    let few = nrows.saturating_mul(4) < nright;
     if few && kt.keys.ncols() == 1 && crate::index::finds(&kt.keys.vals[0]) && kt.keys.vals[0].type_num() == left_key_cols[0].type_num() {
         let kcol = &kt.keys.vals[0];
         let lcol = left_key_cols[0];
@@ -72,8 +78,124 @@ fn probe_keyed_table(kt: &KeyedTable, left_key_cols: &[&ColVec], nrows: usize) -
             .map(|r| crate::index::find_first(kcol, &lcol.get_atom(r)).filter(|&idx| idx < klen))
             .collect();
     }
+    let same_types = kt
+        .keys
+        .vals
+        .iter()
+        .zip(left_key_cols)
+        .all(|(r, l)| r.plain().type_num() == l.plain().type_num());
+    if same_types && nright < u32::MAX as usize {
+        match (kt.keys.vals.as_slice(), left_key_cols) {
+            ([rcol], [lcol]) => {
+                if let (Some(rbits), Some(lbits)) = (rcol.key_bits(), lcol.key_bits()) {
+                    if nrows.saturating_mul(8) < nright {
+                        let mut wanted: HashMap<u64, u32> = HashMap::with_capacity(nrows);
+                        for &k in lbits.iter() {
+                            wanted.insert(k, u32::MAX);
+                        }
+                        for (r, &k) in rbits.iter().enumerate().rev() {
+                            if let Some(slot) = wanted.get_mut(&k) {
+                                *slot = r as u32;
+                            }
+                        }
+                        return par::map(&lbits, |k| {
+                            let v = wanted[k];
+                            (v != u32::MAX).then_some(v as usize)
+                        });
+                    }
+                    let (lo, hi) = rbits
+                        .iter()
+                        .fold((i64::MAX, i64::MIN), |(lo, hi), &k| (lo.min(k as i64), hi.max(k as i64)));
+                    if let Some(span) = hi.checked_sub(lo).and_then(|d| usize::try_from(d).ok()).and_then(|d| d.checked_add(1)) {
+                        if span <= nright.saturating_mul(5).saturating_add(256) && span <= 8_000_000 {
+                            let lo = lo as u64;
+                            let mut slots = vec![u32::MAX; span];
+                            for (r, &k) in rbits.iter().enumerate().rev() {
+                                slots[k.wrapping_sub(lo) as usize] = r as u32;
+                            }
+                            return par::map(&lbits, |&k| {
+                                slots.get(k.wrapping_sub(lo) as usize).and_then(|&v| (v != u32::MAX).then_some(v as usize))
+                            });
+                        }
+                    }
+                    let mut map: HashMap<u64, u32> = HashMap::with_capacity(nright);
+                    for (r, &k) in rbits.iter().enumerate().rev() {
+                        map.insert(k, r as u32);
+                    }
+                    return par::map(&lbits, |k| map.get(k).map(|&v| v as usize));
+                }
+            }
+            ([r0, r1], [l0, l1]) => {
+                if let (Some(rb0), Some(rb1), Some(lb0), Some(lb1)) = (r0.key_bits(), r1.key_bits(), l0.key_bits(), l1.key_bits()) {
+                    if nrows < nright {
+                        let mut wanted: HashMap<(u64, u64), u32> = HashMap::with_capacity(nrows);
+                        for i in 0..nrows {
+                            wanted.insert((lb0[i], lb1[i]), u32::MAX);
+                        }
+                        for r in (0..nright).rev() {
+                            if let Some(slot) = wanted.get_mut(&(rb0[r], rb1[r])) {
+                                *slot = r as u32;
+                            }
+                        }
+                        let lookup = |i: usize| {
+                            let v = wanted[&(lb0[i], lb1[i])];
+                            (v != u32::MAX).then_some(v as usize)
+                        };
+                        return match par::split(nrows) {
+                            false => (0..nrows).map(lookup).collect(),
+                            true => (0..nrows).into_par_iter().map(lookup).collect(),
+                        };
+                    }
+                    let mut map: HashMap<(u64, u64), u32> = HashMap::with_capacity(nright);
+                    for r in (0..nright).rev() {
+                        map.insert((rb0[r], rb1[r]), r as u32);
+                    }
+                    let lookup = |i: usize| map.get(&(lb0[i], lb1[i])).map(|&v| v as usize);
+                    return match par::split(nrows) {
+                        false => (0..nrows).map(lookup).collect(),
+                        true => (0..nrows).into_par_iter().map(lookup).collect(),
+                    };
+                }
+            }
+            ([r0, r1, r2], [l0, l1, l2]) => {
+                if let (Some(rb0), Some(rb1), Some(rb2), Some(lb0), Some(lb1), Some(lb2)) =
+                    (r0.key_bits(), r1.key_bits(), r2.key_bits(), l0.key_bits(), l1.key_bits(), l2.key_bits())
+                {
+                    if nrows < nright {
+                        let mut wanted: HashMap<[u64; 3], u32> = HashMap::with_capacity(nrows);
+                        for i in 0..nrows {
+                            wanted.insert([lb0[i], lb1[i], lb2[i]], u32::MAX);
+                        }
+                        for r in (0..nright).rev() {
+                            if let Some(slot) = wanted.get_mut(&[rb0[r], rb1[r], rb2[r]]) {
+                                *slot = r as u32;
+                            }
+                        }
+                        let lookup = |i: usize| {
+                            let v = wanted[&[lb0[i], lb1[i], lb2[i]]];
+                            (v != u32::MAX).then_some(v as usize)
+                        };
+                        return match par::split(nrows) {
+                            false => (0..nrows).map(lookup).collect(),
+                            true => (0..nrows).into_par_iter().map(lookup).collect(),
+                        };
+                    }
+                    let mut map: HashMap<[u64; 3], u32> = HashMap::with_capacity(nright);
+                    for r in (0..nright).rev() {
+                        map.insert([rb0[r], rb1[r], rb2[r]], r as u32);
+                    }
+                    let lookup = |i: usize| map.get(&[lb0[i], lb1[i], lb2[i]]).map(|&v| v as usize);
+                    return match par::split(nrows) {
+                        false => (0..nrows).map(lookup).collect(),
+                        true => (0..nrows).into_par_iter().map(lookup).collect(),
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
     let right_key_cols: Vec<&ColVec> = kt.keys.vals.iter().collect();
-    let (probe, keys) = key_ids(left_key_cols, nrows, &right_key_cols, kt.nrows());
+    let (probe, keys) = key_ids(left_key_cols, nrows, &right_key_cols, nright);
     let first = first_rows(&keys);
     probe.into_iter().map(|id| first.get(id).copied()).collect()
 }
@@ -117,24 +239,49 @@ pub fn left_join(lhs: &K, rhs: &K) -> KResult<K> {
 
     for (rc, rv) in kt.vals.cols.iter().zip(&kt.vals.vals) {
         if let Some(existing_pos) = out_cols.iter().position(|c| c == rc) {
-            // kdb+ `lj` semantics: non-null RHS value overwrites LHS value; on miss (or null RHS?), keep LHS on miss!
-            let mut merged = Vec::with_capacity(nrows);
-            for (r, m) in matched.iter().enumerate() {
-                match m {
-                    Some(rr) => {
-                        let rhs_v = rv.get_atom(*rr);
-                        if rhs_v.is_null() {
-                            merged.push(out_vals[existing_pos].get_atom(r));
-                        } else {
-                            merged.push(rhs_v);
+            // kdb+ `lj` semantics: non-null RHS value overwrites LHS value; on miss (or null RHS), keep LHS!
+            let merged_cv = match (&out_vals[existing_pos], rv) {
+                (ColVec::Long(_, lxs), ColVec::Long(_, rxs)) => Some(ColVec::Long(
+                    Attr::None,
+                    Arc::new(par::map2(lxs, &matched, |&lv, &m| m.map_or(lv, |rr| if rxs[rr] == NULL_LONG { lv } else { rxs[rr] }))),
+                )),
+                (ColVec::Int(_, lxs), ColVec::Int(_, rxs)) => Some(ColVec::Int(
+                    Attr::None,
+                    Arc::new(par::map2(lxs, &matched, |&lv, &m| m.map_or(lv, |rr| if rxs[rr] == NULL_INT { lv } else { rxs[rr] }))),
+                )),
+                (ColVec::Float(_, lxs), ColVec::Float(_, rxs)) => Some(ColVec::Float(
+                    Attr::None,
+                    Arc::new(par::map2(lxs, &matched, |&lv, &m| m.map_or(lv, |rr| if rxs[rr].is_nan() { lv } else { rxs[rr] }))),
+                )),
+                (ColVec::Sym(_, lxs), ColVec::Sym(_, rxs)) => Some(ColVec::Sym(
+                    Attr::None,
+                    Arc::new(par::map2(lxs, &matched, |&lv, &m| m.map_or(lv, |rr| if rxs[rr].is_null() { lv } else { rxs[rr] }))),
+                )),
+                (ColVec::Bool(_, lxs), ColVec::Bool(_, rxs)) => Some(ColVec::Bool(
+                    Attr::None,
+                    Arc::new(crate::bools::Bools::from_fn(nrows, |r| matched[r].map_or_else(|| lxs.get(r), |rr| rxs.get(rr)))),
+                )),
+                _ => None,
+            };
+            out_vals[existing_pos] = merged_cv.unwrap_or_else(|| {
+                let mut merged = Vec::with_capacity(nrows);
+                for (r, m) in matched.iter().enumerate() {
+                    match m {
+                        Some(rr) => {
+                            let rhs_v = rv.get_atom(*rr);
+                            if rhs_v.is_null() {
+                                merged.push(out_vals[existing_pos].get_atom(r));
+                            } else {
+                                merged.push(rhs_v);
+                            }
                         }
+                        None => merged.push(out_vals[existing_pos].get_atom(r)),
                     }
-                    None => merged.push(out_vals[existing_pos].get_atom(r)),
                 }
-            }
-            out_vals[existing_pos] = ColVec::from_atoms(merged);
+                ColVec::from_atoms(merged)
+            });
         } else {
-            let gather_idx: Vec<usize> = matched.iter().map(|m| m.unwrap_or(usize::MAX)).collect();
+            let gather_idx: Vec<usize> = par::map(&matched, |m| m.unwrap_or(usize::MAX));
             out_cols.push(*rc);
             out_vals.push(rv.gather(&gather_idx));
         }
@@ -268,6 +415,45 @@ pub fn plus_join(lhs: &K, rhs: &K) -> KResult<K> {
     let mut out_cols = left_flip.cols;
     let mut out_vals = left_flip.vals;
     for (rc, rv) in kt.vals.cols.iter().zip(&kt.vals.vals) {
+        if let Some(pos) = out_cols.iter().position(|c| c == rc) {
+            match (&out_vals[pos], rv) {
+                (ColVec::Float(_, lxs), ColVec::Float(_, rxs)) => {
+                    let out = par::map2(lxs, &matched, |&lv, &m| {
+                        lv + m.map_or(0.0, |rr| if rxs[rr].is_nan() { 0.0 } else { rxs[rr] })
+                    });
+                    out_vals[pos] = ColVec::Float(Attr::None, Arc::new(out));
+                    continue;
+                }
+                (ColVec::Long(_, lxs), ColVec::Long(_, rxs)) => {
+                    let out = par::map2(lxs, &matched, |&lv, &m| {
+                        if lv == NULL_LONG {
+                            NULL_LONG
+                        } else {
+                            lv.wrapping_add(m.map_or(0, |rr| if rxs[rr] == NULL_LONG { 0 } else { rxs[rr] }))
+                        }
+                    });
+                    out_vals[pos] = ColVec::Long(Attr::None, Arc::new(out));
+                    continue;
+                }
+                _ => {}
+            }
+        } else {
+            match rv {
+                ColVec::Float(_, rxs) => {
+                    let out = par::map(&matched, |&m| m.map_or(0.0, |rr| if rxs[rr].is_nan() { 0.0 } else { rxs[rr] }));
+                    out_cols.push(*rc);
+                    out_vals.push(ColVec::Float(Attr::None, Arc::new(out)));
+                    continue;
+                }
+                ColVec::Long(_, rxs) => {
+                    let out = par::map(&matched, |&m| m.map_or(0, |rr| if rxs[rr] == NULL_LONG { 0 } else { rxs[rr] }));
+                    out_cols.push(*rc);
+                    out_vals.push(ColVec::Long(Attr::None, Arc::new(out)));
+                    continue;
+                }
+                _ => {}
+            }
+        }
         let zero = if matches!(rv, ColVec::Float(_, _) | ColVec::Real(_, _)) { K::Float(0.0) } else { K::Long(0) };
         let addend_atoms: Vec<K> = matched
             .iter()
@@ -358,10 +544,10 @@ pub fn union_join(lhs: &K, rhs: &K) -> KResult<K> {
                     }
                 })
                 .collect();
-            Ok(K::KeyedTable(Arc::new(KeyedTable {
-                keys: Flip { cols: ka.keys.cols.clone(), vals: kvals },
-                vals: Flip { cols: all_vcols, vals: vvals },
-            })))
+            Ok(K::KeyedTable(Arc::new(KeyedTable::from_flips(
+                Flip { cols: ka.keys.cols.clone(), vals: kvals },
+                Flip { cols: all_vcols, vals: vvals },
+            ))))
         }
         _ => Err(KError::ty("uj requires two unkeyed tables or two keyed tables")),
     }

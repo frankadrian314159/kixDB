@@ -8,6 +8,7 @@
 //! assert_eq!(v.to_string(), "55");
 //! ```
 pub mod ast;
+pub mod bools;
 pub mod bytes;
 mod callbacks;
 pub mod delta;
@@ -32,6 +33,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+pub use bools::Bools;
 pub use callbacks::Background;
 pub use engine::{flip_to_resultset, k_to_resultset, BatchResult, DistMode, Event, ResultSet};
 pub use error::{KError, KResult};

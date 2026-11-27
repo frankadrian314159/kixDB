@@ -113,6 +113,14 @@ fn a_follower_given_the_changes_holds_the_same_values() {
         "sd[2]: \"two\"",
         "words: (\"ab\"; \"cd\")",
         "words,: enlist \"ef\"",
+        "bt: ([] id: til 70; ok: 0 = (til 70) mod 2)",
+        "`bt insert (70; 1b)",
+        "bt,: ([] id: 71 72; ok: 01b)",
+        "update ok: 1b from `bt where id in 1 63 64 71",
+        "delete from `bt where id in 0 64 70",
+        "bv: 0 = (til 65) mod 3",
+        "bv,: 101b",
+        "bv[64]: 0b",
     ] {
         pair.run(q);
     }

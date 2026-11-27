@@ -297,3 +297,30 @@ fn a_snapshot_shares_the_variables_until_one_is_written() {
     assert_eq!(copy.vars[&kixdb::sym::intern("a")].to_string(), "1");
     assert_eq!(c.eval("a").unwrap().to_string(), "2");
 }
+
+#[test]
+fn top_k_sorts_composite_joins_fby_and_grouped_updates_match_full_evaluation() {
+    let mut c = Server::new().connect();
+    c.eval("t: ([] s: `b`a`b`a`c`a; k: 2 1 2 1 3 2; v: 10 20 30 40 50 60; w: 1.0 2.0 3.0 0N 5.0 6.0)").unwrap();
+    for (code, expected) in [
+        // Top-K chained xdesc/xasc matches full sort + take, including tie stability and cleared attributes
+        ("(3 sublist `k xdesc `s xasc t) ~ 3 # (`k xdesc (`s xasc t))", "1b"),
+        ("attr (3 sublist `s xasc t)`s", "`"),
+        ("attr (`s xasc `k xdesc t)`s", "`s"),
+        // fby primitive fast paths (including nulls)
+        ("exec v from t where v = (max; v) fby s", "30 50 60"),
+        ("exec v from t where v = (first; v) fby ([] s; k)", "10 20 50 60"),
+        ("exec (last; w) fby s from t", "3 6 3 6 5 6f"),
+        // Grouped update with wavg, sums, and partial where selection
+        ("exec u from update u: v wavg w by s from t where k <= 2", "2.5 5 2.5 5 0n 5"),
+        ("exec rs from update rs: sums v by s from t where k <= 2", "10 20 40 60 0N 120"),
+        // 3-column keyed joins and plus join
+        (
+            "exec z from ([] a: 1 2 1; b: `x`y`z; d: 2024.01.01 2024.01.02 2024.01.01) lj ([a: 1 2 1; b: `x`y`x; d: 2024.01.01 2024.01.02 2024.01.01] z: 7 8 9)",
+            "7 8 0N",
+        ),
+        ("exec v from ([] k: 1 2 3; v: 10 20 30) pj ([k: 2 4] v: 5 9)", "10 25 30"),
+    ] {
+        assert_eq!(c.eval(code).unwrap().to_string(), expected, "{code}");
+    }
+}

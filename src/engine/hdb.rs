@@ -65,7 +65,7 @@ impl Engine<'_> {
         };
         let made = match table {
             K::Table(t) => K::Table(Arc::new(enumerated(t))),
-            K::KeyedTable(t) => K::KeyedTable(Arc::new(KeyedTable { keys: enumerated(&t.keys), vals: enumerated(&t.vals) })),
+            K::KeyedTable(t) => K::KeyedTable(Arc::new(KeyedTable::from_flips(enumerated(&t.keys), enumerated(&t.vals)))),
             _ => return Err(KError::ty(".Q.en takes a table")),
         };
         let list = symbols(list);

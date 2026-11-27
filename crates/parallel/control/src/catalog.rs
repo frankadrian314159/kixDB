@@ -56,7 +56,7 @@ pub fn rekey(flip: Flip, nkeys: usize) -> K {
     }
     let keys = Flip { cols: flip.cols[..nkeys].to_vec(), vals: flip.vals[..nkeys].to_vec() };
     let vals = Flip { cols: flip.cols[nkeys..].to_vec(), vals: flip.vals[nkeys..].to_vec() };
-    K::KeyedTable(Arc::new(KeyedTable { keys, vals }))
+    K::KeyedTable(Arc::new(KeyedTable::from_flips(keys, vals)))
 }
 
 /// A table or keyed table as `(columns, number of key columns)`.

@@ -320,7 +320,7 @@ impl Inner {
             .collect();
         let vals = Flip::new(val_names, cols)?;
         if push.query.kind == QSqlKind::Exec {
-            return Ok(exec_by_result(&KeyedTable { keys, vals }));
+            return Ok(exec_by_result(&KeyedTable::from_flips(keys, vals)));
         }
         let mut cols = keys.cols;
         cols.extend(vals.cols);

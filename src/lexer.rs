@@ -592,11 +592,14 @@ fn lex_numeric_sequence(src: &str, start: usize) -> KResult<(K, usize)> {
             j += 1;
         }
         if j > start && j < len && bytes[j] == b'b' && (j + 1 == len || !bytes[j + 1].is_ascii_alphanumeric()) {
-            let bits: Vec<bool> = bytes[start..j].iter().map(|&c| c == b'1').collect();
-            let k = if bits.len() == 1 {
-                K::Bool(bits[0])
+            let blen = j - start;
+            let k = if blen == 1 {
+                K::Bool(bytes[start] == b'1')
             } else {
-                K::Vector(ColVec::Bool(Attr::None, Arc::new(bits)))
+                K::Vector(ColVec::Bool(
+                    Attr::None,
+                    Arc::new(crate::bools::Bools::from_fn(blen, |i| bytes[start + i] == b'1')),
+                ))
             };
             return Ok((k, j + 1));
         }

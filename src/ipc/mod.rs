@@ -208,9 +208,7 @@ fn write_colvec(buf: &mut Vec<u8>, cv: &ColVec, stored: bool) {
             }
         }
         ColVec::Bool(_, xs) => {
-            for &b in xs.iter() {
-                buf.push(u8::from(b));
-            }
+            buf.extend(xs.iter().map(u8::from));
         }
         ColVec::Guid(_, xs) => {
             for g in xs.iter() {
@@ -366,7 +364,7 @@ fn decode_k_endian(data: &[u8], mut p: usize, le: bool) -> KResult<(K, usize)> {
                 1 => {
                     let slice = data.get(p..p + n).ok_or_else(|| KError::ipc("truncated bool vec"))?;
                     p += n;
-                    ColVec::Bool(attr, Arc::new(slice.iter().map(|&b| b != 0).collect()))
+                    ColVec::Bool(attr, Arc::new(crate::bools::Bools::from_fn(n, |i| slice[i] != 0)))
                 }
                 2 => {
                     let mut xs = Vec::with_capacity(n);

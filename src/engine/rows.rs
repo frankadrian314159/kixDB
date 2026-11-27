@@ -118,7 +118,7 @@ pub fn find(lhs: &K, rhs: &K) -> Option<KResult<K>> {
 fn by_keys(kt: &KeyedTable, keys: &Flip, keep: bool) -> KResult<K> {
     let wanted: HashSet<Vec<u8>> = row_keys(&ordered(keys, &kt.keys)?).into_iter().collect();
     let rows: Vec<usize> = row_keys(&kt.keys).iter().enumerate().filter(|(_, k)| wanted.contains(*k) == keep).map(|(i, _)| i).collect();
-    Ok(K::KeyedTable(Arc::new(KeyedTable { keys: kt.keys.gather(&rows), vals: kt.vals.gather(&rows) })))
+    Ok(K::KeyedTable(Arc::new(KeyedTable::from_flips(kt.keys.gather(&rows), kt.vals.gather(&rows)))))
 }
 
 /// `keys # kt` (the rows with those keys, in their order) and `keys _ kt` (the others).
@@ -136,7 +136,7 @@ pub fn take_or_drop(lhs: &K, rhs: &K, take: bool) -> Option<KResult<K>> {
     Some(ordered(&keys, &kt.keys).map(|keys| {
         let held: HashMap<Vec<u8>, usize> = row_keys(&kt.keys).into_iter().enumerate().rev().map(|(i, k)| (k, i)).collect();
         let rows: Vec<usize> = row_keys(&keys).iter().filter_map(|k| held.get(k).copied()).collect();
-        K::KeyedTable(Arc::new(KeyedTable { keys: kt.keys.gather(&rows), vals: kt.vals.gather(&rows) }))
+        K::KeyedTable(Arc::new(KeyedTable::from_flips(kt.keys.gather(&rows), kt.vals.gather(&rows))))
     }))
 }
 
@@ -163,6 +163,33 @@ pub enum Set {
 /// `inter`, `union` and `except` of the rows of two tables.
 pub fn set(a: &Flip, b: &Flip, kind: Set) -> KResult<K> {
     let b = ordered(b, a)?;
+    let same_typed = a
+        .vals
+        .iter()
+        .zip(&b.vals)
+        .all(|(ca, cb)| ca.type_num() == cb.type_num() && !matches!(ca, ColVec::General(..)));
+    if same_typed {
+        if kind == Set::Union {
+            return ops::distinct_op(&K::Table(Arc::new(append(a, &b)?)));
+        }
+        if b.nrows() == 0 {
+            return Ok(K::Table(Arc::new(if kind == Set::Inter { a.take(0) } else { a.clone() })));
+        }
+        if a.nrows() == 0 {
+            return Ok(K::Table(Arc::new(a.clone())));
+        }
+        let both = append(&b, a)?;
+        let nb = b.nrows();
+        let ids = ops::group_ids(&both.vals, nb + a.nrows());
+        let max_b = ids[..nb].iter().copied().max().unwrap_or(0);
+        let want_in_b = kind == Set::Inter;
+        let rows: Vec<usize> = ids[nb..]
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &id)| ((id <= max_b) == want_in_b).then_some(i))
+            .collect();
+        return Ok(K::Table(Arc::new(a.gather(&rows))));
+    }
     let theirs: HashSet<Vec<u8>> = row_keys(&b).into_iter().collect();
     let mine = row_keys(a);
     if kind == Set::Union {

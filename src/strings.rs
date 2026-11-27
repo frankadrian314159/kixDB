@@ -14,6 +14,13 @@ pub struct Strings {
 }
 
 impl Strings {
+    pub fn with_capacity(strings: usize, bytes: usize) -> Self {
+        Self {
+            ends: Vec::with_capacity(strings),
+            bytes: Vec::with_capacity(bytes),
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.ends.len()
     }
@@ -63,6 +70,72 @@ impl Strings {
 
     pub fn text(&self) -> &[u8] {
         &self.bytes
+    }
+
+    pub fn reverse_each(&self) -> ColVec {
+        let mut out = Self::with_capacity(self.len(), self.bytes.len());
+        for b in self.iter() {
+            out.bytes.extend(b.iter().rev().copied());
+            out.ends.push(out.bytes.len() as u64);
+        }
+        ColVec::of_strings(Attr::None, out)
+    }
+
+    pub fn take_each(&self, n: i64) -> ColVec {
+        let un = n.unsigned_abs() as usize;
+        let mut out = Self::with_capacity(self.len(), self.len().saturating_mul(un));
+        for b in self.iter() {
+            let len = b.len();
+            if n == 0 {
+                // empty
+            } else if len == 0 {
+                out.bytes.resize(out.bytes.len() + un, NULL_CHAR);
+            } else if n > 0 && un <= len {
+                out.bytes.extend_from_slice(&b[..un]);
+            } else if n < 0 && un <= len {
+                out.bytes.extend_from_slice(&b[len - un..]);
+            } else if n > 0 {
+                out.bytes.extend((0..un).map(|i| b[i % len]));
+            } else {
+                let start = (len - (un % len)) % len;
+                out.bytes.extend((0..un).map(|i| b[(start + i) % len]));
+            }
+            out.ends.push(out.bytes.len() as u64);
+        }
+        ColVec::of_strings(Attr::None, out)
+    }
+
+    pub fn drop_each(&self, n: i64) -> ColVec {
+        let un = n.unsigned_abs() as usize;
+        let mut out = Self::with_capacity(self.len(), self.bytes.len());
+        for b in self.iter() {
+            let slice = if n == 0 {
+                b
+            } else if un >= b.len() {
+                b""
+            } else if n > 0 {
+                &b[un..]
+            } else {
+                &b[..b.len() - un]
+            };
+            out.push(slice);
+        }
+        ColVec::of_strings(Attr::None, out)
+    }
+
+    pub fn concat_each(&self, extra: &[u8], prepend: bool) -> ColVec {
+        let mut out = Self::with_capacity(self.len(), self.bytes.len() + self.len() * extra.len());
+        for b in self.iter() {
+            if prepend {
+                out.bytes.extend_from_slice(extra);
+                out.bytes.extend_from_slice(b);
+            } else {
+                out.bytes.extend_from_slice(b);
+                out.bytes.extend_from_slice(extra);
+            }
+            out.ends.push(out.bytes.len() as u64);
+        }
+        ColVec::of_strings(Attr::None, out)
     }
 }
 
@@ -145,7 +218,14 @@ impl ColVec {
     /// The column with packed strings made the general list that they stand for.
     pub fn listed(&self) -> Cow<'_, ColVec> {
         match self {
-            ColVec::Strings(attr, s) => Cow::Owned(ColVec::General(*attr, Arc::new(crate::engine::par::map(&(0..s.len()).collect::<Vec<_>>(), |&i| value(s.get(i)))))),
+            ColVec::Strings(attr, s) => {
+                use rayon::prelude::*;
+                let items = match crate::engine::par::split(s.len()) {
+                    false => (0..s.len()).map(|i| value(s.get(i))).collect(),
+                    true => (0..s.len()).into_par_iter().map(|i| value(s.get(i))).collect(),
+                };
+                Cow::Owned(ColVec::General(*attr, Arc::new(items)))
+            }
             other => Cow::Borrowed(other),
         }
     }
@@ -189,7 +269,7 @@ impl K {
         match self {
             K::Vector(c) => K::Vector(column(c)),
             K::Table(t) => K::Table(Arc::new(flip(t))),
-            K::KeyedTable(t) => K::KeyedTable(Arc::new(KeyedTable { keys: flip(&t.keys), vals: flip(&t.vals) })),
+            K::KeyedTable(t) => K::KeyedTable(Arc::new(KeyedTable::from_flips(flip(&t.keys), flip(&t.vals)))),
             K::Dict(d) => K::Dict(Arc::new(Dict { keys: Box::new(d.keys.listed()), vals: Box::new(d.vals.listed()) })),
             other => other.clone(),
         }

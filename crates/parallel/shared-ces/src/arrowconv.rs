@@ -5,7 +5,7 @@
 //! attribute (`kix.attr`) in Arrow `Field` metadata so temporal types (`Date`, `Timestamp`, `Time`, `Minute`, ...) and
 //! interned symbols (`SymId`) reconstruct with zero loss. Nested/general columns travel as `BinaryArray` of IPC bytes.
 use arrow_array::builder::{
-    BinaryBuilder, BooleanBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder, StringBuilder,
+    BinaryBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder, StringBuilder,
 };
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float32Type, Float64Type, Int16Type, Int32Type, Int64Type};
@@ -113,11 +113,24 @@ fn colvec_slice_to_arrow(cv: &ColVec, start: usize, end: usize) -> Result<ArrayR
     let n = end.saturating_sub(start);
     Ok(match cv {
         ColVec::Bool(_, xs) => {
-            let mut b = BooleanBuilder::with_capacity(n);
-            for &v in &xs[start..end] {
-                b.append_value(v);
+            #[cfg(target_endian = "little")]
+            {
+                let (w0, w1, bit_off) = if n == 0 { (0, 0, 0) } else { (start >> 6, end.div_ceil(64), start & 63) };
+                let buf = arrow_buffer::BooleanBuffer::new(
+                    arrow_buffer::Buffer::from_slice_ref(&xs.as_raw_bytes()[w0 * 8..w1 * 8]),
+                    bit_off,
+                    n,
+                );
+                Arc::new(arrow_array::BooleanArray::new(buf, None))
             }
-            Arc::new(b.finish())
+            #[cfg(not(target_endian = "little"))]
+            {
+                let mut b = arrow_array::builder::BooleanBuilder::with_capacity(n);
+                for i in start..end {
+                    b.append_value(xs.get(i));
+                }
+                Arc::new(b.finish())
+            }
         }
         ColVec::Short(_, xs) => {
             let mut b = Int16Builder::with_capacity(n);
@@ -265,11 +278,13 @@ fn arrow_column_to_colvec(
 ) -> Result<ColVec, String> {
     Ok(match tnum {
         1 => {
-            let mut out = Vec::with_capacity(total_rows);
+            let mut out = kixdb::Bools::with_capacity(total_rows);
             for b in batches {
                 let arr = b.column(ci).as_boolean();
-                for i in 0..arr.len() {
-                    out.push(!arr.is_null(i) && arr.value(i));
+                if arr.null_count() == 0 {
+                    out.extend_from(&kixdb::Bools::from_fn(arr.len(), |i| arr.value(i)));
+                } else {
+                    out.extend_from(&kixdb::Bools::from_fn(arr.len(), |i| !arr.is_null(i) && arr.value(i)));
                 }
             }
             ColVec::Bool(attr, Arc::new(out))
@@ -406,5 +421,10 @@ mod tests {
         let kt = c.eval("([sym: `AAPL`MSFT] bid: 185.1 412.2)").unwrap();
         let (ks, kb) = k_to_batches(&kt, 100).unwrap();
         assert_eq!(batches_to_k(&ks, &kb).unwrap(), kt);
+
+        let btbl = c.eval("([] id: til 130; ok: 0 = (til 130) mod 3)").unwrap();
+        let (bs, bb) = k_to_batches(&btbl, 50).unwrap();
+        assert_eq!(bb.len(), 3);
+        assert_eq!(batches_to_k(&bs, &bb).unwrap(), btbl);
     }
 }
