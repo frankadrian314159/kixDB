@@ -1341,6 +1341,13 @@ impl<'a> SortCol<'a> {
         }
     }
 
+    fn new_unranked(cv: &'a ColVec) -> Self {
+        match cv.plain() {
+            ColVec::Sym(_, xs) => Self::SymRaw(xs),
+            _ => Self::new(cv),
+        }
+    }
+
     #[inline]
     fn cmp(&self, a: usize, b: usize) -> Ordering {
         match self {
@@ -1357,6 +1364,293 @@ impl<'a> SortCol<'a> {
             Self::Other(cv) => cv.get_atom(a).k_cmp(&cv.get_atom(b)),
         }
     }
+
+    #[inline]
+    fn cmp_between(&self, a: usize, raw_a: &ColVec, other: &Self, b: usize, raw_b: &ColVec) -> Ordering {
+        match (self, other) {
+            (Self::I64(x), Self::I64(y)) => x[a].cmp(&y[b]),
+            (Self::I32(x), Self::I32(y)) => x[a].cmp(&y[b]),
+            (Self::I16(x), Self::I16(y)) => x[a].cmp(&y[b]),
+            (Self::U8(x), Self::U8(y)) => x[a].cmp(&y[b]),
+            (Self::Bool(x), Self::Bool(y)) => x.get(a).cmp(&y.get(b)),
+            (Self::F64(x), Self::F64(y)) => cmp_f64(x[a], y[b]),
+            (Self::F32(x), Self::F32(y)) => cmp_f32(x[a], y[b]),
+            (Self::Strings(x), Self::Strings(y)) => x.get(a).cmp(y.get(b)),
+            (Self::SymRaw(x), Self::SymRaw(y)) => x[a].cmp(&y[b]),
+            _ => raw_a.get_atom(a).k_cmp(&raw_b.get_atom(b)),
+        }
+    }
+}
+
+fn gather_spans_col(parts: &[Flip], ci: usize, spans: &[(u32, u32, u32)], target: usize) -> ColVec {
+    let c0 = &parts[0].vals[ci];
+    if let ColVec::Enum(tag, _) = c0 {
+        if parts.iter().all(|p| matches!(&p.vals[ci], ColVec::Enum(t, _) if t == tag)) {
+            let stripped: Vec<Flip> = parts
+                .iter()
+                .map(|p| Flip { cols: vec![p.cols[ci]], vals: vec![p.vals[ci].plain().clone()] })
+                .collect();
+            return ColVec::Enum(*tag, Box::new(gather_spans_col(&stripped, 0, spans, target)));
+        }
+    }
+    macro_rules! copy_vec {
+        ($variant:ident) => {{
+            let slices: Option<Vec<_>> = parts
+                .iter()
+                .map(|p| if let ColVec::$variant(_, xs) = p.vals[ci].plain() { Some(xs.as_slice()) } else { None })
+                .collect();
+            if let Some(slices) = slices {
+                let mut out = Vec::with_capacity(target);
+                for &(p, s, e) in spans {
+                    out.extend_from_slice(&slices[p as usize][s as usize..e as usize]);
+                }
+                return ColVec::$variant(Attr::None, Arc::new(out));
+            }
+        }};
+    }
+    match c0.plain() {
+        ColVec::Bool(..) => {
+            let bs: Option<Vec<&Bools>> = parts
+                .iter()
+                .map(|p| if let ColVec::Bool(_, xs) = p.vals[ci].plain() { Some(&**xs) } else { None })
+                .collect();
+            if let Some(bs) = bs {
+                let mut out = Bools::with_capacity(target);
+                for &(p, s, e) in spans {
+                    let b = bs[p as usize];
+                    let len = (e - s) as usize;
+                    if len >= 64 {
+                        out.extend_from(&b.slice(s as usize, len));
+                    } else {
+                        for i in s as usize..e as usize {
+                            out.push(b.get(i));
+                        }
+                    }
+                }
+                return ColVec::Bool(Attr::None, Arc::new(out));
+            }
+        }
+        ColVec::Guid(..) => copy_vec!(Guid),
+        ColVec::Byte(..) => copy_vec!(Byte),
+        ColVec::Short(..) => copy_vec!(Short),
+        ColVec::Int(..) => copy_vec!(Int),
+        ColVec::Long(..) => copy_vec!(Long),
+        ColVec::Real(..) => copy_vec!(Real),
+        ColVec::Float(..) => copy_vec!(Float),
+        ColVec::Char(..) => copy_vec!(Char),
+        ColVec::Sym(..) => copy_vec!(Sym),
+        ColVec::Timestamp(..) => copy_vec!(Timestamp),
+        ColVec::Month(..) => copy_vec!(Month),
+        ColVec::Date(..) => copy_vec!(Date),
+        ColVec::Datetime(..) => copy_vec!(Datetime),
+        ColVec::Timespan(..) => copy_vec!(Timespan),
+        ColVec::Minute(..) => copy_vec!(Minute),
+        ColVec::Second(..) => copy_vec!(Second),
+        ColVec::Time(..) => copy_vec!(Time),
+        ColVec::Strings(..) | ColVec::General(..) if parts.iter().all(|p| p.vals[ci].plain().packed().is_some()) => {
+            let packed: Vec<_> = parts.iter().map(|p| p.vals[ci].plain().packed().unwrap()).collect();
+            let mut out = crate::strings::Strings::with_capacity(target, target * 8);
+            for &(p, s, e) in spans {
+                let ColVec::Strings(_, st) = &*packed[p as usize] else { unreachable!() };
+                for i in s as usize..e as usize {
+                    out.push(st.get(i));
+                }
+            }
+            return ColVec::of_strings(Attr::None, out);
+        }
+        _ => {}
+    }
+    let mut atoms = Vec::with_capacity(target);
+    for &(p, s, e) in spans {
+        let cv = &parts[p as usize].vals[ci];
+        for i in s as usize..e as usize {
+            atoms.push(cv.get_atom(i));
+        }
+    }
+    ColVec::from_atoms(atoms)
+}
+
+/// Merge `k` sorted `Flip`s in `O(N log k)` by `specs` (`(col_idx, desc)`), stopping early at `limit` rows if given.
+/// Empty `Flip`s contribute nothing (not even untyped empty columns); any unsorted input part is sorted locally first.
+pub fn merge_sorted_flips(parts: Vec<Flip>, specs: &[(usize, bool)], limit: Option<usize>) -> KResult<Flip> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    if parts.is_empty() {
+        return Err(KError::new("cluster", "no shard answered"));
+    }
+    let mut first_empty: Option<Flip> = None;
+    let mut non_empty: Vec<Flip> = Vec::with_capacity(parts.len());
+    for p in parts {
+        if p.nrows() == 0 {
+            if first_empty.is_none() {
+                first_empty = Some(p);
+            }
+        } else {
+            if let Some(first) = non_empty.first() {
+                if p.cols != first.cols {
+                    return Err(KError::new("mismatch", "the shards returned different columns"));
+                }
+            }
+            non_empty.push(p);
+        }
+    }
+    let Some(first) = non_empty.first() else {
+        return Ok(first_empty.unwrap());
+    };
+    if limit == Some(0) {
+        return Ok(first.take(0));
+    }
+
+    for part in &mut non_empty {
+        let n = part.nrows();
+        if n > 1 && !specs.is_empty() {
+            let scols: Vec<(SortCol<'_>, bool)> = specs
+                .iter()
+                .map(|&(ci, desc)| (SortCol::new_unranked(&part.vals[ci]), desc))
+                .collect();
+            let is_sorted = (1..n).all(|r| {
+                for (sc, desc) in &scols {
+                    let ord = sc.cmp(r - 1, r);
+                    if ord != Ordering::Equal {
+                        return if *desc { ord == Ordering::Greater } else { ord == Ordering::Less };
+                    }
+                }
+                true
+            });
+            if !is_sorted {
+                let local_specs: Vec<(&ColVec, bool)> = specs.iter().map(|&(ci, d)| (&part.vals[ci], d)).collect();
+                let idx = order_rows(&local_specs, n, limit);
+                *part = part.gather(&idx);
+            }
+        }
+    }
+
+    if non_empty.len() == 1 {
+        let mut only = non_empty.pop().unwrap();
+        if let Some(k) = limit.filter(|&k| k < only.nrows()) {
+            only = only.take(k as i64);
+        }
+        return Ok(only);
+    }
+
+    let total_avail: usize = non_empty.iter().map(Flip::nrows).sum();
+    let target = limit.map_or(total_avail, |k| k.min(total_avail));
+    let mut spans: Vec<(u32, u32, u32)> = Vec::new();
+
+    if specs.is_empty() {
+        let mut rem = target;
+        for (p, part) in non_empty.iter().enumerate() {
+            let take = rem.min(part.nrows());
+            if take > 0 {
+                spans.push((p as u32, 0, take as u32));
+                rem -= take;
+            }
+            if rem == 0 {
+                break;
+            }
+        }
+    } else if specs.len() == 1 && !specs[0].1 && non_empty.iter().all(|p| matches!(p.vals[specs[0].0].plain(), ColVec::Long(..) | ColVec::Timestamp(..) | ColVec::Timespan(..))) {
+        let ci = specs[0].0;
+        let slices: Vec<&[i64]> = non_empty
+            .iter()
+            .map(|p| match p.vals[ci].plain() {
+                ColVec::Long(_, xs) | ColVec::Timestamp(_, xs) | ColVec::Timespan(_, xs) => xs.as_slice(),
+                _ => unreachable!(),
+            })
+            .collect();
+        let mut heap: BinaryHeap<Reverse<(i64, u32, u32)>> = slices
+            .iter()
+            .enumerate()
+            .map(|(p, xs)| Reverse((xs[0], p as u32, 0u32)))
+            .collect();
+        let mut emitted = 0usize;
+        while emitted < target {
+            let Some(Reverse((_, p, start))) = heap.pop() else { break };
+            let xs = slices[p as usize];
+            let max_end = (start as usize + (target - emitted)).min(xs.len());
+            let mut end = start as usize + 1;
+            if let Some(&Reverse((next_val, next_p, _))) = heap.peek() {
+                while end < max_end && (xs[end] < next_val || (xs[end] == next_val && p < next_p)) {
+                    end += 1;
+                }
+            } else {
+                end = max_end;
+            }
+            spans.push((p, start, end as u32));
+            emitted += end - start as usize;
+            if end < xs.len() && emitted < target {
+                heap.push(Reverse((xs[end], p, end as u32)));
+            }
+        }
+    } else {
+        struct MergeEntry<'a> {
+            part: u32,
+            row: u32,
+            cols: &'a [Vec<(SortCol<'a>, &'a ColVec, bool)>],
+        }
+        impl PartialEq for MergeEntry<'_> {
+            fn eq(&self, other: &Self) -> bool {
+                self.part == other.part && self.row == other.row
+            }
+        }
+        impl Eq for MergeEntry<'_> {}
+        impl Ord for MergeEntry<'_> {
+            #[inline]
+            fn cmp(&self, other: &Self) -> Ordering {
+                if self.part == other.part && self.row == other.row {
+                    return Ordering::Equal;
+                }
+                let ca = &self.cols[self.part as usize];
+                let cb = &self.cols[other.part as usize];
+                let (ra, rb) = (self.row as usize, other.row as usize);
+                for ((sa, raw_a, desc), (sb, raw_b, _)) in ca.iter().zip(cb) {
+                    let ord = sa.cmp_between(ra, raw_a, sb, rb, raw_b);
+                    if ord != Ordering::Equal {
+                        return if *desc { ord } else { ord.reverse() };
+                    }
+                }
+                other.part.cmp(&self.part).then_with(|| other.row.cmp(&self.row))
+            }
+        }
+        impl PartialOrd for MergeEntry<'_> {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+
+        let cols: Vec<Vec<(SortCol<'_>, &ColVec, bool)>> = non_empty
+            .iter()
+            .map(|p| {
+                specs
+                    .iter()
+                    .map(|&(ci, desc)| (SortCol::new_unranked(&p.vals[ci]), &p.vals[ci], desc))
+                    .collect()
+            })
+            .collect();
+        let mut heap: BinaryHeap<MergeEntry<'_>> = (0..non_empty.len() as u32)
+            .map(|part| MergeEntry { part, row: 0, cols: &cols })
+            .collect();
+        let mut emitted = 0usize;
+        while emitted < target {
+            let Some(top) = heap.pop() else { break };
+            let (p, r) = (top.part, top.row);
+            if let Some(last) = spans.last_mut().filter(|l| l.0 == p && l.2 == r) {
+                last.2 = r + 1;
+            } else {
+                spans.push((p, r, r + 1));
+            }
+            emitted += 1;
+            if (r as usize + 1) < non_empty[p as usize].nrows() && emitted < target {
+                heap.push(MergeEntry { part: p, row: r + 1, cols: &cols });
+            }
+        }
+    }
+
+    let ncols = non_empty[0].ncols();
+    let out_cols = non_empty[0].cols.clone();
+    let out_vals: Vec<ColVec> = (0..ncols).map(|ci| gather_spans_col(&non_empty, ci, &spans, target)).collect();
+    Flip::new(out_cols, out_vals)
 }
 
 /// Stable row order for `specs` (`(col, desc)` from most significant to least), optionally truncated to `top_k`.

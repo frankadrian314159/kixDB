@@ -6,7 +6,7 @@
 //! it names, gathered from the shards; tables that changed are distributed again.
 use crate::catalog::{column_type, rekey, schema_of, unkey, with_attrs, Names, Table};
 use crate::exec::{augmented, in_order};
-use crate::plan::{has_query, is_constant, rowwise, scan_filters, Layout, Planner, Push};
+use crate::plan::{has_query, is_constant, rowwise, scan_filters, Kind, Layout, Planner, Push};
 use crate::Inner;
 use kix_shared_ces::wire::{ForwardReply, ForwardReq, Forwarded, LoadMode, LoadReq, MemberReq, MutateReq, TxnOp, Work, ORD_COL};
 use kixdb::ast::{ColSpec, Expr, QSql, QSqlKind};
@@ -419,6 +419,9 @@ impl ClusterSession {
         if let Expr::Query(q) = e {
             return self.query_over_read(e, q);
         }
+        if let Some(v) = self.read_sorted(e)? {
+            return Ok(Some(v));
+        }
         let verb = match e {
             Expr::Unary { .. } | Expr::Binary { .. } | Expr::Field(..) => true,
             // a built-in verb or the indexing of a table; a user function could do anything
@@ -447,6 +450,78 @@ impl ClusterSession {
             return Ok(None);
         }
         self.conn.eval_expr(&local).map(Some)
+    }
+
+    /// Push `[N sublist] `c1 xdesc `c2 xasc [0!] <Ordered | ByKey | Replicated | Route query>` to the shards and merge via k-way merge.
+    fn read_sorted(&mut self, e: &Expr) -> KResult<Option<K>> {
+        if !self.names().is_pure(e) {
+            return Ok(None);
+        }
+        let mut cur = e;
+        let mut top_k: Option<usize> = None;
+        if let Expr::Binary { op, lhs, rhs } = cur {
+            if resolve(*op) == "sublist" && self.names().refs(lhs).none() {
+                if let Ok(K::Long(n)) = self.conn.eval_expr(lhs) {
+                    if n >= 0 {
+                        top_k = Some(n as usize);
+                        cur = rhs;
+                    }
+                } else if let Ok(K::Int(n)) = self.conn.eval_expr(lhs) {
+                    if n >= 0 {
+                        top_k = Some(n as usize);
+                        cur = rhs;
+                    }
+                }
+            }
+        }
+        let mut stages: Vec<(Vec<SymId>, bool)> = Vec::new();
+        while let Expr::Binary { op, lhs, rhs } = cur {
+            let op_s = resolve(*op);
+            if !matches!(op_s, "xasc" | "xdesc") || !self.names().refs(lhs).none() {
+                break;
+            }
+            let cols = match self.conn.eval_expr(lhs) {
+                Ok(K::Sym(s)) => if s.is_null() { vec![] } else { vec![s] },
+                Ok(K::Vector(ColVec::Sym(_, xs))) => (*xs).clone(),
+                Ok(K::Vector(ColVec::General(_, xs))) if xs.is_empty() => vec![],
+                _ => return Ok(None),
+            };
+            if cols.contains(&intern(ORD_COL)) {
+                return Ok(None);
+            }
+            stages.push((cols, op_s == "xdesc"));
+            cur = rhs;
+        }
+        if stages.is_empty() {
+            return Ok(None);
+        }
+        let mut unkey_result = false;
+        if let Expr::Binary { op, lhs, rhs } = cur {
+            if resolve(*op) == "!" && matches!(&**lhs, Expr::Lit(K::Long(0) | K::Int(0))) {
+                unkey_result = true;
+                cur = rhs;
+            }
+        }
+        let Some(mut push) = self.analyze(cur) else { return Ok(None) };
+        if push.query.kind != QSqlKind::Select
+            || push.query.distinct
+            || push.query.limit.is_some()
+            || matches!(push.kind, Kind::TwoPhase(_))
+        {
+            return Ok(None);
+        }
+        let q = &mut push.query;
+        for x in q.where_clauses.iter_mut().chain(q.cols.iter_mut().map(|c| &mut c.expr)).chain(q.by.iter_mut().flatten().map(|c| &mut c.expr)) {
+            self.fill(x)?;
+        }
+        self.note(format!("{}; k-way sorted merge", push.describe()));
+        let mut res = self.inner.run_sorted_push(&push, &stages, top_k)?;
+        if unkey_result {
+            if let K::KeyedTable(kt) = res {
+                res = K::Table(Arc::new(kt.unkey()));
+            }
+        }
+        Ok(Some(res))
     }
 
     /// A query whose source is itself a read (`select ... from select ... from t`) and that mentions no other table:

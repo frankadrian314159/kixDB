@@ -536,3 +536,28 @@ fn a_join_that_overwrites_the_distribution_column_is_not_pushed_down() {
     p.check("select from trade lj inst where sector = `tech");
     p.check("select sum size by sector from ej[`sym; trade; 0 ! inst]");
 }
+
+#[test]
+fn streamed_two_phase_and_k_way_sorted_merges_match_one_engine() {
+    let mut p = market(3);
+    // Multi-batch (>8,192 groups per shard) two-phase aggregation across 1, 2, and string keys
+    p.check(".kix.dist[`big; `sharded; `sid]");
+    p.check(
+        "big: ([] sid: til 30000; g1: (til 30000) mod 20000; g2: `a`b`c`d ((til 30000) mod 4); \
+         v: 1.5 * 1 + (til 30000) mod 97; w: 1 + (til 30000) mod 13; tag: string (til 30000) mod 500)",
+    );
+    p.plan(
+        "select s: sum w, vf: sum v, a: avg v, dv: dev v, sv: svar v, wv: w wavg v, mn: min v, mx: max g2, n: count i by g1 from big",
+        "two-phase",
+    );
+    p.plan("select sum w, avg v, min sid, max sid by g1, g2 from big where w > 3", "two-phase");
+    p.plan("select sum w, avg v by tag from big", "two-phase");
+
+    // K-way sorted merge and pushed-down top-K (`sublist` + `xasc`/`xdesc`) on Ordered and ByKey queries
+    p.plan("`price xasc trade", "k-way sorted merge");
+    p.plan("`size xdesc `price xasc trade", "k-way sorted merge");
+    p.plan("15 sublist `price xdesc `time xasc select sym, time, price, size from trade where size > 20", "k-way sorted merge");
+    p.plan("5 sublist `s xdesc select s: sum size, hi: max price by sym from trade", "k-way sorted merge");
+    p.plan("5 sublist `s xdesc 0! select s: sum size by sym from trade", "k-way sorted merge");
+    p.plan("25 sublist `v xdesc `sid xasc big", "k-way sorted merge");
+}

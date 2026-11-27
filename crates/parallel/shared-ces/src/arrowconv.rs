@@ -269,6 +269,32 @@ pub fn batches_to_k(schema: &Schema, batches: &[RecordBatch]) -> Result<K, Strin
     }
 }
 
+/// Convert a single Arrow `RecordBatch` of a table or keyed table directly into `(Flip, key_count)`.
+pub fn batch_to_flip(schema: &Schema, batch: &RecordBatch) -> Result<Option<(Flip, usize)>, String> {
+    let kind = schema.metadata().get(META_KIX_KIND).map(String::as_str).unwrap_or("table");
+    if kind == "scalar" {
+        return Ok(None);
+    }
+    let key_count: usize = schema.metadata().get(META_KEY_COLS).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let ncols = schema.fields().len();
+    let nrows = batch.num_rows();
+    let batches = std::slice::from_ref(batch);
+    let mut cols = Vec::with_capacity(ncols);
+    let mut vals = Vec::with_capacity(ncols);
+    for (ci, field) in schema.fields().iter().enumerate() {
+        cols.push(intern(field.name()));
+        let tnum: i16 = field.metadata().get(META_COL_TYPE).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let attr = field
+            .metadata()
+            .get(META_COL_ATTR)
+            .and_then(|s| s.parse::<u8>().ok())
+            .map(Attr::from_ipc_byte)
+            .unwrap_or(Attr::None);
+        vals.push(arrow_column_to_colvec(tnum, attr, batches, ci, nrows)?);
+    }
+    Ok(Some((Flip::new(cols, vals).map_err(|e| e.to_string())?, key_count)))
+}
+
 fn arrow_column_to_colvec(
     tnum: i16,
     attr: Attr,
