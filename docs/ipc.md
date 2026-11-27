@@ -113,8 +113,13 @@ kix tick/r.q -p 5011 -- :5010 :5012            # the real-time database
 
 `\cmd` and `system "cmd"` run what is not one of q's own commands in the system's shell (`cmd /C` on Windows, else
 `sh -c`) and give the lines it prints. `\cd` gives the directory commands run in, which is where relative paths start:
-the workspace's directory, else the process's, until `\cd dir` chooses another (for every session of the workspace,
-a client's included).
+the workspace's directory, else the process's, until `\cd dir` chooses another (for every session of the workspace).
+
+`\cd dir` and `\p port` act on the whole process, so they work only from the console of `kix` (or of the desktop app's
+`--embedded` workspace) and its startup scripts. Anywhere else they signal `'access`, with `--allow-shell` too: in a
+client's messages, the timer, connection callbacks and what a server sends. So `kix-serve` and a cluster never run them.
+Without an argument both can be asked for anywhere. What a client defined does set them if the console calls it. From
+Rust, `server.connect().at_console()` may.
 
 ```q
 system "ls data"                    / or \ls data

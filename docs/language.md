@@ -146,7 +146,8 @@ parses to a `.kix.table` form, and `'` applied to a named function appears as `e
 (with `:n` repetitions) timing, `\t 1000` the timer's interval in milliseconds (`\t 0` stops it), `\x name` removes a
 variable, `\w` workspace statistics, `\P` significant digits of floats, `\c` lines and characters
 of printed output, `\cd` the directory that relative paths are taken from (`\cd dir` changes it, for the whole
-workspace), `\p` the port (`\p 5010` opens one in `kix`, `\p 0` closes it), `\S` the random seed, `\W` the day that
+workspace), `\p` the port (`\p 5010` opens one in `kix`, `\p 0` closes it; setting this or the directory is for
+[the console and startup scripts](ipc.md#shell-commands)), `\S` the random seed, `\W` the day that
 weeks start on (0 Saturday; 2, Monday, at first) and `\z` how `"D"$` reads `06/01/2010` (0, month first, at first; 1,
 day first). `\S`, `\W` and `\z` hold for the whole workspace and are not saved with it. Until `\S n` is given, `?`
 draws differently on every run (`\S` then shows `0Ni`); with a seed its draws repeat, though they are not kdb+'s, and

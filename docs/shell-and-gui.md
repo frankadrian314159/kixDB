@@ -14,8 +14,9 @@ timer before the script runs, as `\t` does. Input continues over lines while a b
 At the end of input that is not typed (a pipe, a file, `</dev/null`), `kix` goes on serving while a port is open or the
 timer runs; `\\` and `exit` end it.
 
-q's `\` commands work (see [language.md](language.md#system-commands)), and `\\` quits. `\t 1000` calls `.z.ts` every second; `.z.pi` and `.z.exit` take the shell's input
-and hear it leave ([callbacks](ipc.md#callbacks)). Arguments after `--` are in `.z.x`.
+q's `\` commands work (see [language.md](language.md#system-commands)), and `\\` quits. Only what is typed here or in a
+startup script may [set `\p` and `\cd`](ipc.md#shell-commands). `\t 1000` calls `.z.ts` every second; `.z.pi` and
+`.z.exit` take the shell's input and hear it leave ([callbacks](ipc.md#callbacks)). Arguments after `--` are in `.z.x`.
 
 Any other `\` command runs in the system's shell (`\ls`; see [shell commands](ipc.md#shell-commands)), unless the shell
 listens for clients (`-p`, `\p`), which then needs `--allow-shell`. What servers it is connected to send is run while

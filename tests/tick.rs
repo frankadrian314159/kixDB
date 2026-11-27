@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 /// A connection to a durable workspace in a new directory, so that relative paths stay inside it.
 fn workspace() -> (tempfile::TempDir, Connection) {
     let dir = tempfile::tempdir().unwrap();
-    let connection = Server::open(dir.path()).unwrap().connect();
+    let connection = Server::open(dir.path()).unwrap().connect().at_console();
     (dir, connection)
 }
 
@@ -116,7 +116,7 @@ fn ports_and_directories_are_set_from_q() {
         seen.lock().unwrap().push(port);
         Ok(())
     });
-    let mut q = server.connect();
+    let mut q = server.connect().at_console();
     check(&mut q, &[("system \"p\"", "0i"), ("system \"p 5000\"", "::"), ("system \"p 0\"", "::")]);
     assert_eq!(*asked.lock().unwrap(), [5000, 0]);
     let listener = Listener::bind(server.clone(), "127.0.0.1:0", IpcConfig::default()).unwrap();
@@ -130,6 +130,35 @@ fn ports_and_directories_are_set_from_q() {
         ("@[system; \"cd nowhere\"; {x}]", "\"os\""),
     ]);
     assert!(dir.path().join("sub/b").exists());
+}
+
+#[test]
+fn only_the_console_sets_the_port_and_the_directory() {
+    let server = Server::new();
+    server.when_asked_to_listen(|_, _| Ok(()));
+    let mut other = server.connect();
+    check(&mut other, &[("system \"p 0\"", "'access"), ("system \"cd .\"", "'access"), ("system \"p\"", "0i")]);
+    // not for a client, even one that may run shell commands; both may still be asked for
+    let open = IpcConfig { allow_shell: true, ..IpcConfig::default() };
+    let listener = Listener::bind(server.clone(), "127.0.0.1:0", open).unwrap();
+    let mut client = IpcClient::connect_addr(&listener.local_addr().to_string(), "u", "").unwrap();
+    for code in ["\\p 0", "\\cd .", "system \"p 0\"", "value \"\\\\cd .\""] {
+        assert_eq!(text(client.query_str(code)), "'access", "{code}");
+    }
+    for code in ["system \"p\"", "system \"cd\""] {
+        assert!(client.query_str(code).is_ok(), "{code}");
+    }
+    // nor for what it leaves the timer to run
+    client.query_str(".z.ts: {seen:: @[system; \"p 0\"; {x}]}").unwrap();
+    client.query_str("system \"t 10\"").unwrap();
+    let _background = server.start_background();
+    let mut console = server.connect().at_console();
+    let started = std::time::Instant::now();
+    while console.eval("seen").is_err() {
+        assert!(started.elapsed().as_secs() < 10, "the timer did not run");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    check(&mut console, &[("seen", "\"access\""), ("system \"t 0\"", "::"), ("system \"cd .\"", "::")]);
 }
 
 #[test]
@@ -209,6 +238,20 @@ upd: {[t; x] l enlist (`upd; t; x); i+: 1; (neg union/[w]) @\\: (`upd; t; x);}
     let log = dir.path().join("day").display().to_string().replace('\\', "/");
     check(&mut late, &[("trade: ([] sym: `symbol$(); price: `float$()); upd: insert", "insert")]);
     check(&mut late, &[(&format!("-11!`$\":{log}\""), "1"), ("trade`price", "1 2f")]);
+}
+
+#[test]
+fn the_shell_and_its_scripts_set_the_port_and_the_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("one/two")).unwrap();
+    std::fs::write(dir.path().join("start.q"), "system \"cd one\"\n").unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kix"));
+    command.current_dir(dir.path()).arg("start.q").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut shell = command.spawn().unwrap();
+    shell.stdin.take().unwrap().write_all(b"\\cd two\n\\p 0\n`:here set 1;\n").unwrap();
+    let output = shell.wait_with_output().unwrap();
+    assert!(output.stderr.is_empty(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(dir.path().join("one/two/here").exists());
 }
 
 #[test]

@@ -272,6 +272,8 @@ pub struct SessionState {
     pub client: Option<(i32, i32)>,
     /// While a client's synchronous request is answered, whether the answer has been put off (`-30!`).
     pub deferred: Option<bool>,
+    /// Whether what runs is what the process's owner typed or started it with, which may set `\p` and `\cd`.
+    pub console: bool,
     /// Set (from any thread) to stop what the session is evaluating before its next step, with `'stop`.
     pub cancel: Arc<AtomicBool>,
 }
@@ -285,6 +287,7 @@ impl SessionState {
             display: Default::default(),
             client: None,
             deferred: None,
+            console: false,
             cancel: Arc::default(),
         }
     }
@@ -2388,6 +2391,10 @@ impl<'a> Engine<'a> {
             }
             "\\" => Ok(K::Null),
             "cd" if arg.is_empty() => Ok(K::string(&self.directory()?.to_string_lossy())),
+            // (setting them acts on the whole process: not for clients, nor for what they leave the process to run)
+            "cd" | "p" if !arg.is_empty() && !self.session.console => {
+                Err(KError::new("access", format!("\\{cmd} {arg} is for the console and startup scripts")))
+            }
             "cd" => {
                 self.ws.writable()?;
                 let to = self.directory()?.join(arg);

@@ -118,7 +118,7 @@ impl App {
         let server = Server::new();
         // (a workspace within the application serves no clients, so its user may run shell commands)
         server.allow_shell_commands(true);
-        let conn = Session::new(server.connect());
+        let conn = Session::new(server.connect().at_console());
         let mut app = Self {
             held: vec![],
             server,
@@ -162,7 +162,7 @@ impl App {
         self.tabs = vec![Tab::Query(QueryTab::new(None, String::new()))];
         self.active = 0;
         self.server = Server::new();
-        self.conn.replace(self.server.connect());
+        self.conn.replace(self.server.connect().at_console());
         self.remote = None;
         self.dir = None;
 
@@ -173,7 +173,7 @@ impl App {
             }
             Some(d) => match Server::open_with(&d, self.opts) {
                 Ok(s) => {
-                    self.conn.replace(s.connect());
+                    self.conn.replace(s.connect().at_console());
                     self.server = s;
                     self.status = format!("Opened workspace {}", d.display());
                     self.dir = Some(d);
