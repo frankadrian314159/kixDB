@@ -17,7 +17,7 @@ fn check(c: &mut Connection, cases: &[(&str, &str)]) {
 fn commands_give_the_lines_they_print() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::open(dir.path()).unwrap();
-    let mut c = server.connect();
+    let mut c = server.connect().at_console();
     // off until allowed, in a library as anywhere
     check(&mut c, &[("system \"echo hi\"", "'access"), ("\\echo hi", "'access")]);
     server.allow_shell_commands(true);

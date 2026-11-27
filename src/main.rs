@@ -183,7 +183,7 @@ fn main() -> ExitCode {
                 }
             }
         }
-        let conn = server.connect_as_trusted(&user);
+        let conn = server.connect_as_trusted(&user).at_console();
         Target::Local { conn, server, listener }
     };
 

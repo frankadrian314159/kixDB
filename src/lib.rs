@@ -305,6 +305,13 @@ pub struct Connection {
 }
 
 impl Connection {
+    /// Take what this connection runs to be typed at the console or in a startup script, which may open ports (`\p`)
+    /// and change the directory (`\cd`), both of which act on the whole process. Not for what others send.
+    pub fn at_console(mut self) -> Self {
+        self.session.console = true;
+        self
+    }
+
     /// The server whose workspace the connection works on.
     pub fn server(&self) -> &Server {
         &self.server
