@@ -2775,6 +2775,13 @@ fn find_or_roll_op(lhs: &K, rhs: &K) -> KResult<K> {
 
     // 2. Find (`vec ? x`): first index of each item of `rhs` in `lhs` (`count lhs` if not found, as in kdb+!)
     if let K::Vector(hay) = lhs {
+        // a simple list is searched for each item of a list that holds lists, however deep they lie
+        if let K::Vector(wanted) = rhs {
+            if !hay.is_list() && wanted.is_list() && (0..wanted.len()).any(|i| !wanted.get_atom(i).is_atom()) {
+                let found = (0..wanted.len()).map(|i| find_or_roll_op(lhs, &wanted.get_atom(i))).collect::<KResult<_>>()?;
+                return Ok(K::Vector(ColVec::from_atoms(found)));
+            }
+        }
         // a list of lists is searched for a simple list as a whole: one that it does not hold is just past its end
         let of_lists = match hay {
             ColVec::Strings(..) => true,
