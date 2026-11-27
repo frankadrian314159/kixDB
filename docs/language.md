@@ -57,7 +57,8 @@ Unlike kdb+, which holds positions in the domain:
 
 ## Syntax
 
-* assignment `:`, global `::`, amend `x[i]:v`, `x+:1`, `@[d;i;f;y]`, deep amend `.[d;path;f;y]`
+* assignment `:`, global `::`, amend `x[i]:v`, `x+:1`, `@[d;i;f;y]`, deep amend `.[d;path;f;y]`; `x+::1` and
+  `x[i]::v` change the global from inside a function (a local of that name, where there is one, as `x::v` does)
 * lambdas `{[a;b] ...}` (implicit `x y z`), projections `f[1;]`, early return `:value`
 * adverbs `'` `/` `\` `':` `/:` `\:`, and the words `each`, `over`, `scan`, `prior`
 * `$[c;t;f]`, `if[...]`, `do[...]`, `while[...]`; a null condition is true; `[a;b;c]` runs expressions in turn

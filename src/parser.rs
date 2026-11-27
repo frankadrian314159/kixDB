@@ -304,8 +304,8 @@ impl<'a> Parser<'a> {
         // Assignment forms:
         //   `ident : rhs`
         //   `ident :: rhs`
-        //   `ident +: rhs`
-        //   `ident[idx...] : rhs` / `ident[idx...] +: rhs`
+        //   `ident +: rhs` / `ident +:: rhs`
+        //   `ident[idx...] : rhs` / `ident[idx...] +: rhs` (`::` and `+::` too, though these reach a global as they are)
         if let Tok::Ident(name) = self.peek().clone() {
             if !is_builtin_verb(&name) || matches!(self.peek_n(1), Tok::Colon | Tok::DoubleColon) {
                 match self.peek_n(1) {
@@ -322,11 +322,16 @@ impl<'a> Parser<'a> {
                         return Ok(Expr::Assign { name: intern(&name), global: true, op: None, val: Box::new(val) });
                     }
                     Tok::OpColon(op) => {
-                        let op = op.clone();
+                        let op = intern(op);
                         self.next();
                         self.next();
+                        // (a second colon, as in `x,::y`, says that it is the global that is changed)
+                        let global = matches!(self.peek(), Tok::Colon);
+                        if global {
+                            self.next();
+                        }
                         let val = self.parse_expr()?;
-                        return Ok(Expr::Assign { name: intern(&name), global: false, op: Some(intern(&op)), val: Box::new(val) });
+                        return Ok(Expr::Assign { name: intern(&name), global, op: Some(op), val: Box::new(val) });
                     }
                     Tok::LBrack => {
                         // Look ahead past matching `]` to see if `: ` or `op:` follows!
@@ -447,14 +452,14 @@ impl<'a> Parser<'a> {
             return Ok(None);
         };
         let assign = match self.peek() {
-            Tok::Colon => {
+            Tok::Colon | Tok::DoubleColon => {
                 let after = self.pos + 1;
                 self.pos = saved_pos;
                 Some((indices, after, None))
             }
             Tok::OpColon(op) => {
                 let op_sym = intern(op);
-                let after = self.pos + 1;
+                let after = self.pos + 1 + usize::from(matches!(self.peek_n(1), Tok::Colon));
                 self.pos = saved_pos;
                 Some((indices, after, Some(op_sym)))
             }

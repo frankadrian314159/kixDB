@@ -31,6 +31,23 @@ fn appending_to_a_list() {
 }
 
 #[test]
+fn a_second_colon_changes_the_global() {
+    check("gl: 1 2; n: 5; d: `a`b!1 2", &[
+        ("f: {gl,:: 8; count gl}; r: f 0; (r; gl)", "(3;1 2 8)"),
+        ("g: {gl,:: x; n+:: 1; n-:: 3; 0}; g 9; (gl; n)", "(1 2 8 9;3)"),
+        ("gl+:: 10; gl", "11 12 18 19"),
+        ("h: {d[`a]:: 5; d[`b]+:: 5; gl[0]:: 0; gl[1]+:: 1; 0}; h 0; (value d; gl)", "(5 7;0 13 18 19)"),
+        // as `x::y` does, it assigns a local that has the name
+        ("k: {gl: 0 0; gl,:: 1; count gl}; (k 0; count gl)", "3 4"),
+        ("parse \"n+::1\"", "(+::;`n;1)"),
+        ("eval parse \"n+::1\"; n", "4"),
+        // a colon of its own still returns, and `::` is still the generic null
+        ("{:x; 0} 7", "7"),
+        ("e: (); e,: (::); count e", "1"),
+    ]);
+}
+
+#[test]
 fn appending_rows_to_a_table() {
     check("t: ([] c: `a`b; n: 1 2); u: t", &[
         ("t,: ([] c: enlist `c; n: enlist 3); (t`c; u`c)", "(`a`b`c;`a`b)"),

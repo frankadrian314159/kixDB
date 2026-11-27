@@ -189,6 +189,7 @@ pub fn to_tree(e: &Expr, ns: &str) -> KResult<K> {
         Expr::Lambda { .. } => K::Func(func_of(e, ns).ok_or_else(|| KError::nyi("lambda"))?),
         Expr::Assign { name, global, op, val } => {
             let head = match op {
+                Some(op) if *global => format!("{op}::"),
                 Some(op) => format!("{op}:"),
                 None if *global => "::".into(),
                 None => ":".into(),
@@ -262,8 +263,9 @@ pub fn to_expr(k: &K) -> KResult<Expr> {
         });
         return Ok(Expr::Apply { target: Box::new(Expr::Lit(head.clone())), args: args.collect::<KResult<_>>()? });
     }
-    // `+:` and friends: an operator before a colon
-    let base = name.strip_suffix(':').filter(|b| is_operator(b));
+    // `+:` and friends: an operator before a colon, or before two where a global is changed
+    let global = name.strip_suffix("::");
+    let base = global.or_else(|| name.strip_suffix(':')).filter(|b| is_operator(b));
     Ok(match (name, rest) {
         (":", [x]) => Expr::Return(boxed(x)?),
         ("'", [x]) => Expr::Signal(boxed(x)?),
@@ -271,7 +273,7 @@ pub fn to_expr(k: &K) -> KResult<Expr> {
             Expr::Assign { name: *target, global: name == "::", op: None, val: boxed(val)? }
         }
         (_, [K::Sym(target), val]) if base.is_some() => {
-            Expr::Assign { name: *target, global: false, op: base.map(intern), val: boxed(val)? }
+            Expr::Assign { name: *target, global: global.is_some(), op: base.map(intern), val: boxed(val)? }
         }
         (_, [K::Vector(ColVec::General(_, target)), val]) if (name == ":" || base.is_some()) && matches!(target.first(), Some(K::Sym(_))) => {
             let Some(K::Sym(target_name)) = target.first() else { return Err(KError::ty("bad assignment tree")) };
