@@ -65,6 +65,7 @@ fn parsed<T: std::str::FromStr>(value: Option<String>) -> T {
 }
 
 fn main() -> ExitCode {
+    kixdb::engine::par::one_thread_a_core();
     let (mut config, mut state, mut listen) = (None::<String>, None::<String>, None::<u16>);
     let (mut bind, mut auth) = ("127.0.0.1".to_string(), std::env::var("KIX_AUTH").ok());
     let (mut metrics_listen, mut broadcast_limit, mut request_timeout) = (None::<String>, None::<usize>, None::<u64>);

@@ -224,13 +224,15 @@ impl<'a> Engine<'a> {
         // `active_rows == None` represents all `0..total_nrows` rows without cloning `base_flip` up front.
         let total_nrows = base_flip.nrows();
         let mut active_rows: RowNumbers = None;
+        // the key column of a keyed table that has one
+        let key = orig_key_cols.as_deref().and_then(|keys| (keys.len() == 1).then(|| keys[0]));
 
         for wc in &q.where_clauses {
             if total_nrows == 0 || active_rows.as_ref().is_some_and(|r| r.is_empty()) {
                 break;
             }
             let active = active_rows.as_ref().map(|r| r.as_slice());
-            if let Some(indexed) = crate::index::try_filter_where(&base_flip, active, wc, &mut |e| self.eval_expr(e))? {
+            if let Some(indexed) = crate::index::try_filter_where(&base_flip, key, active, wc, &mut |e| self.eval_expr(e))? {
                 active_rows = Some(Arc::new(indexed));
                 continue;
             }

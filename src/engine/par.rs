@@ -10,6 +10,21 @@ pub const PAR: usize = 100_000;
 /// The items a thread takes at a time.
 const PIECE: usize = 32_768;
 
+/// Share work among a thread for each processor core, not one for each of the two that a core may run: the second adds
+/// processor time and no speed. `RAYON_NUM_THREADS` says otherwise. For a program, before its first query: one that
+/// embeds the engine sets rayon up as it likes.
+pub fn one_thread_a_core() {
+    #[cfg(target_arch = "x86_64")]
+    if std::env::var_os("RAYON_NUM_THREADS").is_none() {
+        // (the processor's topology leaf says how many threads share a core)
+        #[allow(unused_unsafe)]
+        let per_core = unsafe { std::arch::x86_64::__cpuid_count(0xB, 0) }.ebx & 0xffff;
+        let threads = std::thread::available_parallelism().map_or(1, usize::from);
+        // (a pool that is there already is left as it is)
+        let _ = rayon::ThreadPoolBuilder::new().num_threads(threads.div_ceil(per_core.clamp(1, 2) as usize)).build_global();
+    }
+}
+
 /// Whether work on `n` items is shared out.
 pub fn split(n: usize) -> bool {
     n >= PAR && rayon::current_num_threads() > 1

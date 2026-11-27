@@ -376,8 +376,8 @@ Pushed-down reads and selective partial gathers (`slice`) share the cluster conc
 writes and full-table mirror gathers take exclusive cluster access.
 
 A shard runs requests that only read side by side and changes one at a time, and shares work on large vectors among its
-threads, as a [single server does](ipc.md#concurrency). Shard processes on one machine each use all of its threads
-unless `RAYON_NUM_THREADS` says otherwise.
+threads, as a [single server does](ipc.md#concurrency). Shard processes on one machine each use a thread for every one
+of its cores unless `RAYON_NUM_THREADS` says otherwise.
 
 The control node remembers how many rows tables have, to plan joins and number inserted rows without asking the shards
 each time.

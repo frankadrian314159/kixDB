@@ -1,5 +1,36 @@
 # Benchmark results: scale factor 0.3
 
+## Threads and keyed tables
+
+Measured 2026-11-26 on mains power (6 cores, 12 threads), one run each. Provisional, as below.
+
+TPC-H's single-statement queries on one engine for 8 s, from 1 client and from 12 at once, with each number of threads
+(`RAYON_NUM_THREADS`), on the build with packed strings:
+
+| Threads | Queries/s, 1 client | Processor ms a query | Queries/s, 12 clients | Processor ms a query |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 29 | 34 | 54 | 80 |
+| 4 | 42 | 73 | 49 | 92 |
+| **6** | **45** | **93** | **51** | **118** |
+| 8 | 45 | 116 | 51 | 144 |
+| 12 | 43 | 156 | 51 | 171 |
+
+All 22 TPC-H and 24 TPC-DS queries once each took 0.58 and 0.19 s with 1 thread, 0.48 and 0.16 s with 6, and 0.46 and
+0.17 s with 12. kixDB's programs now use one thread a core.
+
+A keyed table of 1,000,000 rows, before the [index of keys](storage.md#looking-up-keys) and with it, milliseconds
+for all the repetitions together:
+
+| Statement | Times | `9de4c2e` | now |
+| --- | ---: | ---: | ---: |
+| upsert a key that is there (the second builds the index) | 100 | 304 | 66 |
+| upsert a new key | 1,000 | 3,039 | 8 |
+| `k 999999` (the last key) | 100 | 4,898 | under 1 |
+| `select from k where id = 999999` | 100 | 50 | under 1 |
+| `x lj k`, 4 rows | 100 | 1,255 | under 1 |
+| two key columns: upsert (the second builds the index) | 100 | 2,064 | 86 |
+| two key columns: look up | 100 | 12,204 | under 1 |
+
 ## Packed string columns
 
 Measured 2026-11-26 on mains power: commit `305ae9c` and [packed columns of strings](storage.md#columns-of-strings),

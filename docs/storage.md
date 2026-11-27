@@ -116,6 +116,15 @@ Relative paths are resolved against the workspace directory of a durable workspa
 current directory. (Earlier versions resolved those given to `0:`, `1:`, `hcount` and `.Q.en` against the current
 directory.) The file format is kixDB's own and is not readable by kdb+.
 
+## Looking up keys
+
+A keyed table of 1,000 rows or more whose keys are looked for a second time (`k 5`, an `upsert` or `insert` of a few
+rows, `lj` of a few rows, `select ... where` its one key `=` a value) is given an **index** of its keys, so that finding
+them does not read through the table. It is kept in memory beside the table (about 36 bytes a row, an estimate), grows
+with the rows that are added, and is made again, when next wanted, after the keys change in any other way (a `delete`,
+an `update` of a key, a new table). Keys of floating point numbers, strings and general lists have none: they are read
+through as before. Nothing about it is written to files or sent to replicas.
+
 ## Partitioned databases and column attributes
 
 Directories named `YYYY.MM.DD`, `YYYY.MM`, `YYYY` (`1800..=2999`) or an integer are partitions; each table inside is

@@ -10,6 +10,7 @@ use crate::types::{Attr, ColVec, Flip, K};
 use std::any::Any;
 use std::cmp::Ordering;
 use foldhash::{HashMap, HashMapExt};
+use std::hash::{BuildHasher, Hasher};
 use std::ops::Range;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 
@@ -115,6 +116,147 @@ fn get_or_build_index(cv: &ColVec) -> Option<Arc<AttrIndex>> {
     }
     cache.insert(key, (Arc::downgrade(&backing), arc_idx.clone()));
     Some(arc_idx)
+}
+
+// ----- The keys of keyed tables -------------------------------------------------------------------------------------
+
+/// A keyed table with fewer rows is quick enough to read through.
+const MANY_ROWS: usize = 1_000;
+
+/// Where each key of a large keyed table is, so that a few are found without reading them all. It is built the second
+/// time keys are looked for in the same columns, goes with them when `delta::patch` only adds rows, and is dropped
+/// when they change otherwise.
+#[derive(Clone)]
+pub struct KeyIndex {
+    /// The first row that holds each key, by the key's code: its bits for one column, a hash of them for several.
+    rows: HashMap<u64, u32>,
+    /// How many rows are in it.
+    len: usize,
+    /// Whether no key is there twice.
+    unique: bool,
+}
+
+impl KeyIndex {
+    /// The code of the key in row `r` of the columns whose bits these are.
+    fn code(bits: &[Vec<u64>], r: usize) -> u64 {
+        match bits {
+            [one] => one[r],
+            several => {
+                let mut hasher = foldhash::fast::FixedState::default().build_hasher();
+                several.iter().for_each(|column| hasher.write_u64(column[r]));
+                hasher.finish()
+            }
+        }
+    }
+
+    /// Add the rows of `columns` from the first that is not in it. `None`: two keys share a code, so there is no index.
+    fn extend(&mut self, columns: &[ColVec]) -> Option<()> {
+        let end = columns.first()?.len();
+        let from = self.len;
+        let bits: Vec<Vec<u64>> = columns.iter().map(|c| if from == 0 { c.key_bits() } else { c.drop_n(from as i64).key_bits() }).collect::<Option<_>>()?;
+        for r in 0..end - from {
+            let row = u32::try_from(from + r).ok()?;
+            let first = *self.rows.entry(Self::code(&bits, r)).or_insert(row);
+            if first != row {
+                if columns.len() > 1 && columns.iter().any(|c| c.get_atom(first as usize) != c.get_atom(from + r)) {
+                    return None;
+                }
+                self.unique = false;
+            }
+        }
+        self.len = end;
+        Some(())
+    }
+
+    /// The row of `columns` with the key that row `r` of the wanted columns holds, whose bits are `bits`.
+    fn row(&self, columns: &[ColVec], wanted: &[&ColVec], bits: &[Vec<u64>], r: usize) -> Option<usize> {
+        let row = *self.rows.get(&Self::code(bits, r))? as usize;
+        // (of several columns, another key may have the same code)
+        (columns.len() == 1 || columns.iter().zip(wanted).all(|(c, w)| c.get_atom(row) == w.get_atom(r))).then_some(row)
+    }
+}
+
+/// The columns of an index, to learn when one is gone.
+type Held = Vec<Weak<dyn Any + Send + Sync>>;
+/// The columns of an index and what is known of them: `None` while they have been asked for only once. The cache knows
+/// them by where each is held and how long it is.
+type KeyEntry = (Held, Option<Arc<KeyIndex>>);
+static KEY_CACHE: LazyLock<Mutex<HashMap<Vec<CacheKey>, KeyEntry>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// What stands for `columns` in the cache, if they are of kinds that are indexed: keys that are equal as `=` has them
+/// when their bits are, which floats are not.
+fn identity(columns: &[ColVec]) -> Option<(Vec<CacheKey>, Held)> {
+    let kind = |c: &ColVec| matches!(c.type_num(), 1 | 4..=7 | 10..=14 | 16..=19) && !matches!(c, ColVec::Enum(..));
+    if columns.first()?.len() < MANY_ROWS || !columns.iter().all(kind) {
+        return None;
+    }
+    Some(columns.iter().map(|c| {
+        let (key, held) = backing_identity(c);
+        (key, Arc::downgrade(&held))
+    }).unzip())
+}
+
+fn remember(id: Vec<CacheKey>, entry: KeyEntry) {
+    let mut cache = KEY_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= 256 {
+        cache.retain(|_, (held, _)| held.iter().all(|w| w.strong_count() > 0));
+        if cache.len() >= 256 {
+            cache.clear();
+        }
+    }
+    cache.insert(id, entry);
+}
+
+/// The index of the key `columns`, if they have been asked for before.
+fn key_index(columns: &[ColVec]) -> Option<Arc<KeyIndex>> {
+    let (id, held) = identity(columns)?;
+    let known = {
+        let cache = KEY_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        cache.get(&id).filter(|(held, _)| held.iter().all(|w| w.strong_count() > 0)).map(|(_, index)| index.clone())
+    };
+    match known {
+        Some(Some(index)) => Some(index),
+        None => {
+            remember(id, (held, None));
+            None
+        }
+        Some(None) => {
+            let mut index = KeyIndex { rows: HashMap::with_capacity(columns[0].len()), len: 0, unique: true };
+            index.extend(columns)?;
+            let index = Arc::new(index);
+            remember(id, (held, Some(index.clone())));
+            Some(index)
+        }
+    }
+}
+
+/// The first row of the key `columns` that holds each of the `n` keys in `wanted`. `None`: look some other way (the
+/// keys are too few or not indexed, there are too many to look up for an index to help, or this is the first time).
+pub fn key_rows(columns: &[ColVec], wanted: &[&ColVec], n: usize) -> Option<Vec<Option<usize>>> {
+    let alike = columns.len() == wanted.len() && columns.iter().zip(wanted).all(|(c, w)| c.type_num() == w.type_num() && w.len() == n);
+    if !alike || n.saturating_mul(4) >= columns.first()?.len() {
+        return None;
+    }
+    let index = key_index(columns)?;
+    let bits: Vec<Vec<u64>> = wanted.iter().map(|w| w.key_bits()).collect::<Option<_>>()?;
+    Some((0..n).map(|r| index.row(columns, wanted, &bits, r)).collect())
+}
+
+/// Take the index of `columns` out of the cache, to be given back by `keep_keys` once rows have been added to them. (Left
+/// there, it would hold on to the columns, which would then be copied to be changed.)
+pub(crate) fn take_keys(columns: &[ColVec]) -> Option<KeyEntry> {
+    let (id, _) = identity(columns)?;
+    KEY_CACHE.lock().unwrap_or_else(|e| e.into_inner()).remove(&id)
+}
+
+/// The index that `take_keys` gave, for the columns as they are with rows added.
+pub(crate) fn keep_keys(columns: &[ColVec], taken: KeyEntry) {
+    let Some((id, held)) = identity(columns) else { return };
+    let index = taken.1.and_then(|mut index| {
+        Arc::make_mut(&mut index).extend(columns)?;
+        Some(index)
+    });
+    remember(id, (held, index));
 }
 
 /// Binary-search lower bound: first index `i` where `cv[i] >= target`.
@@ -322,6 +464,7 @@ fn expr_uses_table_cols(e: &Expr, cols: &[SymId]) -> bool {
 /// Attempt to evaluate a `qSQL` `where` predicate directly against an attributed column of `flip`.
 pub fn try_filter_where(
     flip: &Flip,
+    key: Option<SymId>,
     active: Option<&[usize]>,
     wc: &Expr,
     eval_rhs: &mut impl FnMut(&Expr) -> KResult<K>,
@@ -338,6 +481,16 @@ pub fn try_filter_where(
 
     let cv = flip.col(col_sym).unwrap();
     if cv.attr() == Attr::None {
+        // the one key of a keyed table is found by the index of its keys, where no key is there twice
+        if key == Some(col_sym) && eff_op == "=" && active.is_none() {
+            if let Some(index) = key_index(std::slice::from_ref(cv)).filter(|index| index.unique) {
+                let v = eval_rhs(val_expr)?;
+                if v.type_num() == -cv.type_num() {
+                    let wanted = ColVec::from_atoms(vec![v]);
+                    return Ok(wanted.key_bits().map(|bits| index.row(std::slice::from_ref(cv), &[&wanted], &[bits], 0).into_iter().collect()));
+                }
+            }
+        }
         return Ok(None);
     }
 

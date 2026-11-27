@@ -342,6 +342,14 @@ pub fn fits(value: &K, changes: &Changes) -> bool {
 
 /// Make `changes` to `value`; `false` if they were not made from a value like it.
 pub fn patch(value: &mut K, changes: &Changes) -> bool {
+    // the index of a keyed table's keys goes with them where rows are only added to them
+    let taken = match value {
+        K::KeyedTable(t) => {
+            let mut keys = changes.iter().filter(|c| (c.0 as usize) < t.keys.ncols()).peekable();
+            (keys.peek().is_some() && keys.all(|c| matches!(c.1, ColChange::Append { .. }))).then(|| crate::index::take_keys(&t.keys.vals)).flatten()
+        }
+        _ => None,
+    };
     let Some(mut cols) = columns_mut(value) else { return false };
     let made = changes.iter().all(|(i, change)| match (cols.get_mut(*i as usize), change) {
         (Some(col), ColChange::Append { at, tail }) => extend(col, *at, tail),
@@ -353,5 +361,8 @@ pub fn patch(value: &mut K, changes: &Changes) -> bool {
         (None, _) => false,
     });
     value.pack();
+    if let (true, Some(taken), K::KeyedTable(t)) = (made, taken, &*value) {
+        crate::index::keep_keys(&t.keys.vals, taken);
+    }
     made
 }

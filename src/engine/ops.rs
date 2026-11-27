@@ -3725,9 +3725,9 @@ pub fn index_k(target: &K, args: &[Option<K>]) -> KResult<K> {
                 Some(k) => {
                     if kt.keys.ncols() == 1 {
                         if k.is_atom() {
-                            let kv = &kt.keys.vals[0];
-                            let hk = k.hash_key();
-                            let found = (0..kv.len()).find(|&i| kv.get_atom(i).hash_key() == hk);
+                            let wanted = ColVec::from_atoms(vec![k.clone()]);
+                            let indexed = crate::index::key_rows(&kt.keys.vals, &[&wanted], 1);
+                            let found = indexed.map_or_else(|| kt.keys.vals[0].position(k), |rows| rows[0]);
                             match found {
                                 Some(r) => K::Dict(Arc::new(kt.vals.row_dict(r))),
                                 None => first_op(&K::Table(Arc::new(kt.vals.gather(&[])))),
@@ -3746,9 +3746,12 @@ pub fn index_k(target: &K, args: &[Option<K>]) -> KResult<K> {
                         if let Some(probe) = several {
                             K::Table(Arc::new(crate::engine::joins::lookup_keyed_rows(kt, &probe?)?))
                         } else if tuple_cv.len() == kt.keys.ncols() {
-                            let found = (0..kt.nrows()).find(|&r| {
-                                (0..kt.keys.ncols()).all(|c| kt.keys.vals[c].get_atom(r).hash_key() == tuple_cv.get_atom(c).hash_key())
-                            });
+                            let wanted: Vec<ColVec> = (0..kt.keys.ncols()).map(|c| ColVec::from_atoms(vec![tuple_cv.get_atom(c)])).collect();
+                            let indexed = crate::index::key_rows(&kt.keys.vals, &wanted.iter().collect::<Vec<_>>(), 1);
+                            let found = indexed.map_or_else(
+                                || (0..kt.nrows()).find(|&r| (0..kt.keys.ncols()).all(|c| kt.keys.vals[c].get_atom(r).hash_key() == tuple_cv.get_atom(c).hash_key())),
+                                |rows| rows[0],
+                            );
                             match found {
                                 Some(r) => K::Dict(Arc::new(kt.vals.row_dict(r))),
                                 None => first_op(&K::Table(Arc::new(kt.vals.gather(&[])))),
