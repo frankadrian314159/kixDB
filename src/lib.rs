@@ -21,6 +21,7 @@ pub mod lexer;
 pub mod parser;
 pub mod persist;
 pub mod storage;
+pub mod strings;
 pub mod sym;
 pub mod temporal;
 pub mod tools;

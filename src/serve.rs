@@ -38,6 +38,7 @@ fn read_pem(path: &str) -> Vec<u8> {
 }
 
 fn main() {
+    kixdb::engine::par::one_thread_a_core();
     let mut dir: Option<String> = None;
     let mut port: u16 = 5000;
     let mut bind = "127.0.0.1".to_string();

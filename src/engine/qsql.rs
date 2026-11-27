@@ -28,7 +28,7 @@ const ITEMWISE_BINARY: [&str; 17] =
     ["+", "-", "*", "%", "=", "<>", "<", "<=", ">", ">=", "&", "|", "and", "or", "div", "mod", "^"];
 
 fn is_one_of(op: SymId, verbs: &[&str]) -> bool {
-    verbs.contains(&resolve(op).as_str())
+    verbs.contains(&resolve(op))
 }
 
 /// Whether row `r` of `e` depends only on row `r` of `flip`'s columns.
@@ -69,7 +69,7 @@ impl<'a> Engine<'a> {
                 false
             });
         }
-        let dynamic = names.iter().any(|&n| DYNAMIC.contains(&resolve(n).as_str()) || self.reaches_names(n));
+        let dynamic = names.iter().any(|&n| DYNAMIC.contains(&resolve(n)) || self.reaches_names(n));
         (!dynamic).then_some(names)
     }
 
@@ -90,7 +90,7 @@ impl<'a> Engine<'a> {
         }
         match self.eval_in_rows(flip, rows.clone(), e).ok()? {
             // a computed general list may not have the type that a group's own values would
-            K::Vector(v) if v.len() == flip.nrows() && (matches!(e, Expr::Var(_)) || !matches!(v, ColVec::General(..))) => Some(v),
+            K::Vector(v) if v.len() == flip.nrows() && (matches!(e, Expr::Var(_)) || !v.is_list()) => Some(v),
             _ => None,
         }
     }
@@ -110,7 +110,7 @@ impl<'a> Engine<'a> {
         };
         // the other verbs apply to each group's atom in turn, as they would group by group (`not` takes a vector of dates
         // but no single date), and not to the lists that `first` of a nested column gives
-        let atoms = |k: K| (!matches!(k, K::Vector(ColVec::General(..)))).then_some(k);
+        let atoms = |k: K| (!matches!(&k, K::Vector(v) if v.is_list())).then_some(k);
         match e {
             Expr::Lit(k) if k.is_atom() => Some(k.clone()),
             Expr::Unary { op, arg } if is_one_of(*op, &AGGREGATES) => {
@@ -121,24 +121,24 @@ impl<'a> Engine<'a> {
                 let values = self.row_values(flip, rows, arg)?;
                 let verb = resolve(*op);
                 per_group(&|g| match distinct {
-                    true => eval_unary_prim(&verb, &distinct_op(&K::Vector(values.gather(g)))?),
-                    false => aggregate_rows(&verb, &values, g),
+                    true => eval_unary_prim(verb, &distinct_op(&K::Vector(values.gather(g)))?),
+                    false => aggregate_rows(verb, &values, g),
                 })
             }
             Expr::Binary { op, lhs, rhs } if is_one_of(*op, &["wsum", "wavg"]) => {
                 let (r, l) = (self.row_values(flip, rows, rhs)?, self.row_values(flip, rows, lhs)?);
                 let verb = resolve(*op);
-                per_group(&|g| eval_binary_prim(&verb, &K::Vector(l.gather(g)), &K::Vector(r.gather(g))))
+                per_group(&|g| eval_binary_prim(verb, &K::Vector(l.gather(g)), &K::Vector(r.gather(g))))
             }
             Expr::Unary { op, arg } if is_one_of(*op, &ITEMWISE_UNARY) => {
                 let (x, verb) = (atoms(self.by_groups(flip, rows, groups, arg)?)?, resolve(*op));
-                broadcast_atoms(&x, &K::Null, |a, _| eval_unary_prim(&verb, a)).ok()
+                broadcast_atoms(&x, &K::Null, |a, _| eval_unary_prim(verb, a)).ok()
             }
             Expr::Binary { op, lhs, rhs } if is_one_of(*op, &ITEMWISE_BINARY) => {
                 let r = atoms(self.by_groups(flip, rows, groups, rhs)?)?;
                 let l = atoms(self.by_groups(flip, rows, groups, lhs)?)?;
                 let verb = resolve(*op);
-                broadcast_atoms(&l, &r, |a, b| eval_binary_prim(&verb, a, b)).ok()
+                broadcast_atoms(&l, &r, |a, b| eval_binary_prim(verb, a, b)).ok()
             }
             _ => None,
         }
@@ -224,15 +224,26 @@ impl<'a> Engine<'a> {
         // `active_rows == None` represents all `0..total_nrows` rows without cloning `base_flip` up front.
         let total_nrows = base_flip.nrows();
         let mut active_rows: RowNumbers = None;
+        // the key column of a keyed table that has one
+        let key = orig_key_cols.as_deref().and_then(|keys| (keys.len() == 1).then(|| keys[0]));
 
         for wc in &q.where_clauses {
             if total_nrows == 0 || active_rows.as_ref().is_some_and(|r| r.is_empty()) {
                 break;
             }
             let active = active_rows.as_ref().map(|r| r.as_slice());
-            if let Some(indexed) = crate::index::try_filter_where(&base_flip, active, wc, &mut |e| self.eval_expr(e))? {
+            if let Some(indexed) = crate::index::try_filter_where(&base_flip, key, active, wc, &mut |e| self.eval_expr(e))? {
                 active_rows = Some(Arc::new(indexed));
                 continue;
+            }
+            // while most rows are kept, testing every row costs less than copying out the ones that are
+            if let Some(cur) = active_rows.as_ref().filter(|cur| cur.len() * 2 >= total_nrows && row_by_row(&base_flip, wc)) {
+                if let Ok(K::Vector(ColVec::Bool(_, test))) = self.eval_in_table_scope(&base_flip, wc) {
+                    if test.len() == total_nrows {
+                        active_rows = Some(Arc::new(cur.iter().copied().filter(|&r| test[r]).collect()));
+                        continue;
+                    }
+                }
             }
             match &active_rows {
                 None => {
@@ -283,14 +294,22 @@ impl<'a> Engine<'a> {
             QSqlKind::Select | QSqlKind::Exec => {
                 // without a column list the result has every column
                 let read = if q.cols.is_empty() { base_flip.clone() } else { self.columns_read(&base_flip, outputs()) };
+                // A query that groups most of the rows by columns of theirs reads them where they are.
+                let plain = |b: &ColSpec| matches!(&b.expr, Expr::Var(v) if read.col(*v).is_some() && b.name.is_none_or(|name| name == *v));
+                let kept = active_rows.as_ref().filter(|rows| {
+                    let grouped = q.by.as_ref().is_some_and(|by| !by.is_empty() && by.iter().all(plain));
+                    q.kind == QSqlKind::Select && grouped && !q.cols.is_empty() && !rows.is_empty() && rows.len() * 2 >= total_nrows
+                });
                 let filtered = match &active_rows {
-                    None => read,
-                    Some(rows) => read.gather(rows),
+                    Some(rows) if kept.is_none() => read.gather(rows),
+                    _ => read,
                 };
                 if q.kind == QSqlKind::Exec {
                     return self.exec_query_exec(&filtered, &active_rows, &q.cols, q.by.as_deref());
                 }
-                let mut res = self.exec_select(&filtered, &active_rows, &q.cols, q.by.as_deref(), orig_key_cols)?;
+                let numbers = if kept.is_some() { &None } else { &active_rows };
+                let kept = kept.map(|rows| rows.as_slice());
+                let mut res = self.exec_select(&filtered, numbers, kept, &q.cols, q.by.as_deref(), orig_key_cols)?;
                 if q.distinct {
                     if let K::Table(_) = &res {
                         res = distinct_op(&res)?;
@@ -311,6 +330,8 @@ impl<'a> Engine<'a> {
         &mut self,
         filtered: &Flip,
         rows: &RowNumbers,
+        // the rows of `filtered` to group, where it holds others too (`by` then names columns of it)
+        kept: Option<&[usize]>,
         cols: &[ColSpec],
         by: Option<&[ColSpec]>,
         orig_keys: Option<Vec<SymId>>,
@@ -422,7 +443,10 @@ impl<'a> Engine<'a> {
                 for bs in by_specs {
                     let v = self.eval_in_rows(filtered, rows.clone(), &bs.expr)?;
                     match v {
-                        K::Vector(cv) if cv.len() == filtered.nrows() => by_vecs.push(cv),
+                        K::Vector(cv) if cv.len() == filtered.nrows() => by_vecs.push(match kept {
+                            Some(kept) => cv.gather(kept),
+                            None => cv,
+                        }),
                         atom if atom.is_atom() => by_vecs.push(ColVec::repeat(atom, filtered.nrows())),
                         _ => return Err(KError::length("by expression length must match table row count")),
                     }
@@ -439,13 +463,17 @@ impl<'a> Engine<'a> {
                 }
 
                 // Group row indices by composite `by` key
-                let (first_rows, mut groups) = group_rows(&by_vecs, filtered.nrows());
+                let (first_rows, mut groups) = group_rows(&by_vecs, kept.map_or(filtered.nrows(), <[usize]>::len));
 
                 // Sort groups ascending by `by_vecs` keys (matching kdb+ `select ... by k from t`!)
                 let keys: Vec<ColVec> = by_vecs.iter().map(|bv| bv.gather(&first_rows)).collect();
                 let group_order = sort_order(&keys, first_rows.len());
                 let mut key_vals: Vec<ColVec> = keys.iter().map(|k| k.gather(&group_order)).collect();
-                let sorted_groups: Vec<Vec<usize>> = group_order.into_iter().map(|g| std::mem::take(&mut groups[g])).collect();
+                let mut sorted_groups: Vec<Vec<usize>> = group_order.into_iter().map(|g| std::mem::take(&mut groups[g])).collect();
+                // (the groups' rows as rows of `filtered`)
+                if let Some(kept) = kept {
+                    sorted_groups.iter_mut().for_each(|group| group.iter_mut().for_each(|r| *r = kept[*r]));
+                }
 
                 if by_vecs.len() == 1 && !key_vals.is_empty() {
                     key_vals[0].set_attr_unchecked(Attr::Sorted);
@@ -467,7 +495,8 @@ impl<'a> Engine<'a> {
 
                 // bind the `by` names too, so `select ... by bar: 5 xbar t` can reference `bar`
                 let mut scope = filtered.clone();
-                for (bn, bv) in by_names.iter().zip(by_vecs) {
+                // (where the rows grouped are among others, the `by` columns are there already)
+                for (bn, bv) in by_names.iter().zip(by_vecs).filter(|_| kept.is_none()) {
                     match scope.col_idx(*bn) {
                         Some(pos) => scope.vals[pos] = bv,
                         None => {
@@ -508,7 +537,7 @@ impl<'a> Engine<'a> {
     fn exec_query_exec(&mut self, filtered: &Flip, rows: &RowNumbers, cols: &[ColSpec], by: Option<&[ColSpec]>) -> KResult<K> {
         if let Some(by_specs) = by {
             // `exec val by key from t` -> dictionary `keys ! vals`
-            let tbl = self.exec_select(filtered, rows, cols, Some(by_specs), None)?;
+            let tbl = self.exec_select(filtered, rows, None, cols, Some(by_specs), None)?;
             if let K::KeyedTable(kt) = &tbl {
                 return Ok(exec_by_result(kt));
             }
@@ -650,20 +679,20 @@ impl<'a> Engine<'a> {
                     atom => ColVec::repeat(atom, active_rows.len()),
                 };
                 if let Some(held) = work.col(cname) {
-                    if !matches!(held, ColVec::General(..)) && held.type_num() != sub_cv.type_num() && !active_rows.is_empty() {
+                    if !held.is_list() && held.type_num() != sub_cv.type_num() && !active_rows.is_empty() {
                         return Err(KError::ty(format!("a {} value in a {} column", sub_cv.type_name(), held.type_name())));
                     }
                 }
-                let typed_null = sub_cv.null_atom();
-                let mut atoms: Vec<K> = if let Some(ex) = work.col(cname) {
-                    (0..total).map(|r| ex.get_atom(r)).collect()
-                } else {
-                    vec![typed_null; total]
-                };
-                for (j, &orig_r) in active_rows.iter().enumerate() {
-                    atoms[orig_r] = sub_cv.get_atom(j);
+                let mut new_cv = work.col(cname).cloned().unwrap_or_else(|| ColVec::repeat(sub_cv.null_atom(), total));
+                let rows: Vec<u64> = active_rows.iter().map(|&r| r as u64).collect();
+                if matches!(new_cv, ColVec::General(..)) || !crate::delta::set(&mut new_cv, &rows, &sub_cv) {
+                    let mut atoms: Vec<K> = (0..total).map(|r| new_cv.get_atom(r)).collect();
+                    for (j, &orig_r) in active_rows.iter().enumerate() {
+                        atoms[orig_r] = sub_cv.get_atom(j);
+                    }
+                    new_cv = ColVec::from_atoms(atoms);
                 }
-                let new_cv = ColVec::from_atoms(atoms);
+                new_cv.set_attr_unchecked(Attr::None);
                 if let Some(pos) = work.col_idx(cname) {
                     work.vals[pos] = new_cv;
                 } else {
@@ -735,7 +764,7 @@ impl<'a> Engine<'a> {
 
     /// Add rows to the table named `name` (`upsert`: setting those whose keys it has). The rows it had and how many came.
     fn add_rows(&mut self, name: SymId, rows: &K, upsert: bool) -> KResult<(usize, usize)> {
-        let is_list = |r: &K| matches!(r, K::Vector(ColVec::General(..)));
+        let is_list = |r: &K| matches!(r, K::Vector(v) if v.is_list());
         if !upsert && matches!(rows, K::Vector(ColVec::General(_, items)) if !items.is_empty() && items.iter().all(is_list)) {
             return Err(KError::ty("insert takes columns, a table or dictionaries, not a list of rows"));
         }
@@ -784,7 +813,7 @@ impl<'a> Engine<'a> {
     }
 
     /// The incoming rows as a flip of the table's columns (keys first), and the rows the table has.
-    fn incoming_rows(&mut self, target: &K, rows: &K) -> KResult<(Flip, usize)> {
+    pub(crate) fn incoming_rows(&mut self, target: &K, rows: &K) -> KResult<(Flip, usize)> {
         let full = match target {
             K::Table(t) => (**t).clone(),
             K::KeyedTable(kt) => kt.unkey(),

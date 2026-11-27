@@ -193,7 +193,7 @@ impl Engine<'_> {
                 let tag = rhs.tag()?;
                 Some(self.rows_referred(tag, rhs).map(|(rows, atom)| if atom { K::Long(rows[0]) } else { K::Vector(long_column(rows)) }))
             }
-            "$" if !ops::is_type_name(&resolve(*name)) => {
+            "$" if !ops::is_type_name(resolve(*name)) => {
                 let source = match domain? {
                     K::KeyedTable(_) => Source::Keys,
                     K::Vector(_) => Source::List,

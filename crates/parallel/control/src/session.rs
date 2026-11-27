@@ -82,8 +82,8 @@ fn as_query(e: &Expr) -> Option<QSql> {
     let source = match e {
         Expr::Query(q) => return Some((**q).clone()),
         Expr::Var(_) => true,
-        Expr::Binary { op, .. } => matches!(resolve(*op).as_str(), "lj" | "ij" | "pj"),
-        Expr::Apply { target, .. } => matches!(&**target, Expr::Var(f) if matches!(resolve(*f).as_str(), "aj" | "aj0" | "ej" | "wj" | "wj1")),
+        Expr::Binary { op, .. } => matches!(resolve(*op), "lj" | "ij" | "pj"),
+        Expr::Apply { target, .. } => matches!(&**target, Expr::Var(f) if matches!(resolve(*f), "aj" | "aj0" | "ej" | "wj" | "wj1")),
         _ => false,
     };
     source.then(|| QSql {
@@ -242,7 +242,7 @@ impl ClusterSession {
             } else if self.mutation(e)?.is_some() {
                 "update / delete run on every shard".into()
             } else {
-                let tables: Vec<String> = refs.tables.iter().map(|&t| resolve(t)).collect();
+                let tables: Vec<String> = refs.tables.iter().map(|&t| resolve(t).into()).collect();
                 let what = if refs.dynamic { "every table".to_string() } else { tables.join(", ") };
                 format!("control node, after gathering {what} (unless its parts can be pushed down)")
             };
@@ -421,7 +421,7 @@ impl ClusterSession {
             Expr::Unary { .. } | Expr::Binary { .. } | Expr::Field(..) => true,
             // a built-in verb or the indexing of a table; a user function could do anything
             Expr::Apply { target, .. } => match &**target {
-                Expr::Var(f) => kixdb::parser::is_builtin_verb(&resolve(*f)) || self.names().table(*f).is_some(),
+                Expr::Var(f) => kixdb::parser::is_builtin_verb(resolve(*f)) || self.names().table(*f).is_some(),
                 _ => false,
             },
             _ => false,
@@ -580,7 +580,7 @@ impl ClusterSession {
         if originals.is_empty() {
             self.note("control");
         } else {
-            let list: Vec<String> = originals.iter().map(|(t, _)| resolve(t.name)).collect();
+            let list: Vec<String> = originals.iter().map(|(t, _)| resolve(t.name).into()).collect();
             self.note(format!("gather {}", list.join(", ")));
             self.conn.set_vars(originals.iter().map(|(t, full)| (t.name, Some(full.clone()))).collect())?;
         }
@@ -847,10 +847,10 @@ impl ClusterSession {
             _ => return None,
         };
         let Expr::Lit(K::Sym(t)) = target else { return None };
-        if !matches!(verb.as_str(), "insert" | "upsert") {
+        if !matches!(verb, "insert" | "upsert") {
             return None;
         }
-        Some((verb, self.names().table(*t)?, rows.clone()))
+        Some((verb.into(), self.names().table(*t)?, rows.clone()))
     }
 
     fn insert(&mut self, verb: &str, t: Table, rows: &Expr) -> KResult<K> {
@@ -971,7 +971,7 @@ impl ClusterSession {
         let Mutation { table: t, mut query } = m;
         let (kind, assigned) = (query.kind, resolve_col_names(&query.cols));
         *query.from = augmented(t.name);
-        let req = MutateReq { table: resolve(t.name), query: Expr::Query(Box::new(query)) };
+        let req = MutateReq { table: resolve(t.name).into(), query: Expr::Query(Box::new(query)) };
         self.changes.extend((0..self.inner.shards().len()).map(|s| (s, TxnOp::Mutate(req.clone()))));
         let name = t.name;
         self.commit(true, move |session, results| session.take_schema(&t, kind, &assigned, results))?;

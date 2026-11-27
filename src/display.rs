@@ -63,6 +63,7 @@ pub fn cell(k: &K) -> String {
 pub fn column_cell(column: &ColVec, row: usize) -> String {
     match column {
         ColVec::General(_, items) => items[row].q_repr(),
+        ColVec::Strings(..) => column.get_atom(row).q_repr(),
         typed => cell(&typed.get_atom(row)),
     }
 }
@@ -94,13 +95,13 @@ fn dict(d: &Dict, most: usize) -> Vec<String> {
     let values: Vec<K> = (0..n).map(|i| item(&d.vals, i)).collect();
     // lists that are all as long as each other line up in columns, as do the values of a simple list
     let length = |v: &K| match v {
-        K::Vector(v) if !matches!(v, ColVec::Char(..) | ColVec::General(..)) && v.len() > 1 => Some(v.len()),
+        K::Vector(v) if !matches!(v, ColVec::Char(..)) && !v.is_list() && v.len() > 1 => Some(v.len()),
         _ => None,
     };
     let columns = values.first().and_then(length).filter(|&n| values.iter().all(|v| length(v) == Some(n)));
     let shown: Vec<String> = match (&*d.vals, columns) {
         (_, Some(_)) => aligned(&values.iter().filter_map(|v| if let K::Vector(v) = v { Some(cells(v)) } else { None }).collect::<Vec<_>>()),
-        (K::Vector(ColVec::General(..)), None) => values.iter().map(K::q_repr).collect(),
+        (K::Vector(v), None) if v.is_list() => values.iter().map(K::q_repr).collect(),
         _ => values.iter().map(cell).collect(),
     };
     let width = keys.iter().map(|k| k.chars().count()).max().unwrap_or(0);
@@ -127,6 +128,7 @@ pub fn console(k: &K) -> String {
     let lines: Vec<String> = match k {
         K::Null => return String::new(),
         K::Vector(ColVec::General(_, items)) => list(&items[..items.len().min(most + 1)]),
+        K::Vector(v @ ColVec::Strings(..)) => list(&(0..v.len().min(most + 1)).map(|i| v.get_atom(i)).collect::<Vec<_>>()),
         K::Vector(v) if v.len() > wide => vec![K::Vector(v.take(wide as i64)).q_repr()],
         K::Dict(d) => dict(d, most + 1),
         K::Table(t) => crate::tools::format_flip(t, most - 3).split('\n').map(String::from).collect(),

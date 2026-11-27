@@ -108,7 +108,7 @@ impl Push {
                 if m.keys.is_empty() {
                     return format!("broadcast {}; ", m.source.name);
                 }
-                let keys: Vec<String> = m.keys.iter().map(|&k| resolve(k)).collect();
+                let keys: Vec<String> = m.keys.iter().map(|&k| resolve(k).into()).collect();
                 format!("shuffle {} by {}; ", m.source.name, keys.join(", "))
             })
             .collect();
@@ -148,7 +148,7 @@ const ELEMENTWISE_BINARY: [&str; 16] = ["+", "-", "*", "%", "=", "<>", "<", "<="
 const PREDICATES: [&str; 13] = ["=", "<>", "<", "<=", ">", ">=", "&", "|", "and", "or", "in", "within", "like"];
 
 fn is_one_of(s: SymId, set: &[&str]) -> bool {
-    set.contains(&resolve(s).as_str())
+    set.contains(&resolve(s))
 }
 
 /// Whether the expression's value does not depend on any row.
@@ -187,7 +187,7 @@ pub fn rowwise(e: &Expr, cols: &HashSet<SymId>, keys: &[SymId]) -> bool {
             (Expr::Var(f), [Some(a)]) => is_one_of(*f, &ELEMENTWISE_UNARY) && rw(a),
             _ => false,
         },
-        Expr::Binary { op, lhs, rhs } => match resolve(*op).as_str() {
+        Expr::Binary { op, lhs, rhs } => match resolve(*op) {
             "in" | "within" | "like" => rw(lhs) && is_constant(rhs, cols),
             "xbar" | "$" => is_constant(lhs, cols) && rw(rhs),
             "^" | "xexp" | "xlog" => rw(lhs) && rw(rhs),
@@ -238,7 +238,7 @@ pub struct Filtered {
 /// The values a clause `column = value` or `column in values` allows a distribution column.
 fn restriction(wc: &Expr, cols: &[SymId], schema: &Flip) -> Option<(SymId, Vec<K>)> {
     let Expr::Binary { op, lhs, rhs } = wc else { return None };
-    let (column, value, set) = match (resolve(*op).as_str(), &**lhs, &**rhs) {
+    let (column, value, set) = match (resolve(*op), &**lhs, &**rhs) {
         ("=", Expr::Var(c), Expr::Lit(v)) | ("=", Expr::Lit(v), Expr::Var(c)) if v.is_atom() => (*c, v, false),
         ("in", Expr::Var(c), Expr::Lit(v)) => (*c, v, true),
         _ => return None,
@@ -357,7 +357,7 @@ impl Planner<'_> {
                 let Expr::Var(f) = &**target else { return None };
                 let verb = resolve(*f);
                 let args: Vec<&Expr> = args.iter().map(Option::as_ref).collect::<Option<_>>()?;
-                let (cols_at, left_at) = match (verb.as_str(), args.len()) {
+                let (cols_at, left_at) = match (verb, args.len()) {
                     ("aj" | "aj0" | "ej", 3) => (0, 1),
                     ("wj" | "wj1", 4) => (1, 2),
                     _ => return None,
@@ -514,7 +514,7 @@ impl Planner<'_> {
 
     fn closed_expr(&self, e: &Expr, bound: &HashSet<SymId>) -> bool {
         let here = match e {
-            Expr::Var(s) => bound.contains(s) || (is_builtin_verb(&resolve(*s)) && !is_one_of(*s, &EFFECTS)),
+            Expr::Var(s) => bound.contains(s) || (is_builtin_verb(resolve(*s)) && !is_one_of(*s, &EFFECTS)),
             Expr::Assign { global, .. } => !*global,
             Expr::IndexAssign { name, .. } => bound.contains(name),
             Expr::Unary { op, .. } | Expr::Binary { op, .. } => !is_one_of(*op, &EFFECTS),
@@ -541,10 +541,10 @@ impl Planner<'_> {
                 if name == "i" {
                     return scope.row_numbers.then(|| e.clone());
                 }
-                if EFFECTS.contains(&name.as_str()) || self.names.table(*s).is_some() {
+                if EFFECTS.contains(&name) || self.names.table(*s).is_some() {
                     return None;
                 }
-                if is_builtin_verb(&name) {
+                if is_builtin_verb(name) {
                     return Some(e.clone());
                 }
                 if name.starts_with(".z.") {
@@ -711,7 +711,7 @@ impl Planner<'_> {
             return None;
         }
         // argument types are those the expression has on the empty table
-        let source = self.mirror.get_var_direct(&resolve(rel.driver)).ok();
+        let source = self.mirror.get_var_direct(resolve(rel.driver)).ok();
         let schema = match (&rel.expr, source) {
             (Expr::Var(_), Some(t)) => crate::catalog::unkey(&t)?.0,
             (expr, _) => {

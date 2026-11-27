@@ -28,7 +28,7 @@ impl<'a> Reader<'a> {
     /// Whether the verb or name `s` can be used by a reader.
     fn name(&self, s: SymId) -> bool {
         let text = resolve(s);
-        if EFFECTS.contains(&text.as_str()) {
+        if EFFECTS.contains(&text) {
             return false;
         }
         match self.global(s) {
@@ -36,7 +36,7 @@ impl<'a> Reader<'a> {
             Some(None) => false,
             // a function may do anything
             Some(Some(value)) => !matches!(value, K::Func(_)),
-            None => !text.starts_with('.') || text.starts_with(".z.") || is_builtin_verb(&text) || namespaces::reads(&text),
+            None => !text.starts_with('.') || text.starts_with(".z.") || is_builtin_verb(text) || namespaces::reads(text),
         }
     }
 
@@ -55,13 +55,13 @@ impl<'a> Reader<'a> {
 
     fn reads(&self, e: &Expr) -> bool {
         let here = match e {
-            Expr::Lit(K::Func(Func::Prim(s))) => !EFFECTS.contains(&resolve(*s).as_str()),
+            Expr::Lit(K::Func(Func::Prim(s))) => !EFFECTS.contains(&resolve(*s)),
             Expr::Lit(K::Func(_)) => false,
             Expr::Lit(_) | Expr::List(_) | Expr::TableLit { .. } | Expr::Field(..) | Expr::Cond(_) | Expr::Nop | Expr::Adverb { .. } => true,
             Expr::Var(s) => self.name(*s),
             Expr::Unary { op, .. } => self.name(*op),
             // (`-11!` replays a log)
-            Expr::Binary { op, lhs, .. } => match resolve(*op).as_str() {
+            Expr::Binary { op, lhs, .. } => match resolve(*op) {
                 "!" if matches!(&**lhs, Expr::Lit(K::Int(_) | K::Long(_))) => false,
                 // (`-1 each lines`)
                 "each" | "peach" if self.handle(lhs) => false,
@@ -69,8 +69,8 @@ impl<'a> Reader<'a> {
             },
             Expr::Apply { target, args } => match &**target {
                 // protected evaluation and amends
-                Expr::Lit(K::Func(Func::Prim(s))) if args.len() >= 3 && matches!(resolve(*s).as_str(), "@" | ".") => false,
-                Expr::Var(s) if args.len() >= 3 && matches!(resolve(*s).as_str(), "@" | ".") => false,
+                Expr::Lit(K::Func(Func::Prim(s))) if args.len() >= 3 && matches!(resolve(*s), "@" | ".") => false,
+                Expr::Var(s) if args.len() >= 3 && matches!(resolve(*s), "@" | ".") => false,
                 // a number applied to something writes to it
                 _ => !self.handle(target),
             },

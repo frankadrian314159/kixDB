@@ -9,7 +9,7 @@
 //! - `-` immediately before digits is part of a negative literal only when not immediately preceded by a value token
 //!   (so `10-3` is `10 - 3`, `1 -2` is the vector `1 -2`, and `1 - 2` is `1 - 2`).
 use crate::error::{KError, KResult};
-use crate::sym::{intern, SymId};
+use crate::sym::{intern, resolve, SymId};
 use crate::types::*;
 use std::sync::Arc;
 
@@ -183,7 +183,7 @@ pub fn tokenize(src: &str) -> KResult<Vec<Tok>> {
         if b.is_ascii_digit() || neg_num_ok || point_ok {
             let (k, next_i) = lex_numeric_sequence(src, i)?;
             out.push(match k {
-                K::Func(Func::Prim(s)) => Tok::Op(s.as_str_owned()),
+                K::Func(Func::Prim(s)) => Tok::Op(resolve(s).into()),
                 k => Tok::Lit(k),
             });
             i = next_i;

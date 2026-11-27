@@ -12,6 +12,7 @@ use arrow_array::types::{Float32Type, Float64Type, Int16Type, Int32Type, Int64Ty
 use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_schema::{DataType as ArrowType, Field, Schema, SchemaRef};
 use kixdb::ipc::{decode_k_payload, encode_k_payload};
+use kixdb::strings::Strings;
 use kixdb::sym::{intern, resolve, SymId};
 use kixdb::types::{NULL_INT, NULL_LONG, NULL_SHORT};
 use kixdb::{Attr, ColVec, Flip, KeyedTable, K};
@@ -22,6 +23,8 @@ const META_KIX_KIND: &str = "kix.kind"; // "table" | "keyed" | "scalar"
 const META_KEY_COLS: &str = "kix.keys";
 const META_COL_TYPE: &str = "kix.type";
 const META_COL_ATTR: &str = "kix.attr";
+/// The type that marks a column of packed strings, whose items are their text.
+const PACKED_STRINGS: i16 = 21;
 
 pub fn k_to_batches(val: &K, batch_rows: usize) -> Result<(SchemaRef, Vec<RecordBatch>), String> {
     match val {
@@ -60,7 +63,8 @@ pub fn flip_to_batches(
         .zip(&flip.vals)
         .map(|(&c, cv)| {
             let mut fmeta = HashMap::new();
-            fmeta.insert(META_COL_TYPE.into(), cv.type_num().to_string());
+            let type_num = if matches!(cv, ColVec::Strings(..)) { PACKED_STRINGS } else { cv.type_num() };
+            fmeta.insert(META_COL_TYPE.into(), type_num.to_string());
             fmeta.insert(META_COL_ATTR.into(), cv.attr().ipc_byte().to_string());
             Field::new(resolve(c), arrow_type_for_colvec(cv), true).with_metadata(fmeta)
         })
@@ -184,6 +188,11 @@ fn colvec_slice_to_arrow(cv: &ColVec, start: usize, end: usize) -> Result<ArrayR
                     b.append_value(resolve(s));
                 }
             }
+            Arc::new(b.finish())
+        }
+        ColVec::Strings(_, s) => {
+            let mut b = BinaryBuilder::with_capacity(n, n * 16);
+            (start..end).for_each(|i| b.append_value(s.get(i)));
             Arc::new(b.finish())
         }
         other => {
@@ -339,6 +348,14 @@ fn arrow_column_to_colvec(
                 }
             }
             ColVec::Sym(attr, Arc::new(out))
+        }
+        PACKED_STRINGS => {
+            let mut out = Strings::default();
+            for b in batches {
+                let arr = b.column(ci).as_binary::<i32>();
+                (0..arr.len()).for_each(|i| out.push(arr.value(i)));
+            }
+            ColVec::of_strings(attr, out)
         }
         _ => {
             let mut atoms = Vec::with_capacity(total_rows);

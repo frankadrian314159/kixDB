@@ -112,8 +112,10 @@ while a read is running first copies the list of global variables, which takes t
 0.01 ms with 1,000 and 3 ms with 100,000).
 
 Work on 100,000 items or more (comparisons, arithmetic, `like`, `where`, sums, `min`, `max`, `avg`, grouping with few
-groups, and `by` queries that go group by group) is shared among the processor's threads; `RAYON_NUM_THREADS` sets how
-many. A sum of that many floating point numbers can differ in its last digits from one added in order, but is the same
+groups, and `by` queries that go group by group) is shared among threads. kixDB's programs use one for each processor
+core, even where a core runs two: using both took 45-68% more processor time a query and answered no faster
+([measurements](benchmark-results.md#threads-and-keyed-tables)). `RAYON_NUM_THREADS` sets how many. (A program that embeds the engine has
+rayon's setting, a thread for each that the processor runs, unless it calls `kixdb::engine::par::one_thread_a_core`.) A sum of that many floating point numbers can differ in its last digits from one added in order, but is the same
 with any number of threads.
 
 ## Client

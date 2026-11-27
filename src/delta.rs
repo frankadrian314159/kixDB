@@ -30,10 +30,14 @@ pub struct Removed {
     pub attrs: Vec<Attr>,
 }
 
-/// The columns of a vector (just itself) or a table, with the column names.
+/// The columns of a vector (just itself), a dictionary of lists (keys and values) or a table, with the column names.
 fn columns(v: &K) -> Option<Columns<'_>> {
     match v {
         K::Vector(c) => Some((vec![c], [&[], &[]])),
+        K::Dict(d) => match (&*d.keys, &*d.vals) {
+            (K::Vector(keys), K::Vector(vals)) => Some((vec![keys, vals], [&[], &[]])),
+            _ => None,
+        },
         K::Table(f) => Some((f.vals.iter().collect(), [&f.cols, &[]])),
         K::KeyedTable(t) => Some((t.keys.vals.iter().chain(&t.vals.vals).collect(), [&t.keys.cols, &t.vals.cols])),
         _ => None,
@@ -58,10 +62,12 @@ fn identical(a: &K, b: &K) -> bool {
     }
 }
 
-/// Whether the columns are of one type, enumerations being of one domain too.
+/// Whether the columns are of one type, enumerations being of one domain too. (Strings, packed or not, are lists.)
 fn alike(a: &ColVec, b: &ColVec) -> bool {
     match (a, b) {
         (ColVec::Enum(t, x), ColVec::Enum(u, y)) => t == u && alike(x, y),
+        (ColVec::Strings(..), other) => other.packed().is_some(),
+        (ColVec::General(..), ColVec::Strings(..)) => true,
         _ => std::mem::discriminant(a) == std::mem::discriminant(b),
     }
 }
@@ -75,6 +81,7 @@ fn begins(a: &ColVec, b: &ColVec) -> bool {
                 $((ColVec::$float(_, x), ColVec::$float(_, y)) => x.len() <= y.len() && x.iter().zip(y.iter()).all(|(x, y)| x.to_bits() == y.to_bits()),)*
                 (ColVec::General(_, x), ColVec::General(_, y)) => x.len() <= y.len() && (Arc::ptr_eq(x, y) || x.iter().zip(y.iter()).all(|(x, y)| identical(x, y))),
                 (ColVec::Enum(t, x), ColVec::Enum(u, y)) => t == u && begins(x, y),
+                (ColVec::Strings(_, x), ColVec::Strings(_, y)) => x.len() <= y.len() && (Arc::ptr_eq(x, y) || x.iter().zip(y.iter()).all(|(x, y)| x == y)),
                 _ => false,
             }
         };
@@ -91,6 +98,7 @@ fn same_item(a: &ColVec, i: usize, b: &ColVec, j: usize) -> bool {
                 $((ColVec::$float(_, x), ColVec::$float(_, y)) => x[i].to_bits() == y[j].to_bits(),)*
                 (ColVec::General(_, x), ColVec::General(_, y)) => identical(&x[i], &y[j]),
                 (ColVec::Enum(t, x), ColVec::Enum(u, y)) => t == u && same_item(x, i, y, j),
+                (ColVec::Strings(_, x), ColVec::Strings(_, y)) => x.get(i) == y.get(j),
                 _ => false,
             }
         };
@@ -172,11 +180,34 @@ fn extend(col: &mut ColVec, at: u64, tail: &ColVec) -> bool {
     if let ColVec::Enum(t, x) = col {
         return matches!(tail, ColVec::Enum(u, y) if t == u && extend(x, at, y));
     }
+    match (&mut *col, tail) {
+        // strings stay packed when what is added is strings, and otherwise become a list
+        (ColVec::Strings(attr, x), _) if x.len() as u64 == at => {
+            return match tail.packed().as_deref() {
+                Some(ColVec::Strings(new, y)) => {
+                    Arc::make_mut(x).extend_from(y);
+                    *attr = *new;
+                    true
+                }
+                _ => {
+                    *col = col.listed().into_owned();
+                    extend(col, at, tail)
+                }
+            };
+        }
+        (ColVec::General(..), ColVec::Strings(..)) => return extend(col, at, &tail.listed()),
+        _ => {}
+    }
     macro_rules! on {
         ($($v:ident)*) => {
             match (col, tail) {
                 $((ColVec::$v(attr, x), ColVec::$v(new, y)) if x.len() as u64 == at => {
-                    Arc::make_mut(x).extend_from_slice(y);
+                    // (an empty column takes the tail itself, unless that holds much room to spare)
+                    if x.is_empty() && y.capacity() <= y.len() + y.len() / 8 {
+                        *x = y.clone();
+                    } else {
+                        Arc::make_mut(x).extend_from_slice(y);
+                    }
                     *attr = *new;
                     true
                 })*
@@ -187,10 +218,17 @@ fn extend(col: &mut ColVec, at: u64, tail: &ColVec) -> bool {
     on!(General Bool Guid Byte Short Int Long Real Float Char Sym Timestamp Month Date Datetime Timespan Minute Second Time)
 }
 
-/// The columns of a vector or table, to change.
+/// The columns of a vector, dictionary of lists or table, to change.
 fn columns_mut(value: &mut K) -> Option<Vec<&mut ColVec>> {
     Some(match value {
         K::Vector(c) => vec![c],
+        K::Dict(d) => {
+            let d = Arc::make_mut(d);
+            match (&mut *d.keys, &mut *d.vals) {
+                (K::Vector(keys), K::Vector(vals)) => vec![keys, vals],
+                _ => return None,
+            }
+        }
         K::Table(f) => Arc::make_mut(f).vals.iter_mut().collect(),
         K::KeyedTable(t) => {
             let t = Arc::make_mut(t);
@@ -207,6 +245,12 @@ pub fn remove(value: &mut K, removed: &Removed) -> bool {
         return false;
     }
     for (col, &attr) in cols.iter_mut().zip(&removed.attrs) {
+        if let ColVec::Strings(..) = col {
+            let kept: Vec<usize> = (0..removed.at).filter(|r| removed.rows.binary_search(r).is_err()).map(|r| r as usize).collect();
+            **col = col.gather(&kept);
+            col.set_attr_unchecked(attr);
+            continue;
+        }
         macro_rules! on {
             ($($v:ident)*) => {
                 match match &mut **col {
@@ -220,7 +264,7 @@ pub fn remove(value: &mut K, removed: &Removed) -> bool {
                             gone.next_if_eq(&&(row - 1)).is_none()
                         });
                     })*
-                    ColVec::Enum(..) => return false,
+                    ColVec::Enum(..) | ColVec::Strings(..) => return false,
                 }
             };
         }
@@ -231,12 +275,30 @@ pub fn remove(value: &mut K, removed: &Removed) -> bool {
 }
 
 /// Set rows of a column of the type of `values`.
-fn set(col: &mut ColVec, rows: &[u64], values: &ColVec) -> bool {
+pub(crate) fn set(col: &mut ColVec, rows: &[u64], values: &ColVec) -> bool {
     if rows.len() != values.len() || rows.iter().any(|&r| r >= col.len() as u64) {
         return false;
     }
     if let ColVec::Enum(t, x) = col {
         return matches!(values, ColVec::Enum(u, y) if t == u && set(x, rows, y));
+    }
+    // strings set among packed ones: the text is put together anew, each row's from the last value set in it
+    if let (ColVec::Strings(attr, x), Some(ColVec::Strings(new, y))) = (&mut *col, values.packed().as_deref()) {
+        let mut set: Vec<Option<&[u8]>> = vec![None; x.len()];
+        rows.iter().zip(y.iter()).for_each(|(&r, v)| set[r as usize] = Some(v));
+        *x = Arc::new(set.into_iter().enumerate().map(|(i, v)| v.unwrap_or_else(|| x.get(i))).collect());
+        *attr = *new;
+        return true;
+    }
+    if let ColVec::Strings(..) = values {
+        return set(col, rows, &values.listed());
+    }
+    // other values are set in the list that packed strings stand for, which is packed again if only strings remain
+    if let ColVec::Strings(..) = col {
+        *col = col.listed().into_owned();
+        let done = set(col, rows, values);
+        col.pack();
+        return done;
     }
     macro_rules! on {
         ($($v:ident)*) => {
@@ -280,8 +342,16 @@ pub fn fits(value: &K, changes: &Changes) -> bool {
 
 /// Make `changes` to `value`; `false` if they were not made from a value like it.
 pub fn patch(value: &mut K, changes: &Changes) -> bool {
+    // the index of a keyed table's keys goes with them where rows are only added to them
+    let taken = match value {
+        K::KeyedTable(t) => {
+            let mut keys = changes.iter().filter(|c| (c.0 as usize) < t.keys.ncols()).peekable();
+            (keys.peek().is_some() && keys.all(|c| matches!(c.1, ColChange::Append { .. }))).then(|| crate::index::take_keys(&t.keys.vals)).flatten()
+        }
+        _ => None,
+    };
     let Some(mut cols) = columns_mut(value) else { return false };
-    changes.iter().all(|(i, change)| match (cols.get_mut(*i as usize), change) {
+    let made = changes.iter().all(|(i, change)| match (cols.get_mut(*i as usize), change) {
         (Some(col), ColChange::Append { at, tail }) => extend(col, *at, tail),
         (Some(col), ColChange::Set { rows, values }) => set(col, rows, values),
         (Some(col), ColChange::Replace(new)) => {
@@ -289,5 +359,10 @@ pub fn patch(value: &mut K, changes: &Changes) -> bool {
             true
         }
         (None, _) => false,
-    })
+    });
+    value.pack();
+    if let (true, Some(taken), K::KeyedTable(t)) = (made, taken, &*value) {
+        crate::index::keep_keys(&t.keys.vals, taken);
+    }
+    made
 }

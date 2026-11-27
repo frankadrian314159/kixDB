@@ -54,6 +54,7 @@ fn parsed<T: std::str::FromStr>(value: Option<String>) -> T {
 
 #[tokio::main]
 async fn main() {
+    kixdb::engine::par::one_thread_a_core();
     let (mut id, mut listen, mut data, mut replica) = (None::<u32>, None::<SocketAddr>, None::<String>, None::<u64>);
     let mut peers: Vec<(u64, String)> = vec![];
     let (mut raft_dir, mut addr, mut metrics_listen) = (None::<String>, None::<String>, None::<String>);

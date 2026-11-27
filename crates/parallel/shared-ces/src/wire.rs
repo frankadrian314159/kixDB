@@ -3,7 +3,7 @@
 //! A query is a `DoGet` whose ticket is a [`Fragment`]; its result streams back as Arrow batches. Everything else is an
 //! action.
 use kixdb::ast::Expr;
-use kixdb::ipc::{decode_k_payload, encode_k_payload};
+use kixdb::ipc::{decode_k_payload, encode_k_stored};
 use kixdb::{KError, K};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -141,7 +141,7 @@ pub struct LoadReq {
 
 impl LoadReq {
     pub fn new(table: impl Into<String>, mode: LoadMode, rows: &K, ords: Option<Vec<i64>>) -> Self {
-        Self { table: table.into(), mode, ipc_k: encode_k_payload(rows), ords }
+        Self { table: table.into(), mode, ipc_k: encode_k_stored(rows), ords }
     }
 
     pub fn rows(&self) -> Result<K, KError> {

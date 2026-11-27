@@ -2,13 +2,28 @@
 //! sizes and are put together in order. (A sum of many floating point numbers may differ in its last digits from the
 //! sum added one after another.)
 use rayon::prelude::*;
-use std::collections::HashMap;
+use foldhash::{HashMap, HashMapExt};
 use std::ops::Range;
 
 /// Inputs shorter than this are not worth handing to other threads.
 pub const PAR: usize = 100_000;
 /// The items a thread takes at a time.
 const PIECE: usize = 32_768;
+
+/// Share work among a thread for each processor core, not one for each of the two that a core may run: the second adds
+/// processor time and no speed. `RAYON_NUM_THREADS` says otherwise. For a program, before its first query: one that
+/// embeds the engine sets rayon up as it likes.
+pub fn one_thread_a_core() {
+    #[cfg(target_arch = "x86_64")]
+    if std::env::var_os("RAYON_NUM_THREADS").is_none() {
+        // (the processor's topology leaf says how many threads share a core)
+        #[allow(unused_unsafe)]
+        let per_core = unsafe { std::arch::x86_64::__cpuid_count(0xB, 0) }.ebx & 0xffff;
+        let threads = std::thread::available_parallelism().map_or(1, usize::from);
+        // (a pool that is there already is left as it is)
+        let _ = rayon::ThreadPoolBuilder::new().num_threads(threads.div_ceil(per_core.clamp(1, 2) as usize)).build_global();
+    }
+}
 
 /// Whether work on `n` items is shared out.
 pub fn split(n: usize) -> bool {
@@ -73,7 +88,7 @@ pub fn true_rows(bs: &[bool]) -> Vec<usize> {
 /// Number the groups of rows with the keys `keys` (a column of 64-bit values each) into `ids`, in order of first
 /// appearance, a piece at a time: `number` numbers the rows of one piece the same way, from 0. `false` (and nothing
 /// to be relied on in `ids`) when there are so many groups that putting the pieces together would cost what it saves.
-pub fn group(keys: &[Vec<u64>], ids: &mut [usize], number: impl Fn(Range<usize>, &mut [usize]) + Sync) -> bool {
+pub fn group<K: AsRef<[u64]> + Sync>(keys: &[K], ids: &mut [usize], number: impl Fn(Range<usize>, &mut [usize]) + Sync) -> bool {
     // a sample tells whether rows mostly share groups
     let sample = PIECE.min(ids.len());
     number(0..sample, &mut ids[..sample]);
@@ -103,7 +118,7 @@ pub fn group(keys: &[Vec<u64>], ids: &mut [usize], number: impl Fn(Range<usize>,
         .map(|rows| {
             let mut number_of = |row: usize| {
                 let next = seen.len();
-                *seen.entry(keys.iter().map(|k| k[row]).collect()).or_insert(next)
+                *seen.entry(keys.iter().map(|k| k.as_ref()[row]).collect()).or_insert(next)
             };
             rows.iter().map(|&r| number_of(r)).collect()
         })

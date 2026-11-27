@@ -40,7 +40,7 @@ pub fn write(x: &K, null_infinities: bool) -> String {
     };
     let array = |items: Vec<String>| format!("[{}]", items.join(","));
     let table = |t: &Flip| {
-        let names: Vec<String> = t.cols.iter().map(|&c| resolve(c)).collect();
+        let names: Vec<String> = t.cols.iter().map(|&c| resolve(c).into()).collect();
         let row = |r| object(names.iter().cloned().zip(t.vals.iter().map(|c| item(&c.get_atom(r)))).collect());
         array((0..t.nrows()).map(row).collect())
     };
@@ -54,7 +54,7 @@ pub fn write(x: &K, null_infinities: bool) -> String {
         K::Real(v) => float(f64::from(*v)),
         K::Float(v) => float(*v),
         K::Char(c) => quoted(&(*c as char).to_string()),
-        K::Sym(s) => quoted(&resolve(*s)),
+        K::Sym(s) => quoted(resolve(*s)),
         K::Guid(_) | K::Minute(_) | K::Second(_) | K::Time(_) | K::Timespan(_) => time(x, 0),
         K::Month(_) => time(x, 1),
         K::Date(_) | K::Timestamp(_) | K::Datetime(_) => time(x, 2),

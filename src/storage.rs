@@ -6,7 +6,7 @@
 use crate::ast::Expr;
 use crate::engine::Workspace;
 use crate::error::{KError, KResult};
-use crate::ipc::{decode_k_payload, encode_k_payload};
+use crate::ipc::{decode_k_payload, encode_k_stored};
 use crate::sym::{intern, resolve, SymId};
 use crate::types::*;
 use std::fs;
@@ -116,7 +116,7 @@ pub fn read_bytes(ws: &Workspace, x: &K) -> KResult<Vec<u8>> {
 
 pub fn write_flat_k(path: &Path, val: &K) -> KResult<()> {
     create_parent(path)?;
-    let payload = encode_k_payload(val);
+    let payload = encode_k_stored(val);
     let mut buf = Vec::with_capacity(8 + payload.len());
     buf.extend_from_slice(&FLAT_MAGIC);
     buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -130,7 +130,8 @@ pub fn read_flat_k(path: &Path) -> KResult<K> {
     if buf.len() < 8 || buf[..4] != FLAT_MAGIC {
         return Err(KError::io(format!("invalid kixdb binary file '{}'", path.display())));
     }
-    let (k, _) = decode_k_payload(&buf[8..], 0)?;
+    let (mut k, _) = decode_k_payload(&buf[8..], 0)?;
+    k.pack();
     Ok(k)
 }
 
@@ -170,7 +171,7 @@ pub fn write_splayed_table(dir: &Path, flip: &Flip) -> KResult<()> {
     write_flat_k(&dir.join(".d"), &d_vec)?;
     for (col_sym, col_vec) in flip.cols.iter().zip(&flip.vals) {
         let col_name = resolve(*col_sym);
-        write_flat_k(&dir.join(&col_name), &K::Vector(col_vec.clone()))?;
+        write_flat_k(&dir.join(col_name), &K::Vector(col_vec.clone()))?;
     }
     Ok(())
 }
@@ -187,9 +188,10 @@ pub fn read_splayed_table(dir: &Path, needed_cols: Option<&[SymId]>) -> KResult<
     let mut vals = Vec::with_capacity(cols_to_read.len());
     for &c in &cols_to_read {
         let ck = read_flat_k(&dir.join(resolve(c)))?;
-        let K::Vector(cv) = ck else {
+        let K::Vector(mut cv) = ck else {
             return Err(KError::io(format!("corrupt splayed column '{}'", resolve(c))));
         };
+        cv.pack();
         vals.push(cv);
     }
     Flip::new(cols_to_read, vals)
@@ -368,12 +370,12 @@ fn match_partition_predicate(
     };
     let op_s = resolve(*op);
     let no_cols = |e: &Expr| !e.any(&mut |x| matches!(x, Expr::Var(s) | Expr::Field(_, s) if table_cols.contains(s)));
-    let rhs_expr = match (&**lhs, &**rhs, op_s.as_str()) {
+    let rhs_expr = match (&**lhs, &**rhs, op_s) {
         (Expr::Var(c), r, _) if *c == part_col && no_cols(r) => r,
         (l, Expr::Var(c), "=") if *c == part_col && no_cols(l) => l,
         _ => return Ok(None),
     };
-    match op_s.as_str() {
+    match op_s {
         "=" => {
             let v = eval_rhs(rhs_expr)?;
             Ok(Some(Box::new(move |pv| pv.k_cmp(&v) == std::cmp::Ordering::Equal)))
@@ -446,7 +448,7 @@ pub fn delimited_lines(delimiter: char, flip: &Flip) -> K {
         false => s,
     };
     let line = |cells: Vec<String>| K::string(&cells.join(&delimiter.to_string()));
-    let mut lines = vec![line(flip.cols.iter().map(|&c| field(resolve(c))).collect())];
+    let mut lines = vec![line(flip.cols.iter().map(|&c| field(resolve(c).into())).collect())];
     lines.extend((0..flip.nrows()).map(|r| line(flip.vals.iter().map(|c| field(c.get_atom(r).data_text())).collect())));
     K::Vector(ColVec::General(Attr::None, Arc::new(lines)))
 }

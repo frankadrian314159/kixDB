@@ -1,12 +1,13 @@
 //! Vectorized unary and binary `q` primitives, casts, aggregations, moving windows, and temporal extractors.
 use crate::error::{KError, KResult};
-use crate::sym::{intern, resolve, with_str, SymId};
+use crate::sym::{intern, resolve, SymId};
 use crate::types::*;
+use foldhash::{HashMap, HashMapExt, HashSet};
+use rayon::prelude::*;
 use chrono::Datelike;
 use regex::Regex;
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::ops::Range;
 use crate::engine::{builtins, rows};
@@ -21,7 +22,7 @@ pub fn eval_field(val: &K, field: SymId) -> KResult<K> {
     let val = &*val.plain();
     let fname = resolve(field);
     // Temporal component extraction (`date.year`, `date.mm`, `date.dd`, `time.hh`, `time.uu`, `time.ss`, `time.minute`, `time.second`, `ts.date`, `ts.time`, `ts.minute`)
-    if let Some(extracted) = try_temporal_field(val, &fname) {
+    if let Some(extracted) = try_temporal_field(val, fname) {
         return Ok(extracted);
     }
     match val {
@@ -233,7 +234,40 @@ fn md5_op(x: &K) -> KResult<K> {
 const UNARY_KEEPING_TAGS: [&str; 18] =
     ["type", "@", "count", "#", "reverse", "|", "first", "*", "last", "distinct", "?", "enlist", ",", "flip", "meta", "asc", "desc", "raze"];
 
+/// The verbs of one argument that read packed strings as they are (see `strings.rs`).
+const UNARY_ON_PACKED: [&str; 24] = [
+    "type", "count", "first", "*", "last", "reverse", "|", "enlist", ",", "flip", "meta", "distinct", "?", "group", "iasc", "<", "idesc", ">", "upper",
+    "lower", "trim", "ltrim", "rtrim", "show",
+];
+
+/// `x` as the verb `op` of one argument is given it.
+pub(crate) fn unary_given<'a>(op: &str, x: &'a K) -> Cow<'a, K> {
+    match UNARY_ON_PACKED.contains(&op) {
+        true => Cow::Borrowed(x),
+        false => x.unpacked(),
+    }
+}
+
+/// The arguments as the verb `op` of two is given them: it may read packed strings on both sides, on the left, or on
+/// the right, and is given lists elsewhere.
+pub(crate) fn binary_given<'a>(op: &str, x: &'a K, y: &'a K) -> (Cow<'a, K>, Cow<'a, K>) {
+    let (left, right) = match op {
+        "," | "~" | "in" | "lj" | "ljf" | "ij" | "ijf" | "uj" | "ujf" | "pj" | "ej" | "aj" | "aj0" | "insert" | "upsert" | "set" | "xasc" | "xdesc" | "xkey"
+        | "xcol" | "xcols" | "each" | "peach" | "over" | "scan" | "prior" => (true, true),
+        "like" | "?" | "@" => (true, false),
+        "#" | "_" | "sublist" | "$" => (false, true),
+        // (`-8!x` and the other functions that a number names write the value as it is; `n!t` keys a table)
+        "!" if matches!(x, K::Int(_) | K::Long(_)) => (false, true),
+        _ => (false, false),
+    };
+    let given = |keeps: bool, x: &'a K| if keeps { Cow::Borrowed(x) } else { x.unpacked() };
+    (given(left, x), given(right, y))
+}
+
 pub fn eval_unary_prim(op: &str, x: &K) -> KResult<K> {
+    if let Cow::Owned(listed) = unary_given(op, x) {
+        return eval_unary_prim(op, &listed);
+    }
     if let Some(tag) = x.tag() {
         match op {
             "key" | "!" => return Ok(K::Sym(tag.domain)),
@@ -726,7 +760,7 @@ pub(crate) fn group_ids(cols: &[ColVec], nrows: usize) -> Vec<usize> {
         count
     }
     // the rows `of` alone, by the columns' keys
-    let number = |keys: &[Vec<u64>], of: Range<usize>, ids: &mut [usize]| {
+    let number = |keys: &[Cow<'_, [u64]>], of: Range<usize>, ids: &mut [usize]| {
         let (mut groups, n) = (1, of.len());
         ids.fill(0);
         for keys in keys.iter().map(|k| &k[of.clone()]) {
@@ -746,9 +780,10 @@ pub(crate) fn group_ids(cols: &[ColVec], nrows: usize) -> Vec<usize> {
     }
     let mut ids = vec![0; nrows];
     for c in cols {
-        match c.key_bits() {
-            Some(keys) => refine(&mut ids, keys.into_iter()),
-            None => refine(&mut ids, (0..nrows).map(|r| c.get_atom(r).hash_key())),
+        match (c.key_bits(), c) {
+            (Some(keys), _) => refine(&mut ids, keys.iter().copied()),
+            (None, ColVec::Strings(_, s)) => refine(&mut ids, s.iter()),
+            (None, _) => refine(&mut ids, (0..nrows).map(|r| c.get_atom(r).hash_key())),
         };
     }
     ids
@@ -792,6 +827,11 @@ pub fn aggregate_rows(verb: &str, values: &ColVec, rows: &[usize]) -> KResult<K>
         ("first", _) => values.get_atom(rows[0]),
         ("sum", ColVec::Float(_, xs)) => K::Float(rows.iter().map(|&r| xs[r]).filter(|v| !v.is_nan()).sum()),
         ("sum", ColVec::Long(_, xs)) => K::Long(rows.iter().map(|&r| xs[r]).filter(|&v| v != NULL_LONG).fold(0, i64::wrapping_add)),
+        ("avg", ColVec::Float(_, xs)) => {
+            let add = |piece: &[usize]| piece.iter().map(|&r| xs[r]).filter(|v| !v.is_nan()).fold((0.0, 0usize), |a, v| (a.0 + v, a.1 + 1));
+            let (sum, n) = par::pieces(rows, add).into_iter().fold((0.0, 0), |a, p| (a.0 + p.0, a.1 + p.1));
+            K::Float(if n == 0 { f64::NAN } else { sum / n as f64 })
+        }
         _ => eval_unary_prim(verb, &K::Vector(values.gather(rows)))?,
     })
 }
@@ -872,8 +912,13 @@ pub fn iasc_indices(cv: &ColVec, desc: bool) -> Vec<usize> {
                 if desc { ord.reverse() } else { ord }
             });
         }
+        ColVec::Strings(_, s) => {
+            idx.sort_by(|&a, &b| if desc { s.get(b).cmp(s.get(a)) } else { s.get(a).cmp(s.get(b)) });
+        }
         ColVec::Sym(_, xs) => {
-            idx.sort_by(|&a, &b| if desc { xs[b].cmp(&xs[a]) } else { xs[a].cmp(&xs[b]) });
+            // (each name is looked up once)
+            let names: Vec<&str> = xs.iter().map(|&s| resolve(s)).collect();
+            idx.sort_by(|&a, &b| if desc { names[b].cmp(names[a]) } else { names[a].cmp(names[b]) });
         }
         _ => {
             idx.sort_by(|&a, &b| {
@@ -990,14 +1035,18 @@ fn str_transform(x: &K, f: &dyn Fn(&str) -> String) -> KResult<K> {
             let s = f(&(*c as char).to_string());
             Ok(K::Char(s.as_bytes().first().copied().unwrap_or(b' ')))
         }
-        K::Sym(s) => Ok(K::Sym(intern(&f(&resolve(*s))))),
+        K::Sym(s) => Ok(K::Sym(intern(&f(resolve(*s))))),
         K::Vector(ColVec::Char(_, bs)) => {
             let s = f(&String::from_utf8_lossy(bs));
             Ok(K::string(&s))
         }
         K::Vector(ColVec::Sym(_, xs)) => {
-            let out: Vec<SymId> = xs.iter().map(|&s| intern(&f(&resolve(s)))).collect();
+            let out: Vec<SymId> = xs.iter().map(|&s| intern(&f(resolve(s)))).collect();
             Ok(K::Vector(ColVec::Sym(Attr::None, Arc::new(out))))
+        }
+        K::Vector(ColVec::Strings(_, s)) => {
+            let made: Vec<String> = s.iter().map(|b| f(&String::from_utf8_lossy(b))).collect();
+            Ok(K::Vector(ColVec::of_strings(Attr::None, made.iter().map(String::as_bytes).collect())))
         }
         K::Vector(ColVec::General(_, xs)) => {
             let items: KResult<Vec<K>> = xs.iter().map(|e| str_transform(e, f)).collect();
@@ -1441,6 +1490,10 @@ fn ungroup_op(x: &K) -> KResult<K> {
 // ----- Binary Primitives ----------------------------------------------------
 
 pub fn eval_binary_prim(op: &str, lhs: &K, rhs: &K) -> KResult<K> {
+    let given = binary_given(op, lhs, rhs);
+    if matches!(given.0, Cow::Owned(_)) || matches!(given.1, Cow::Owned(_)) {
+        return eval_binary_prim(op, &given.0, &given.1);
+    }
     // (joining keeps the domain that both sides have)
     let keeps = matches!(op, "#" | "_" | "~" | "sublist" | "rotate" | "!" | "@") || op == "," && lhs.tag() == rhs.tag();
     if !keeps {
@@ -2028,6 +2081,10 @@ pub fn broadcast_atoms(lhs: &K, rhs: &K, f: impl Fn(&K, &K) -> KResult<K> + Copy
 // ----- Structural Binary Verbs (`,`, `!`, `#`, `_`, `$`, `?`, ...) ----------
 
 pub fn concat_k(lhs: &K, rhs: &K) -> KResult<K> {
+    let other = |x: &K| !matches!(x, K::Vector(_)) && !x.is_atom();
+    if matches!(lhs, K::Vector(ColVec::Strings(..))) && other(rhs) || matches!(rhs, K::Vector(ColVec::Strings(..))) && other(lhs) {
+        return concat_k(&lhs.unpacked(), &rhs.unpacked());
+    }
     match (lhs, rhs) {
         (K::Vector(a), K::Vector(b)) => Ok(K::Vector(a.concat(b))),
         (K::Vector(a), b) if b.is_atom() => Ok(K::Vector(a.concat(&ColVec::from_atoms(vec![b.clone()])))),
@@ -2111,7 +2168,7 @@ fn take_or_attr_op(lhs: &K, rhs: &K) -> KResult<K> {
     // Attribute application: `` `s#x ``, `` `u#x ``, `` `p#x ``, `` `g#x ``, `` `#x ``
     if let K::Sym(s) = lhs {
         let s_str = resolve(*s);
-        if let Some(attr) = Attr::from_sym(&s_str) {
+        if let Some(attr) = Attr::from_sym(s_str) {
             return match rhs {
                 K::Vector(cv) => Ok(K::Vector(cv.with_attr(attr)?)),
                 K::Dict(d) => match &*d.keys {
@@ -2348,14 +2405,14 @@ pub fn cast_op(lhs: &K, rhs: &K) -> KResult<K> {
     if let K::Sym(tsym) = lhs {
         let tname = resolve(*tsym);
         // Temporal component cast `` `year$d ``, `` `mm$d ``, `` `minute$t ``
-        if let Some(part) = try_temporal_field(rhs, &tname) {
+        if let Some(part) = try_temporal_field(rhs, tname) {
             return Ok(part);
         }
-        let temporal = ["date", "month", "time", "second", "minute", "timespan", "timestamp"].contains(&tname.as_str());
+        let temporal = ["date", "month", "time", "second", "minute", "timespan", "timestamp"].contains(&tname);
         if matches!(rhs, K::Datetime(_) | K::Vector(ColVec::Datetime(..))) && temporal {
             return cast_op(lhs, &temporal::convert(rhs, 12));
         }
-        return cast_by_name(&tname, rhs);
+        return cast_by_name(tname, rhs);
     }
 
     // 3. Char cast `"I"$"42"` (uppercase = parse string!), `"i"$3.5` (lowercase = binary/value cast!)
@@ -2445,6 +2502,10 @@ fn cast_by_name(tname: &str, rhs: &K) -> KResult<K> {
             K::Char(c) => Ok(K::Sym(intern(&(*c as char).to_string()))),
             K::Vector(ColVec::Char(_, bs)) => Ok(K::Sym(intern(String::from_utf8_lossy(bs).trim()))),
             K::Vector(ColVec::Sym(_, _)) => Ok(rhs.clone()),
+            K::Vector(ColVec::Strings(_, s)) => {
+                let syms = s.iter().map(|b| intern(String::from_utf8_lossy(b).trim())).collect();
+                Ok(K::Vector(ColVec::Sym(Attr::None, Arc::new(syms))))
+            }
             K::Vector(ColVec::General(_, xs)) => {
                 let mut syms = Vec::with_capacity(xs.len());
                 for x in xs.iter() {
@@ -2633,6 +2694,9 @@ fn parse_from_string_type(type_ch: char, rhs: &K) -> KResult<K> {
     match rhs {
         K::Char(c) => Ok(parse_atom_from_str(type_ch, &(*c as char).to_string())),
         K::Vector(ColVec::Char(_, bs)) => Ok(parse_atom_from_str(type_ch, &String::from_utf8_lossy(bs))),
+        K::Vector(ColVec::Strings(_, s)) => {
+            Ok(K::Vector(ColVec::from_atoms(s.iter().map(|b| parse_atom_from_str(type_ch, &String::from_utf8_lossy(b))).collect())))
+        }
         K::Vector(ColVec::General(_, xs)) => {
             let mut out = Vec::with_capacity(xs.len());
             for x in xs.iter() {
@@ -2711,6 +2775,11 @@ fn find_or_roll_op(lhs: &K, rhs: &K) -> KResult<K> {
 
     // 2. Find (`vec ? x`): first index of each item of `rhs` in `lhs` (`count lhs` if not found, as in kdb+!)
     if let K::Vector(hay) = lhs {
+        if let (ColVec::Strings(_, s), K::Vector(ColVec::Char(_, needle))) = (hay, rhs) {
+            if let Some(i) = s.iter().position(|item| item == needle.as_slice()) {
+                return Ok(K::Long(i as i64));
+            }
+        }
         if let (ColVec::General(_, items), K::Vector(_)) = (hay, rhs) {
             if let Some(i) = items.iter().position(|item| item == rhs) {
                 return Ok(K::Long(i as i64));
@@ -2764,9 +2833,19 @@ fn in_op(lhs: &K, rhs: &K) -> KResult<K> {
                     want.iter().for_each(|x| slots[x.wrapping_sub(lo) as usize] = true);
                     have.iter().map(|x| slots.get(x.wrapping_sub(lo) as usize) == Some(&true)).collect()
                 } else {
-                    let set: HashSet<u64> = want.into_iter().collect();
+                    let set: HashSet<u64> = want.iter().copied().collect();
                     have.iter().map(|x| set.contains(x)).collect()
                 }));
+            }
+        }
+    }
+    // strings are looked for among those of the right side
+    if let K::Vector(ColVec::Strings(_, s)) = lhs {
+        if let Some(K::Vector(among)) = Some(rhs).filter(|r| matches!(r, K::Vector(v) if v.is_list())) {
+            if let Some(among) = among.packed() {
+                let ColVec::Strings(_, among) = &*among else { unreachable!() };
+                let set: HashSet<&[u8]> = among.iter().collect();
+                return Ok(bool_vec(s.iter().map(|x| set.contains(x)).collect()));
             }
         }
     }
@@ -2856,13 +2935,17 @@ fn like_op(lhs: &K, rhs: &K) -> KResult<K> {
     let inner = Regex::new(inner).map_err(|e| KError::domain(e.to_string()))?;
     let found = |s: &str| if s.contains('\n') { rx.is_match(s) } else { inner.is_match(s) };
     // match the text where it lies, without making a string of it for every item
-    let symbol = |s: SymId| with_str(s, found);
+    let symbol = |s: SymId| found(resolve(s));
     let text = |bs: &[u8]| found(&String::from_utf8_lossy(bs));
     match lhs {
         K::Sym(s) => Ok(K::Bool(symbol(*s))),
         K::Char(c) => Ok(K::Bool(found(&(*c as char).to_string()))),
         K::Vector(ColVec::Char(_, bs)) => Ok(K::Bool(text(bs))),
         K::Vector(ColVec::Sym(_, xs)) => Ok(bool_vec(par::map(xs, |&s| symbol(s)))),
+        K::Vector(ColVec::Strings(_, s)) => Ok(bool_vec(match par::split(s.len()) {
+            false => s.iter().map(text).collect(),
+            true => (0..s.len()).into_par_iter().map(|i| text(s.get(i))).collect(),
+        })),
         K::Vector(ColVec::General(_, xs)) => Ok(bool_vec(par::map(xs, |x| match x {
             K::Vector(ColVec::Char(_, bs)) => text(bs),
             other => other.as_str().is_some_and(|s| found(&s)),
@@ -2899,7 +2982,7 @@ pub fn ssr_op(s: &K, pat: &K, rep: &K) -> KResult<K> {
 fn vs_op(lhs: &K, rhs: &K) -> KResult<K> {
     // `"," vs "a,b,c"` -> `("a";"b";"c")`; `` ` vs `a.b.c `` -> `` `a`b`c ``
     if let (K::Sym(sep), K::Sym(target)) = (lhs, rhs) {
-        let d = if sep.is_null() { "." } else { &resolve(*sep) };
+        let d = if sep.is_null() { "." } else { resolve(*sep) };
         let s = resolve(*target);
         let parts: Vec<SymId> = s.split(d).map(intern).collect();
         return Ok(K::Vector(ColVec::Sym(Attr::None, Arc::new(parts))));
@@ -2955,10 +3038,10 @@ fn vs_op(lhs: &K, rhs: &K) -> KResult<K> {
 
 fn sv_op(lhs: &K, rhs: &K) -> KResult<K> {
     if let (K::Sym(sep), K::Vector(ColVec::Sym(_, syms))) = (lhs, rhs) {
-        let joined: Vec<String> = syms.iter().map(|&s| resolve(s)).collect();
+        let joined: Vec<String> = syms.iter().map(|&s| resolve(s).into()).collect();
         // symbols that start with a path are joined into a path
         let path = joined.first().is_some_and(|s| s.starts_with(':'));
-        let d = if !sep.is_null() { &resolve(*sep) } else if path { "/" } else { "." };
+        let d = if !sep.is_null() { resolve(*sep) } else if path { "/" } else { "." };
         return Ok(K::Sym(intern(&joined.join(d))));
     }
     // lines of text, each ended
@@ -3311,16 +3394,14 @@ pub fn table_sort_op(lhs: &K, rhs: &K, desc: bool) -> KResult<K> {
     for s in &sort_cols {
         col_indices.push(flip.col_idx(*s).ok_or_else(|| KError::value(resolve(*s)))?);
     }
-    let mut row_idx: Vec<usize> = (0..flip.nrows()).collect();
-    row_idx.sort_by(|&a, &b| {
-        for &ci in &col_indices {
-            let ord = flip.vals[ci].get_atom(a).k_cmp(&flip.vals[ci].get_atom(b));
-            if ord != Ordering::Equal {
-                return if desc { ord.reverse() } else { ord };
-            }
-        }
-        a.cmp(&b)
-    });
+    // by the last column first: each grade keeps the order of equals that the ones before it made
+    let mut row_idx = vec![];
+    for (n, &ci) in col_indices.iter().rev().enumerate() {
+        row_idx = match n {
+            0 => iasc_indices(&flip.vals[ci], desc),
+            _ => iasc_indices(&flip.vals[ci].gather(&row_idx), desc).into_iter().map(|i| row_idx[i]).collect(),
+        };
+    }
     let mut sorted = flip.gather(&row_idx);
     if !desc {
         if let Some(&first_ci) = col_indices.first() {
@@ -3529,11 +3610,8 @@ pub fn dict_lookup(d: &Dict, key: &K) -> KResult<K> {
     let K::Vector(keys_cv) = &*d.keys else {
         return Err(KError::ty("corrupt dictionary keys"));
     };
-    let target_hk = key.hash_key();
-    for i in 0..keys_cv.len() {
-        if keys_cv.get_atom(i).hash_key() == target_hk {
-            return index_k(&d.vals, &[Some(K::Long(i as i64))]);
-        }
+    if let Some(i) = keys_cv.position(key) {
+        return index_k(&d.vals, &[Some(K::Long(i as i64))]);
     }
     // (with sorted keys, a missing key has the value of the greatest key below it)
     if keys_cv.attr() == Attr::Sorted {
@@ -3652,9 +3730,9 @@ pub fn index_k(target: &K, args: &[Option<K>]) -> KResult<K> {
                 Some(k) => {
                     if kt.keys.ncols() == 1 {
                         if k.is_atom() {
-                            let kv = &kt.keys.vals[0];
-                            let hk = k.hash_key();
-                            let found = (0..kv.len()).find(|&i| kv.get_atom(i).hash_key() == hk);
+                            let wanted = ColVec::from_atoms(vec![k.clone()]);
+                            let indexed = crate::index::key_rows(&kt.keys.vals, &[&wanted], 1);
+                            let found = indexed.map_or_else(|| kt.keys.vals[0].position(k), |rows| rows[0]);
                             match found {
                                 Some(r) => K::Dict(Arc::new(kt.vals.row_dict(r))),
                                 None => first_op(&K::Table(Arc::new(kt.vals.gather(&[])))),
@@ -3673,9 +3751,12 @@ pub fn index_k(target: &K, args: &[Option<K>]) -> KResult<K> {
                         if let Some(probe) = several {
                             K::Table(Arc::new(crate::engine::joins::lookup_keyed_rows(kt, &probe?)?))
                         } else if tuple_cv.len() == kt.keys.ncols() {
-                            let found = (0..kt.nrows()).find(|&r| {
-                                (0..kt.keys.ncols()).all(|c| kt.keys.vals[c].get_atom(r).hash_key() == tuple_cv.get_atom(c).hash_key())
-                            });
+                            let wanted: Vec<ColVec> = (0..kt.keys.ncols()).map(|c| ColVec::from_atoms(vec![tuple_cv.get_atom(c)])).collect();
+                            let indexed = crate::index::key_rows(&kt.keys.vals, &wanted.iter().collect::<Vec<_>>(), 1);
+                            let found = indexed.map_or_else(
+                                || (0..kt.nrows()).find(|&r| (0..kt.keys.ncols()).all(|c| kt.keys.vals[c].get_atom(r).hash_key() == tuple_cv.get_atom(c).hash_key())),
+                                |rows| rows[0],
+                            );
                             match found {
                                 Some(r) => K::Dict(Arc::new(kt.vals.row_dict(r))),
                                 None => first_op(&K::Table(Arc::new(kt.vals.gather(&[])))),

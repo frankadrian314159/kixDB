@@ -215,7 +215,7 @@ impl Engine<'_> {
         self.ws.writable()?;
         let to = h.saturating_abs();
         if matches!(to, 1 | 2) {
-            let text = String::from_utf8_lossy(&text_bytes(&x, h < 0)?).into_owned();
+            let text = String::from_utf8_lossy(&text_bytes(&x.unpacked(), h < 0)?).into_owned();
             self.print(Event::Console { text, error: to == 2 });
             return Ok(K::Int(h));
         }
@@ -223,7 +223,7 @@ impl Engine<'_> {
         match held {
             Some(Handle::Server(server)) if x == K::Null && h > 0 => locked(&server).receive(),
             _ if h < 0 && x == K::Null => Ok(K::Null),
-            Some(Handle::File(path)) => append(&path, &x, h < 0).map(|_| K::Int(h)),
+            Some(Handle::File(path)) => append(&path, &x.unpacked(), h < 0).map(|_| K::Int(h)),
             Some(Handle::Server(server)) if h > 0 => locked(&server).query_k(&x),
             Some(Handle::Server(server)) => locked(&server).send_async_k(&x).map(|_| K::Null),
             None if h > 0 => Err(KError::nyi("a synchronous call to a client (send to it with neg)")),
@@ -363,7 +363,7 @@ impl Engine<'_> {
 
 fn resolve_symbol(x: &K) -> KResult<String> {
     match x {
-        K::Sym(s) => Ok(resolve(*s)),
+        K::Sym(s) => Ok(resolve(*s).into()),
         _ => Err(KError::ty("expected a symbol")),
     }
 }

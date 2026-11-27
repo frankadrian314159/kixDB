@@ -310,14 +310,20 @@ pub enum ColVec {
     Minute(Attr, Arc<Vec<i32>>),
     Second(Attr, Arc<Vec<i32>>),
     Time(Attr, Arc<Vec<i32>>),
-    /// Values (never themselves tagged) tagged with their domain. (Last, so that files saved before it existed load.)
+    /// Values (never themselves tagged) tagged with their domain.
     Enum(Tag, Box<ColVec>),
+    /// A list of strings, packed (see `strings.rs`). (Here and the one before last, so that files saved before them load.)
+    Strings(Attr, Arc<crate::strings::Strings>),
 }
 
 impl PartialEq for ColVec {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (ColVec::General(_, a), ColVec::General(_, b)) => a == b,
+            (ColVec::Strings(_, a), ColVec::Strings(_, b)) => a == b,
+            (ColVec::Strings(..), ColVec::General(..)) | (ColVec::General(..), ColVec::Strings(..)) => {
+                self.len() == other.len() && (0..self.len()).all(|i| self.get_atom(i) == other.get_atom(i))
+            }
             (ColVec::Bool(_, a), ColVec::Bool(_, b)) => a == b,
             (ColVec::Guid(_, a), ColVec::Guid(_, b)) => a == b,
             (ColVec::Byte(_, a), ColVec::Byte(_, b)) => a == b,
@@ -371,6 +377,7 @@ impl ColVec {
             ColVec::Second(_, v) => v.len(),
             ColVec::Time(_, v) => v.len(),
             ColVec::Enum(_, v) => v.len(),
+            ColVec::Strings(_, v) => v.len(),
         }
     }
 
@@ -398,7 +405,8 @@ impl ColVec {
             | ColVec::Timespan(a, _)
             | ColVec::Minute(a, _)
             | ColVec::Second(a, _)
-            | ColVec::Time(a, _) => *a,
+            | ColVec::Time(a, _)
+            | ColVec::Strings(a, _) => *a,
             ColVec::Enum(_, v) => v.attr(),
         }
     }
@@ -423,7 +431,8 @@ impl ColVec {
             | ColVec::Timespan(a, _)
             | ColVec::Minute(a, _)
             | ColVec::Second(a, _)
-            | ColVec::Time(a, _) => *a = na,
+            | ColVec::Time(a, _)
+            | ColVec::Strings(a, _) => *a = na,
             ColVec::Enum(_, v) => v.set_attr_unchecked(na),
         }
     }
@@ -469,7 +478,7 @@ impl ColVec {
 
     pub fn type_num(&self) -> i16 {
         match self {
-            ColVec::General(_, _) => 0,
+            ColVec::General(_, _) | ColVec::Strings(..) => 0,
             ColVec::Bool(_, _) => 1,
             ColVec::Guid(_, _) => 2,
             ColVec::Byte(_, _) => 4,
@@ -521,6 +530,7 @@ impl ColVec {
             ColVec::Second(_, _) => 'v',
             ColVec::Time(_, _) => 't',
             ColVec::Enum(_, v) => v.meta_type_char(),
+            ColVec::Strings(..) => 'C',
         }
     }
 
@@ -547,12 +557,13 @@ impl ColVec {
             ColVec::Second(_, _) => "second",
             ColVec::Time(_, _) => "time",
             ColVec::Enum(_, v) => v.type_name(),
+            ColVec::Strings(..) => "string",
         }
     }
 
     pub fn null_atom(&self) -> K {
         match self {
-            ColVec::General(_, _) => K::Null,
+            ColVec::General(_, _) | ColVec::Strings(..) => K::Null,
             ColVec::Bool(_, _) => K::Bool(false),
             ColVec::Guid(_, _) => K::Guid(NULL_GUID),
             ColVec::Byte(_, _) => K::Byte(0),
@@ -633,6 +644,7 @@ impl ColVec {
             ColVec::Second(_, v) => K::Second(v[idx]),
             ColVec::Time(_, v) => K::Time(v[idx]),
             ColVec::Enum(t, v) => K::Enum(*t, Box::new(v.get_atom(idx))),
+            ColVec::Strings(_, v) => crate::strings::value(v.get(idx)),
         }
     }
 
@@ -646,6 +658,9 @@ impl ColVec {
                     Some(atom) => ColVec::from_atoms(vec![atom.clone()]).null_atom(),
                     None => self.null_atom(),
                 };
+            }
+            if let ColVec::Strings(..) = self {
+                return crate::strings::value(b"");
             }
             self.null_atom()
         } else {
@@ -685,6 +700,7 @@ impl ColVec {
             ColVec::Second(_, v) => pick!(Second, v, NULL_INT),
             ColVec::Time(_, v) => pick!(Time, v, NULL_INT),
             ColVec::Enum(t, v) => ColVec::Enum(*t, Box::new(v.gather(indices))),
+            ColVec::Strings(_, v) => ColVec::of_strings(Attr::None, indices.iter().map(|&i| if i < v.len() { v.get(i) } else { b"" }).collect()),
         }
     }
 
@@ -727,6 +743,10 @@ impl ColVec {
             ColVec::Second(_, v) => pick!(Second, v, NULL_INT),
             ColVec::Time(_, v) => pick!(Time, v, NULL_INT),
             ColVec::Enum(t, v) => ColVec::Enum(*t, Box::new(v.gather_signed(indices))),
+            ColVec::Strings(_, v) => {
+                let at = |&i: &i64| if i >= 0 && (i as usize) < v.len() { v.get(i as usize) } else { b"" };
+                ColVec::of_strings(Attr::None, indices.iter().map(at).collect())
+            }
         }
     }
 
@@ -791,7 +811,30 @@ impl ColVec {
         if n == 0 {
             return ColVec::from_atoms(vec![atom]).take(0);
         }
-        ColVec::from_atoms(vec![atom; n])
+        macro_rules! of {
+            ($($v:ident)*) => {
+                match atom {
+                    $(K::$v(x) => ColVec::$v(Attr::None, Arc::new(vec![x; n])),)*
+                    other => ColVec::from_atoms(vec![other; n]),
+                }
+            };
+        }
+        of!(Bool Guid Byte Short Int Long Real Float Char Sym Timestamp Month Date Datetime Timespan Minute Second Time)
+    }
+
+    /// The first row that holds `atom`.
+    pub fn position(&self, atom: &K) -> Option<usize> {
+        match (self, atom) {
+            (ColVec::Long(_, v), K::Long(x)) => v.iter().position(|y| y == x),
+            (ColVec::Int(_, v), K::Int(x)) => v.iter().position(|y| y == x),
+            (ColVec::Sym(_, v), K::Sym(x)) => v.iter().position(|y| y == x),
+            (ColVec::Date(_, v), K::Date(x)) => v.iter().position(|y| y == x),
+            (ColVec::Strings(_, v), K::Vector(ColVec::Char(_, x))) => v.iter().position(|y| y == x.as_slice()),
+            _ => {
+                let key = atom.hash_key();
+                (0..self.len()).position(|i| self.get_atom(i).hash_key() == key)
+            }
+        }
     }
 
     /// Normalize a general list of uniform atoms into a typed vector (kdb+'s auto-collapse rule).
@@ -847,6 +890,13 @@ impl ColVec {
             (ColVec::Enum(t, a), ColVec::Enum(u, b)) if t == u => ColVec::Enum(*t, Box::new(a.concat(b))),
             // (values of different domains, or with others that have none, lose their tags)
             (ColVec::Enum(..), _) | (_, ColVec::Enum(..)) if !self.is_empty() && !other.is_empty() => self.plain().concat(other.plain()),
+            (ColVec::Strings(..), _) | (_, ColVec::Strings(..)) if self.packed().is_some() && other.packed().is_some() => {
+                let (Some(a), Some(b)) = (self.packed(), other.packed()) else { unreachable!() };
+                let (ColVec::Strings(_, a), ColVec::Strings(_, b)) = (&*a, &*b) else { unreachable!() };
+                let mut out = (**a).clone();
+                out.extend_from(b);
+                ColVec::of_strings(Attr::None, out)
+            }
             (ColVec::Bool(_, a), ColVec::Bool(_, b)) => cat!(Bool, a, b),
             (ColVec::Guid(_, a), ColVec::Guid(_, b)) => cat!(Guid, a, b),
             (ColVec::Byte(_, a), ColVec::Byte(_, b)) => cat!(Byte, a, b),
@@ -891,7 +941,7 @@ impl ColVec {
             (_, ColVec::Enum(_, b)) => return self.append_strict(b),
             _ => {}
         }
-        if self.type_num() == other.type_num() || matches!(self, ColVec::General(_, _)) {
+        if self.type_num() == other.type_num() || self.is_list() {
             if matches!(self, ColVec::General(_, _)) && self.is_empty() && !matches!(other, ColVec::General(_, _)) {
                 return Ok(other.clone());
             }
@@ -940,6 +990,9 @@ impl ColVec {
             return Err(KError::domain("index out of bounds"));
         }
         self.set_attr_unchecked(Attr::None);
+        if let ColVec::Strings(..) = self {
+            *self = self.listed().into_owned();
+        }
         match (self, val) {
             (ColVec::General(_, v), x) => Arc::make_mut(v)[idx] = x,
             (ColVec::Bool(_, v), K::Bool(b)) => Arc::make_mut(v)[idx] = b,
@@ -970,12 +1023,16 @@ impl ColVec {
 
     /// Each element of a fixed-width vector as 64 bits, two being equal exactly when the elements' `hash_key`s are
     /// (so all NaNs are one value, as are both zeros).
-    pub fn key_bits(&self) -> Option<Vec<u64>> {
+    pub fn key_bits(&self) -> Option<Cow<'_, [u64]>> {
         fn float(v: f64) -> u64 {
             if v.is_nan() { f64::NAN.to_bits() } else if v == 0.0 { 0 } else { v.to_bits() }
         }
         use crate::engine::par::map as par;
-        Some(match self {
+        if let ColVec::Long(_, v) | ColVec::Timestamp(_, v) | ColVec::Timespan(_, v) = self {
+            // SAFETY: the two are as large and as aligned, and every pattern of bits is a value of each
+            return Some(Cow::Borrowed(unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u64>(), v.len()) }));
+        }
+        Some(Cow::Owned(match self {
             ColVec::Bool(_, v) => par(v, |&x| u64::from(x)),
             ColVec::Byte(_, v) | ColVec::Char(_, v) => par(v, |&x| u64::from(x)),
             ColVec::Short(_, v) => par(v, |&x| x as u64),
@@ -985,13 +1042,13 @@ impl ColVec {
             | ColVec::Minute(_, v)
             | ColVec::Second(_, v)
             | ColVec::Time(_, v) => par(v, |&x| x as u64),
-            ColVec::Long(_, v) | ColVec::Timestamp(_, v) | ColVec::Timespan(_, v) => par(v, |&x| x as u64),
+            ColVec::Long(..) | ColVec::Timestamp(..) | ColVec::Timespan(..) => unreachable!("read above"),
             ColVec::Real(_, v) => par(v, |&x| float(f64::from(x))),
             ColVec::Float(_, v) | ColVec::Datetime(_, v) => par(v, |&x| float(x)),
             ColVec::Sym(_, v) => par(v, |&x| u64::from(x.0)),
-            ColVec::General(..) | ColVec::Guid(..) => return None,
+            ColVec::General(..) | ColVec::Guid(..) | ColVec::Strings(..) => return None,
             ColVec::Enum(_, v) => return v.key_bits(),
-        })
+        }))
     }
 
     pub fn is_numeric(&self) -> bool {
@@ -1075,6 +1132,7 @@ impl ColVec {
             | ColVec::Timespan(_, _) => n * 8,
             ColVec::Guid(_, _) => n * 16,
             ColVec::Enum(_, v) => v.approx_bytes(),
+            ColVec::Strings(_, v) => v.bytes_held(),
         }
     }
 }
@@ -1300,7 +1358,7 @@ pub enum Func {
 impl Func {
     pub fn source_text(&self) -> String {
         match self {
-            Func::Prim(s) => resolve(*s),
+            Func::Prim(s) => resolve(*s).into(),
             Func::Lambda(l) => l.source.clone(),
             Func::Adverb { kind, inner } => format!("{}{}", inner.source_text(), kind.symbol()),
             Func::Proj { func, args, .. } => {
@@ -1556,7 +1614,7 @@ impl K {
     pub fn as_str(&self) -> Option<String> {
         match self {
             K::Char(c) => Some((*c as char).to_string()),
-            K::Sym(s) => Some(resolve(*s)),
+            K::Sym(s) => Some(resolve(*s).into()),
             K::Vector(v) => v.as_str(),
             K::Enum(_, v) => v.as_str(),
             _ => None,
@@ -1693,7 +1751,7 @@ impl K {
             K::Float(v) => format_float_cell(*v),
             K::Datetime(v) => if v.is_nan() { String::new() } else { format_datetime(*v) },
             K::Char(c) => (*c as char).to_string(),
-            K::Sym(s) => resolve(*s),
+            K::Sym(s) => resolve(*s).into(),
             K::Timestamp(v) => if *v == NULL_LONG { String::new() } else { format_timestamp(*v) },
             K::Month(v) => if *v == NULL_INT { String::new() } else { format_month(*v) },
             K::Date(v) => if *v == NULL_INT { String::new() } else { format_date(*v) },
@@ -1932,6 +1990,7 @@ fn format_vector_q(v: &ColVec) -> String {
                 format!("{pfx}{enlist}{}e", parts.join(" "))
             }
         }
+        packed @ ColVec::Strings(..) => K::Vector(packed.listed().into_owned()).q_repr(),
         ColVec::General(_, xs) => {
             if xs.is_empty() {
                 "()".into()

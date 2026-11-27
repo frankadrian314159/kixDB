@@ -31,7 +31,7 @@ pub fn augmented(table: SymId) -> Expr {
         kind: QSqlKind::Update,
         distinct: false,
         limit: None,
-        cols: vec![ColSpec { name: Some(intern(ORD_COL)), expr: Expr::Var(intern(&ord_var(&resolve(table)))) }],
+        cols: vec![ColSpec { name: Some(intern(ORD_COL)), expr: Expr::Var(intern(&ord_var(resolve(table)))) }],
         by: None,
         from: Box::new(Expr::Var(table)),
         where_clauses: vec![],
@@ -122,7 +122,7 @@ impl Inner {
     }
 
     fn move_table(&self, m: &Move) -> KResult<()> {
-        let temp = resolve(m.temp);
+        let temp = resolve(m.temp).to_string();
         let mut empty = m.source.schema.clone();
         empty.cols.push(intern(ORD_COL));
         empty.vals.push(ColVec::Long(Attr::None, Arc::new(vec![])));
@@ -132,7 +132,7 @@ impl Inner {
         let sends = shards.iter().enumerate().map(|(me, shard)| {
             let req = ShuffleReq {
                 scan: augmented(m.source.name),
-                key_cols: m.keys.iter().map(|&k| resolve(k)).collect(),
+                key_cols: m.keys.iter().map(|&k| resolve(k).into()).collect(),
                 target_table: temp.clone(),
                 slots: (*slots).clone(),
                 peers: peers.clone(),

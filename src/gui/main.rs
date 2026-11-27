@@ -18,6 +18,7 @@ mod session;
 mod ui;
 
 fn main() -> Result<(), eframe::Error> {
+    kixdb::engine::par::one_thread_a_core();
     let mut dir: Option<std::path::PathBuf> = None;
     let opts = kixdb::StorageOptions::default();
     let mut target: Option<remote::Target> = None;

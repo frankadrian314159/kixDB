@@ -172,7 +172,8 @@ A variable assigned one of these names takes its place. Where they differ from k
 
 * A backtrace (`.Q.bt`, and what `.Q.trp` gives its handler) lists the source of the functions that were running,
   without marking where in each. `.Q.fc` applies its function once, on one thread.
-* `.Q.gc` returns 0: memory is freed as values are dropped. `.Q.w` gives nulls for what is not measured.
+* Memory is freed as values are dropped, but the allocator keeps it for later values; `.Q.gc` asks it to give it back to
+  the system, and returns 0, as how much it gave back is not measured. `.Q.w` gives nulls for what is not measured.
 * `.j.j` writes floats to `\P` digits, a keyed table as the array of its rows, and a function as its source.
 
 ## Not implemented

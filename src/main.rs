@@ -70,6 +70,7 @@ struct Shell {
 }
 
 fn main() -> ExitCode {
+    kixdb::engine::par::one_thread_a_core();
     let mut args = std::env::args().skip(1);
     let mut data_dir: Option<String> = None;
     let mut preload_scripts: Vec<String> = Vec::new();

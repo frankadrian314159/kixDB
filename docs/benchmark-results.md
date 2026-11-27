@@ -1,5 +1,152 @@
 # Benchmark results: scale factor 0.3
 
+## Copying less while filtering
+
+Measured 2026-11-26 on mains power: commit `341ec82` and the changes below, run back to back, one run each. Provisional,
+as below.
+
+| | `341ec82` | now |
+| --- | ---: | ---: |
+| Queries, TPC-H / TPC-DS, single node | 0.49 / 0.16 s | 0.44 / 0.13 s |
+| Queries, TPC-H / TPC-DS, 3 shards | 0.62 / 0.31 s | 0.48 / 0.26 s |
+| Memory allocated by the TPC-H queries, once each | 1,646 MB | 1,249 MB |
+| Memory allocated by the TPC-DS queries | 493 MB | 374 MB |
+| Most memory a TPC-H query adds while it runs | 125 MB | 83 MB |
+| TPC-H queries/s, 12 clients, 6 threads | 51 | 64 |
+| Processor time a query then | 119 ms | 91 ms |
+| TPC-H queries/s, 1 client | 45 | 54 |
+
+What changed:
+
+* While at least half of a table's rows are kept, a later `where` clause that looks at one row at a time is tested on
+  the whole columns, instead of on a copy of the rows kept so far.
+* A query that keeps at least half of the rows and groups them by columns of the table reads them where they are.
+* Keys that are `long`s, timestamps or timespans are read where they are for grouping, joins and `in`, instead of being
+  copied.
+* `avg` of floats by group adds the values where they are.
+
+## Threads and keyed tables
+
+Measured 2026-11-26 on mains power (6 cores, 12 threads), one run each. Provisional, as below.
+
+TPC-H's single-statement queries on one engine for 8 s, from 1 client and from 12 at once, with each number of threads
+(`RAYON_NUM_THREADS`), on the build with packed strings:
+
+| Threads | Queries/s, 1 client | Processor ms a query | Queries/s, 12 clients | Processor ms a query |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 29 | 34 | 54 | 80 |
+| 4 | 42 | 73 | 49 | 92 |
+| **6** | **45** | **93** | **51** | **118** |
+| 8 | 45 | 116 | 51 | 144 |
+| 12 | 43 | 156 | 51 | 171 |
+
+All 22 TPC-H and 24 TPC-DS queries once each took 0.58 and 0.19 s with 1 thread, 0.48 and 0.16 s with 6, and 0.46 and
+0.17 s with 12. kixDB's programs now use one thread a core.
+
+A keyed table of 1,000,000 rows, before the [index of keys](storage.md#looking-up-keys) and with it, milliseconds
+for all the repetitions together:
+
+| Statement | Times | `9de4c2e` | now |
+| --- | ---: | ---: | ---: |
+| upsert a key that is there (the second builds the index) | 100 | 304 | 66 |
+| upsert a new key | 1,000 | 3,039 | 8 |
+| `k 999999` (the last key) | 100 | 4,898 | under 1 |
+| `select from k where id = 999999` | 100 | 50 | under 1 |
+| `x lj k`, 4 rows | 100 | 1,255 | under 1 |
+| two key columns: upsert (the second builds the index) | 100 | 2,064 | 86 |
+| two key columns: look up | 100 | 12,204 | under 1 |
+
+## Packed string columns
+
+Measured 2026-11-26 on mains power: commit `305ae9c` and [packed columns of strings](storage.md#columns-of-strings),
+run back to back, one run each. Provisional, as below.
+
+| | `305ae9c` | now |
+| --- | ---: | ---: |
+| TPC-H tables in memory | 460 MB | **270 MB** |
+| `lineitem.l_comment`, bytes a row | 104 | 32 |
+| TPC-DS tables (few strings) | 107 MB | 107 MB |
+| TPC-H load, 3 shards in-process | 2.28 s | 1.12 s |
+| TPC-H load, single node | 1.84 s | 2.00 s |
+| Queries, TPC-H / TPC-DS, single node | 0.44 / 0.15 s | 0.47 / 0.16 s |
+| Queries, TPC-H / TPC-DS, 3 shards | 0.53 / 0.28 s | 0.54 / 0.30 s |
+
+The single node's TPC-H total includes one run of Q1 at 85 ms against 54; Q1, Q10 and Q13 run again alone, one after
+the other, took the same on both. The load's peak memory (1.0 GB) is unchanged: the generator holds lists while the
+tables are packed.
+
+A table of 1,000,000 rows with two columns of strings, milliseconds a statement:
+
+| Statement | `305ae9c` | now |
+| --- | ---: | ---: |
+| insert one row | 75 | 0.07 |
+| `count each s` | 187 | 2 |
+| `where c ~\: "alpha"` | 231 | 11 |
+| `where c in ("alpha"; "delta")` | 100 | 20 |
+| `distinct c` | 77 | 15 |
+| `select count i by c` | 82 | 19 |
+| join on a string key | 107 | 25 |
+| `upper s` | 249 | 81 |
+| `` `$c `` | 73 | 24 |
+| `` `s xasc t `` | 88 | 34 |
+| `where s like "*12*"` | 32 | 22 |
+| filter that keeps the strings | 22 | 14 |
+| `update ... where` setting a string | 24 | 17 |
+| `-8! t` | 59 | 25 |
+| save / load the splayed table | 76 / 227 | 40 / 33 |
+| **slower:** `` t[`c] = t`c `` (the verb is given a list) | 399 | 650 |
+| **slower:** `` t[`s] ,\: "!" `` | 497 | 608 |
+| **slower:** `` {x, "!"} each t`s `` | 639 | 809 |
+
+A string taken from a packed column is a copy, where an item of a list was shared: this is what makes the last three
+slower, and some queries allocate more for it (TPC-H Q13, 37 to 67 MB).
+
+## After the second round of changes
+
+Measured 2026-11-26 on the machine described under [Setup](#setup), on mains power: commit `5a15686` and the changes
+below, run back to back, one run each. **Treat these figures as provisional:** the machine's memory has still not been
+tested. On battery the same machine runs about half as fast.
+
+| Configuration | Queries, TPC-H / TPC-DS (s): `5a15686` | now | Load, TPC-H / TPC-DS (s): `5a15686` | now |
+| --- | ---: | ---: | ---: | ---: |
+| Single node | 0.49 / 0.21 | 0.42 / 0.14 | 1.92 / 0.32 | 1.71 / 0.17 |
+| 3 shards, in-process | 0.61 / 0.35 | 0.56 / 0.28 | 2.34 / 0.58 | 2.23 / 0.38 |
+
+The cluster figures are from the build before the last change to loading, which affects memory and the single node's load.
+
+Single statements on 1,000,000 rows or items, milliseconds:
+
+| Statement | `5a15686` | now |
+| --- | ---: | ---: |
+| `d[count d]: 1`, 4,000 times | 869 | 8 |
+| `x,: 1`, 40,000 times | 180 | 27 |
+| `a+: 1`, 1,000,000 times | 665 | 367 |
+| `count each s` (strings) | 306 | 108 |
+| `` `sym xasc t `` | 328 | 32 |
+| `` `u insert t `` into an empty table | 102 | 2 |
+| `update v: 0 from t` | 18 | 1.3 |
+| `` update v: 0 from t where sym = `a `` | 17 | 2.0 |
+| upsert one row of a keyed table | 11.8 | 2.1 |
+| `-8! t` (3 columns, one of symbols) | 31 | 9.5 |
+| `-9!` of that | 49 | 37 |
+
+Appending 20,000 items one at a time allocates 17 MB instead of 1.5 GB, and 5,000 dictionary inserts 6 MB instead of
+3 GB.
+
+What changed:
+
+* **Assignments change a variable where it is** ([amend.rs](../src/engine/amend.rs)): `x,: y`, `x[i]: y` and `d[k]: y`
+  for one item or key, where the value keeps its type, cost the items they touch. They are logged and replicated as those
+  changes. A log with a change to a dictionary cannot be replayed by an earlier version.
+* **Symbol names are read without a lock or a copy** ([sym.rs](../src/sym.rs)), which speeds calls of primitives,
+  sorting, and sending symbols.
+* **Writes and updates work column by column:** bulk `insert` no longer makes a list for every row, and `update` builds
+  columns of their types.
+* **`xasc` and `xdesc`** grade one typed column at a time.
+* **A faster hash function** (foldhash) for grouping, joins, `in`, indexes and the symbol table.
+* **`.Q.gc` asks the allocator to give memory back.** After the TPC-H tables were dropped, the process held 909 MB, and
+  72 MB after `.Q.gc[]`.
+
 ## After the performance changes
 
 The seven [recommendations](#recommendations) below were carried out, except that new tables are still created in two

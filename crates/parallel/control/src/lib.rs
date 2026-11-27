@@ -146,7 +146,7 @@ impl Inner {
             ws.dist
                 .iter()
                 .filter(|(name, mode)| !matches!(mode, DistMode::Replicated) && ws.vars.contains_key(name))
-                .map(|(&name, _)| resolve(name))
+                .map(|(&name, _)| resolve(name).into())
                 .collect()
         });
         let shards = self.shards();

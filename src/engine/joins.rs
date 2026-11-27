@@ -6,8 +6,8 @@ use crate::engine::ops::{first_rows, group_ids};
 use crate::error::{KError, KResult};
 use crate::sym::{intern, resolve, SymId};
 use crate::types::*;
+use foldhash::{HashMap, HashMapExt};
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Numbers for the rows of the key columns `left` and of `right` such that equal keys share one. The keys of `right` are
@@ -37,6 +37,9 @@ fn key_buckets(left: &[&ColVec], nleft: usize, right: &[&ColVec], nright: usize)
 /// The row of `kt` with the key of each row of `keys` (`None` where it has none): one pass over the keys of `kt`,
 /// without copying them where there is one key column.
 pub fn match_keys(kt: &KeyedTable, keys: &[&ColVec], nrows: usize) -> Vec<Option<usize>> {
+    if let Some(found) = crate::index::key_rows(&kt.keys.vals, keys, nrows) {
+        return found;
+    }
     if let ([have], [want]) = (kt.keys.vals.as_slice(), keys) {
         if have.type_num() == want.type_num() && want.len() < have.len() {
             if let (Some(wanted), Some(have)) = (want.key_bits(), have.key_bits()) {
@@ -56,6 +59,9 @@ pub fn match_keys(kt: &KeyedTable, keys: &[&ColVec], nrows: usize) -> Vec<Option
 
 /// Probe row index in `kt` for each row of `left_key_cols` (`None` on miss).
 fn probe_keyed_table(kt: &KeyedTable, left_key_cols: &[&ColVec], nrows: usize) -> Vec<Option<usize>> {
+    if let Some(found) = crate::index::key_rows(&kt.keys.vals, left_key_cols, nrows) {
+        return found;
+    }
     // The index that a key column's attribute gives spares a few probes of a large table from reading every key.
     let few = nrows.saturating_mul(4) < kt.nrows();
     if few && kt.keys.ncols() == 1 && crate::index::finds(&kt.keys.vals[0]) && kt.keys.vals[0].type_num() == left_key_cols[0].type_num() {

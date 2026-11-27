@@ -36,7 +36,26 @@ const BASE36_DIGITS: &str = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 /// The most that `.Q.gz` unpacks.
 const LARGEST_UNPACKED: u64 = 1 << 31;
 
+/// Ask the allocator to give the memory that it holds free back to the system.
+fn release_memory() {
+    #[cfg(feature = "fast-alloc")]
+    {
+        use libmimalloc_sys as _;
+        extern "C" {
+            fn mi_collect(force: bool);
+        }
+        // SAFETY: it takes no pointers and may be called on any thread; each has memory of its own to give back
+        let collect = || unsafe { mi_collect(true) };
+        rayon::broadcast(|_| collect());
+        collect();
+    }
+}
+
 pub fn arity(name: &str) -> Option<usize> {
+    // (they are all in namespaces, so the other names, as of the primitives, are not looked for)
+    if !name.starts_with('.') {
+        return None;
+    }
     FUNCTIONS.iter().chain(&markup::FUNCTIONS).find(|f| f.0 == name).map(|f| f.1)
 }
 
@@ -375,8 +394,12 @@ impl Engine<'_> {
                 named
             }
             ".Q.def" => defaults(x, y)?,
-            // (memory is freed as values are dropped, so there is nothing left to collect)
-            ".Q.gc" => K::Long(0),
+            // (values are freed as they are dropped, but the allocator keeps their memory for the next ones; how much
+            // it then gives back is not measured)
+            ".Q.gc" => {
+                release_memory();
+                K::Long(0)
+            }
             ".Q.w" => {
                 let names = ["used", "heap", "peak", "wmax", "mmap", "mphy", "syms", "symw"].map(intern).to_vec();
                 // (nulls: not measured)

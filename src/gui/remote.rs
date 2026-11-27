@@ -96,7 +96,7 @@ impl Backend for RemoteBackend {
 
     fn current_namespace(&mut self) -> String {
         if let Ok(K::Sym(s)) = self.client.query_str("\\d") {
-            self.ns = resolve(s);
+            self.ns = resolve(s).into();
         }
         self.ns.clone()
     }
