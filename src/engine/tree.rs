@@ -182,6 +182,7 @@ pub fn to_tree(e: &Expr, ns: &str) -> KResult<K> {
             list(items)
         }
         Expr::Juxt { func, arg } => list(vec![tree(func)?, tree(arg)?]),
+        Expr::Compose(..) => return Err(KError::nyi("the parse tree of a composition")),
         Expr::Adverb { kind, func } => match func_of(e, ns) {
             Some(f) => K::Func(f),
             None => list(vec![prim(adverb_word(*kind)), tree(func)?]),

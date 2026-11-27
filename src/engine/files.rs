@@ -3,7 +3,7 @@
 //! from the workspace's directory, if it has one.
 use crate::engine::{ops, Engine, Event, Host};
 use crate::error::{KError, KResult};
-use crate::ipc::{encode_k_payload, IpcClient, Outbox};
+use crate::ipc::{encode_error_payload, encode_k_payload, IpcClient, Outbox};
 use crate::storage;
 use crate::sym::{intern, resolve, SymId};
 use crate::types::*;
@@ -136,8 +136,7 @@ fn append(path: &Path, x: &K, text: bool) -> KResult<()> {
     let bytes = if text {
         text_bytes(x, true)?
     } else if storage::holds_value(path) {
-        let joined = ops::eval_binary_prim(",", &storage::read_flat_k(path)?, x)?;
-        return storage::write_flat_k(path, &joined);
+        return storage::append_value(path, x);
     } else {
         raw_bytes(x)?
     };
@@ -262,6 +261,68 @@ impl Engine<'_> {
             }
         }
         Ok(K::Null)
+    }
+
+    /// `-11!x` runs the messages of the log `x` as asynchronous messages from a client are run (`.z.ps`, else their
+    /// values) and gives their number; `-11!(n;x)` runs the first `n`. `-11!(-2;x)` runs none: it gives the number of
+    /// good ones and, if the log is damaged after them, the number of bytes they take.
+    pub(crate) fn replay_log(&mut self, x: &K) -> KResult<K> {
+        let (n, file) = match x {
+            K::Vector(ColVec::General(_, parts)) if parts.len() == 2 => (parts[0].as_i64()?, &parts[1]),
+            file => (-1, file),
+        };
+        if n < -2 {
+            return Err(KError::domain("-11! takes -1, -2 or a number of messages"));
+        }
+        let path = storage::path_of(self.ws, file)?;
+        // (the messages see the globals, from the root namespace)
+        let (namespace, locals) = (std::mem::take(&mut self.session.current_ns), std::mem::take(&mut self.locals));
+        let ran = storage::read_log(&path, u64::try_from(n).unwrap_or(u64::MAX), |message| {
+            if n == -2 {
+                return Ok(());
+            }
+            match self.ws.vars.get(&intern(".z.ps")).cloned() {
+                Some(handler) => self.apply_value(&handler, &[Some(message)]),
+                None => self.eval_message(&message),
+            }
+            .map(|_| ())
+        });
+        (self.session.current_ns, self.locals) = (namespace, locals);
+        match ran? {
+            (count, Some(bytes)) if n == -2 => Ok(K::Vector(ColVec::Long(Attr::None, Arc::new(vec![count as i64, bytes as i64])))),
+            (count, Some(_)) => Err(KError::new("badtail", format!("the log is damaged after {count} messages"))),
+            (count, None) => Ok(K::Long(count as i64)),
+        }
+    }
+
+    /// `-30!(::)`, while a client's request is answered, puts the answer off; `-30!(handle; isError; message)` gives it.
+    pub(crate) fn defer_response(&mut self, x: &K) -> KResult<K> {
+        self.ws.writable()?;
+        if *x == K::Null {
+            let asking = self.session.client.filter(|_| self.session.deferred.is_some()).and_then(|c| self.client(c.0));
+            let client = asking.ok_or_else(|| KError::domain("-30!(::) puts off the answer to a client's synchronous request"))?;
+            if self.session.deferred.replace(true) == Some(false) {
+                client.defer();
+            }
+            return Ok(K::Null);
+        }
+        if x.count() != 3 {
+            return Err(KError::length("-30! takes :: or (handle; isError; message)"));
+        }
+        let part = |i| ops::index_k(x, &[Some(K::Long(i))]);
+        let (h, message) = (part(0)?.as_i64()?, part(2)?);
+        let payload = match part(1)? {
+            K::Bool(false) => encode_k_payload(&message.untagged()),
+            K::Bool(true) => {
+                let signal = message.as_str().ok_or_else(|| KError::ty("-30! takes the error as a string or a symbol"))?;
+                encode_error_payload(&KError::signal(signal))
+            }
+            _ => return Err(KError::ty("-30! takes a boolean that says whether the answer is an error")),
+        };
+        match i32::try_from(h).ok().and_then(|h| self.client(h)) {
+            Some(client) if client.answer_later(payload) => Ok(K::Null),
+            _ => Err(KError::domain(format!("handle {h} is not expecting a response"))),
+        }
     }
 
     /// The value a global name holds, to be changed: for a file not yet there, the empty list.

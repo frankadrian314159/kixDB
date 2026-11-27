@@ -29,7 +29,7 @@ A function assigned to one of these names is called by `kix-serve`, `kix -p` and
 | --- | --- | --- |
 | `.z.pw` | user (symbol), password (string) | a client connects, after `-u`; only `1b` lets it in |
 | `.z.po`, `.z.pc` | the client's handle | after a client is let in, and after it leaves (`.z.pc` also when a server that was connected to closes) |
-| `.z.pg`, `.z.ps` | the message | a synchronous or asynchronous request, in place of evaluating it (`.z.ps` also what a server sends) |
+| `.z.pg`, `.z.ps` | the message | a synchronous or asynchronous request, in place of evaluating it (`.z.ps` also what a server sends, and what `-11!` replays) |
 | `.z.bm` | `(handle; bytes)` | a message cannot be read; the connection is then closed |
 | `.z.ts` | the time (UTC timestamp) | every `\t` milliseconds, in `kix` and `kix-serve` |
 | `.z.vs` | name, `()` | a global in the root namespace is set (the indices of an amend are not given) |
@@ -76,11 +76,45 @@ hclose first subs                              / send what waits, then disconnec
   restrict it.
 * A cluster's control node does not send to its clients (`'nyi`).
 
+## Putting off an answer
+
+While it answers a client's synchronous request, a server may put the answer off and give it later, from another request
+or the timer:
+
+```q
+.z.pg: {$[x ~ "wait"; [waiting:: .z.w; -30!(::)]; value x]}
+-30!(waiting; 0b; 42)                          / the answer
+-30!(waiting; 1b; "gave up")                   / or an error
+```
+
+`-30!(::)` outside such a request is `'domain`, as is an answer for a handle that is owed none. A request that signals
+an error after `-30!(::)` is answered with the error at once.
+
+## Tickerplant systems
+
+The scripts of KX's [kdb-tick](https://github.com/KxSystems/kdb-tick) (`tick.q`, `tick/u.q`, `tick/r.q`) have been run
+unchanged, with a schema in `tick/sym.q`, through publishing, replay and an end of day. kixDB does not include them. In
+the directory that holds them, with a directory `sym` for the history:
+
+```
+kix tick.q -p 5010 -- sym .                    # the tickerplant (add -t 1000 to publish in batches)
+kix sym -p 5012                                # the history
+kix tick/r.q -p 5011 -- :5010 :5012            # the real-time database
+```
+
+* A script's own arguments come after `--`.
+* `kix` goes on serving when its input ends while it listens or its timer runs, so it can be started in the background
+  with `</dev/null`.
+* The history is opened as a durable workspace, which writes `kix.wal` and `kix.lock` into `sym`.
+* Logs are [kixDB's own](storage.md#logs): one that a kdb+ tickerplant wrote cannot be replayed.
+* A server cannot call a client and wait for the answer (`h msg` of a client's handle is `'nyi`).
+
 ## Shell commands
 
 `\cmd` and `system "cmd"` run what is not one of q's own commands in the system's shell (`cmd /C` on Windows, else
 `sh -c`) and give the lines it prints. `\cd` gives the directory commands run in, which is where relative paths start:
-the workspace's directory, else the process's. (`\cd dir` is not implemented.)
+the workspace's directory, else the process's, until `\cd dir` chooses another (for every session of the workspace,
+a client's included).
 
 ```q
 system "ls data"                    / or \ls data

@@ -3,15 +3,18 @@
 ## kix
 
 ```
-kix [DATA_DIR | SCRIPT.q] [-D dir] [-p port] [--connect host[:port]] [-U user] [-P password] [-Q expr]... [-i script.q]...
-    [--allow-shell]
+kix [DATA_DIR | SCRIPT.q] [-D dir] [-p port] [-t ms] [--connect host[:port]] [-U user] [-P password] [-Q expr]...
+    [-i script.q]... [--allow-shell] [-- ARGS]
 ```
 
 Without a data directory the workspace is in memory. `-Q` (also `-q`, `-c`) and `-i` (also `-f`) run an expression or a
-script and exit. `-p` serves the workspace over IPC on the loopback address, without a password. Input continues over
-lines while a bracket, brace or string is open.
+script and exit. `-p` serves the workspace over IPC on the loopback address, without a password, and `-t` sets the
+timer before the script runs, as `\t` does. Input continues over lines while a bracket, brace or string is open.
 
-q's `\` commands work (see [language.md](language.md#system-commands)), plus `\p [port]` and `\\` to quit. `\t 1000` calls `.z.ts` every second; `.z.pi` and `.z.exit` take the shell's input
+At the end of input that is not typed (a pipe, a file, `</dev/null`), `kix` goes on serving while a port is open or the
+timer runs; `\\` and `exit` end it.
+
+q's `\` commands work (see [language.md](language.md#system-commands)), and `\\` quits. `\t 1000` calls `.z.ts` every second; `.z.pi` and `.z.exit` take the shell's input
 and hear it leave ([callbacks](ipc.md#callbacks)). Arguments after `--` are in `.z.x`.
 
 Any other `\` command runs in the system's shell (`\ls`; see [shell commands](ipc.md#shell-commands)), unless the shell

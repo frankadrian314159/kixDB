@@ -23,6 +23,9 @@ q)quote: ([] time: 09:29:00 09:30:30; sym: `AAPL`MSFT; bid: 179.5 399.5)
 q)aj[`sym`time; trade; quote]
 ```
 
+The scripts of kdb+'s standard tick system (tickerplant, real-time and historical database)
+[run unchanged](docs/ipc.md#tickerplant-systems), with logs in kixDB's own format.
+
 Shell commands (`\ls`, `system "ls"`) run in a shell that serves no clients; a server runs them only with
 `--allow-shell`, as [any client then can run programs](docs/ipc.md#shell-commands).
 

@@ -22,7 +22,8 @@ enum AttrIndex {
 }
 
 type CacheKey = (usize, usize, u8);
-type CacheEntry = (Weak<dyn Any + Send + Sync>, Arc<AttrIndex>);
+/// A column and its index, if that has been built.
+type CacheEntry = (Weak<dyn Any + Send + Sync>, Option<Arc<AttrIndex>>);
 
 static INDEX_CACHE: LazyLock<Mutex<HashMap<CacheKey, CacheEntry>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -67,13 +68,18 @@ fn get_or_build_index(cv: &ColVec) -> Option<Arc<AttrIndex>> {
         return None;
     }
     let (key, backing) = backing_identity(cv);
-    {
+    let held = {
         let cache = INDEX_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((weak, idx)) = cache.get(&key) {
-            if weak.upgrade().is_some() {
-                return Some(idx.clone());
-            }
-        }
+        cache.get(&key).filter(|(weak, _)| weak.upgrade().is_some()).map(|(_, index)| index.clone())
+    };
+    if let Some(Some(index)) = held {
+        return Some(index);
+    }
+    // a grouped column is one that grows: it is indexed the second time it is looked in as it is, so that one that is
+    // added to between lookups is read through and not indexed each time
+    if attr == Attr::Grouped && held.is_none() {
+        remember_index(key, &backing, None);
+        return None;
     }
     let n = cv.len();
     let built = match attr {
@@ -108,15 +114,18 @@ fn get_or_build_index(cv: &ColVec) -> Option<Arc<AttrIndex>> {
         _ => return None,
     };
     let arc_idx = Arc::new(built);
-    let mut cache = INDEX_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if cache.len() >= 256 {
-        cache.retain(|_, (w, _)| w.strong_count() > 0);
-        if cache.len() >= 256 {
-            cache.clear();
-        }
-    }
-    cache.insert(key, (Arc::downgrade(&backing), arc_idx.clone()));
+    remember_index(key, &backing, Some(arc_idx.clone()));
     Some(arc_idx)
+}
+
+fn remember_index(key: CacheKey, backing: &Arc<dyn Any + Send + Sync>, index: Option<Arc<AttrIndex>>) {
+    let mut cache = INDEX_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    // (an index goes with the column it was made from)
+    cache.retain(|_, (w, _)| w.strong_count() > 0);
+    if cache.len() >= 256 {
+        cache.clear();
+    }
+    cache.insert(key, (Arc::downgrade(backing), index));
 }
 
 // ----- The keys of keyed tables -------------------------------------------------------------------------------------
@@ -324,6 +333,7 @@ pub fn finds(hay: &ColVec) -> bool {
     match hay.attr() {
         Attr::None => false,
         Attr::Sorted => !hay.is_list(),
+        Attr::Grouped => get_or_build_index(hay).is_some(),
         _ => true,
     }
 }

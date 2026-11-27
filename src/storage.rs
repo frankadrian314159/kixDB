@@ -1,6 +1,7 @@
 //! kdb+-style on-disk storage:
 //! - Flat serialized `K` files (`` `:path set val `` / `` get `:path ``)
 //! - Splayed tables (`` `:dir/table/ set t `` -> `.d` column order + one binary column file per column + `sym` enumeration)
+//! - Logs: lists appended to item by item, as a tickerplant's log of messages is
 //! - Partitioned HDB directories (`dir/2026.11.24/trade/` via `.Q.dpft` and `\l dir`, with predicate partition pruning!)
 //! - `0:` delimited CSV parsing & formatting and `1:` binary reads
 use crate::ast::Expr;
@@ -10,11 +11,12 @@ use crate::ipc::{decode_k_payload, encode_k_stored};
 use crate::sym::{intern, resolve, SymId};
 use crate::types::*;
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const FLAT_MAGIC: [u8; 4] = [0xfe, 0x20, b'K', b'X'];
+const LOG_MAGIC: [u8; 4] = [0xfe, 0x20, b'K', b'L'];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PartKind {
@@ -35,6 +37,8 @@ pub struct PartitionedTable {
     pub name: SymId,
     pub part_col: SymId,
     pub kind: PartKind,
+    /// The database's directory.
+    pub root: PathBuf,
     /// The partitions that queries see, in order, and those that `.Q.view` hides.
     pub slices: Vec<PartitionSlice>,
     pub hidden: Vec<PartitionSlice>,
@@ -49,9 +53,7 @@ type Partition = (PartKind, SymId, K, PathBuf);
 /// directories that its `par.txt` lists, if it has one.
 pub fn partition_dirs(ws: &Workspace, dir: &Path) -> KResult<Vec<Partition>> {
     let mut roots = vec![dir.to_path_buf()];
-    if let Ok(listed) = fs::read_to_string(dir.join("par.txt")) {
-        roots.extend(listed.lines().map(str::trim).filter(|l| !l.is_empty()).map(|l| resolve_fs_path(ws, l.trim_start_matches(':'))));
-    }
+    roots.extend(segments(dir).iter().map(|s| resolve_fs_path(ws, s)));
     let mut found = Vec::new();
     for root in roots {
         let missing = |e: std::io::Error| KError::io(format!("cannot read the partitions in '{}': {e}", root.display()));
@@ -67,15 +69,23 @@ pub fn partition_dirs(ws: &Workspace, dir: &Path) -> KResult<Vec<Partition>> {
     Ok(found)
 }
 
+/// The directories that the `par.txt` of the database in `dir` lists, as they are written there.
+pub fn segments(dir: &Path) -> Vec<String> {
+    let listed = fs::read_to_string(dir.join("par.txt")).unwrap_or_default();
+    listed.lines().map(|l| l.trim().trim_start_matches(':').to_string()).filter(|l| !l.is_empty()).collect()
+}
+
 fn resolve_fs_path(ws: &Workspace, rel: &str) -> PathBuf {
-    let p = Path::new(rel);
-    if p.is_absolute() {
-        p.to_path_buf()
-    } else if let Some(base) = &ws.data_dir {
-        base.join(p)
-    } else {
-        p.to_path_buf()
+    match base_directory(ws) {
+        // (joining an absolute path gives that path)
+        Some(base) => base.join(rel),
+        None => PathBuf::from(rel),
     }
+}
+
+/// The directory that relative paths are taken from, if it is not the process's: that of `\cd`, else the workspace's.
+pub(crate) fn base_directory(ws: &Workspace) -> Option<PathBuf> {
+    ws.host.cwd.lock().unwrap_or_else(|e| e.into_inner()).clone().or_else(|| ws.data_dir.clone())
 }
 
 /// The path that a file symbol or string (`` `:path ``) stands for.
@@ -92,10 +102,84 @@ pub fn create_parent(path: &Path) -> KResult<()> {
     Ok(())
 }
 
-/// Whether the file holds a `q` value, as `set` writes one.
-pub fn holds_value(path: &Path) -> bool {
+/// The first bytes of the file, which say what it holds.
+fn magic(path: &Path) -> Option<[u8; 4]> {
     let mut start = [0u8; 4];
-    fs::File::open(path).and_then(|mut f| f.read_exact(&mut start)).is_ok() && start == FLAT_MAGIC
+    fs::File::open(path).and_then(|mut f| f.read_exact(&mut start)).ok().map(|_| start)
+}
+
+/// Whether the file holds a `q` value, as `set` writes one, or appending to one does.
+pub fn holds_value(path: &Path) -> bool {
+    matches!(magic(path), Some(FLAT_MAGIC | LOG_MAGIC))
+}
+
+/// The items of a log that `x` adds, each as its length, its checksum and its value.
+fn log_records<'a>(items: impl IntoIterator<Item = &'a K>) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for item in items {
+        let payload = encode_k_stored(item);
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+        bytes.extend_from_slice(&payload);
+    }
+    bytes
+}
+
+/// Join `x` to the value that the file holds. A general list that is added to becomes a log, so that what is added
+/// later costs only itself.
+pub fn append_value(path: &Path, x: &K) -> KResult<()> {
+    let items: Option<Vec<K>> = match x {
+        K::Vector(v) => Some((0..v.len()).map(|i| v.get_atom(i)).collect()),
+        K::Dict(_) | K::Table(_) | K::KeyedTable(_) => None,
+        atom => Some(vec![atom.clone()]),
+    };
+    if let (Some(items), Some(LOG_MAGIC)) = (&items, magic(path)) {
+        return Ok(fs::OpenOptions::new().append(true).open(path)?.write_all(&log_records(items))?);
+    }
+    match (read_flat_k(path)?, items) {
+        (K::Vector(ColVec::General(_, held)), Some(items)) => {
+            Ok(fs::write(path, [LOG_MAGIC.to_vec(), log_records(held.iter().chain(&items))].concat())?)
+        }
+        (held, _) => write_flat_k(path, &crate::engine::ops::eval_binary_prim(",", &held, x)?),
+    }
+}
+
+/// The next item of a log, of which `left` bytes remain, unless what follows is cut short or damaged.
+fn next_record(file: &mut impl Read, left: u64, record: &mut Vec<u8>) -> Option<K> {
+    let mut head = [0u8; 8];
+    file.read_exact(&mut head).ok()?;
+    let length = u32::from_le_bytes([head[0], head[1], head[2], head[3]]);
+    if u64::from(length) + 8 > left {
+        return None;
+    }
+    record.resize(length as usize, 0);
+    file.read_exact(record).ok()?;
+    if crc32fast::hash(record).to_le_bytes() != head[4..] {
+        return None;
+    }
+    decode_k_payload(record, 0).ok().filter(|(_, used)| *used == record.len()).map(|(item, _)| item)
+}
+
+/// Give `each` the first `limit` items of the log, or of the list, that the file holds. Returns how many it was given
+/// and, if what follows them in the log is damaged, how many of its bytes are good.
+pub fn read_log(path: &Path, limit: u64, mut each: impl FnMut(K) -> KResult<()>) -> KResult<(u64, Option<u64>)> {
+    if magic(path) != Some(LOG_MAGIC) {
+        let K::Vector(list) = read_flat_k(path)? else { return Err(KError::ty("the file does not hold a list")) };
+        let count = limit.min(list.len() as u64);
+        (0..count as usize).try_for_each(|i| each(list.get_atom(i)))?;
+        return Ok((count, None));
+    }
+    let mut file = BufReader::new(fs::File::open(path)?);
+    let size = file.get_ref().metadata()?.len();
+    file.read_exact(&mut [0u8; 4])?;
+    let (mut good, mut count, mut record) = (4, 0, Vec::new());
+    while count < limit && good < size {
+        let Some(item) = next_record(&mut file, size - good, &mut record) else { return Ok((count, Some(good))) };
+        each(item)?;
+        good += 8 + record.len() as u64;
+        count += 1;
+    }
+    Ok((count, None))
 }
 
 /// The bytes of `` `:file ``, or the part of them that ``(`:file; offset; length)`` names.
@@ -126,6 +210,19 @@ pub fn write_flat_k(path: &Path, val: &K) -> KResult<()> {
 }
 
 pub fn read_flat_k(path: &Path) -> KResult<K> {
+    if magic(path) == Some(LOG_MAGIC) {
+        let mut items = Vec::new();
+        let read = read_log(path, u64::MAX, |item| {
+            items.push(item);
+            Ok(())
+        })?;
+        if read.1.is_some() {
+            return Err(KError::io(format!("damaged log '{}' (see -11!(-2;file))", path.display())));
+        }
+        let mut list = K::Vector(ColVec::from_atoms(items));
+        list.pack();
+        return Ok(list);
+    }
     let buf = fs::read(path)?;
     if buf.len() < 8 || buf[..4] != FLAT_MAGIC {
         return Err(KError::io(format!("invalid kixdb binary file '{}'", path.display())));
@@ -239,6 +336,7 @@ pub fn mount_hdb_dir(ws: &mut Workspace, dir: &Path) -> KResult<Vec<SymId>> {
                     name: tname,
                     part_col: pcol,
                     kind: kind.clone(),
+                    root: dir.to_path_buf(),
                     slices: Vec::new(),
                     hidden: Vec::new(),
                     cols: Vec::new(),

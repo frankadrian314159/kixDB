@@ -55,6 +55,8 @@ pub enum Expr {
     Apply { target: Box<Expr>, args: Vec<Option<Expr>> },
     /// Juxtaposition application `f x` where `f` is an arbitrary expression (`{x+1} 5`, `(+/) 1 2 3`).
     Juxt { func: Box<Expr>, arg: Box<Expr> },
+    /// `f g@`: what is applied to a verb left waiting for its argument is composed with it.
+    Compose(Box<Expr>, Box<Expr>),
     /// Adverb derived expression (`f'`, `f/`, `f\`, `f':`, `f/:`, `f\:`).
     Adverb { kind: AdverbKind, func: Box<Expr> },
     /// Assignment: `name : expr` (`global = false`) or `name :: expr` (`global = true`).
@@ -117,7 +119,7 @@ macro_rules! children {
                 out.push(& $($m)? **lhs);
                 out.push(& $($m)? **rhs);
             }
-            Expr::Juxt { func, arg } => {
+            Expr::Compose(func, arg) | Expr::Juxt { func, arg } => {
                 out.push(& $($m)? **func);
                 out.push(& $($m)? **arg);
             }

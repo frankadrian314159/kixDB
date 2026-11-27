@@ -28,6 +28,8 @@ struct Queue {
     pushed: usize,
     /// An answer is queued and not yet written.
     answering: bool,
+    /// The requests whose answers have been put off (`-30!`).
+    owed: usize,
     /// What is written to, and whether to compress: taken out by the thread that is writing (`None` before the client
     /// has been let in).
     sink: Option<(Box<dyn Write + Send>, bool)>,
@@ -136,6 +138,29 @@ impl Outbox {
         } else {
             Ok(())
         }
+    }
+
+    /// Note that the answer to a request will be given later.
+    pub(crate) fn defer(&self) {
+        self.queue().owed += 1;
+    }
+
+    /// Take back a `defer`; whether an answer was still owed.
+    pub(super) fn undefer(&self) -> bool {
+        let mut queue = self.queue();
+        let owed = queue.owed > 0;
+        queue.owed -= usize::from(owed);
+        owed
+    }
+
+    /// Queue an answer that was put off, without waiting for it to be written; whether one was owed.
+    pub(crate) fn answer_later(&self, payload: Vec<u8>) -> bool {
+        let owed = self.undefer();
+        if owed {
+            self.add(&mut self.queue(), MSG_RESPONSE, Arc::new(payload));
+            self.0.changed.notify_all();
+        }
+        owed
     }
 
     fn stop_queuing(&self) {

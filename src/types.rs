@@ -951,7 +951,11 @@ impl ColVec {
             if matches!(self, ColVec::General(_, _)) && self.is_empty() && !matches!(other, ColVec::General(_, _)) {
                 return Ok(other.clone());
             }
-            return Ok(self.concat(other));
+            let mut joined = self.concat(other);
+            if self.attr() == Attr::Grouped {
+                joined.set_attr_unchecked(Attr::Grouped);
+            }
+            return Ok(joined);
         }
         // Empty typed target vs empty general source
         if other.is_empty() {

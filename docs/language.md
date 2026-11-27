@@ -70,7 +70,14 @@ Unlike kdb+, which holds positions in the domain:
 * signal `'err`, protected evaluation `@[f;x;handler]` and `.[f;args;handler]`
 * views `v::expression`, which read global names only (those of the view's namespace first), never a query's columns or
   a function's variables; `.z.b` lists the views that read each name, and a view that depends on itself is `'loop`
-* namespaces (`\d .name`)
+* a compound assignment (`n+:1`, `t@:i`) in a function changes the global of that name, unless the function has a local
+  of it. A name with a namespace (`.u.w:x`) is always a global's
+* what is applied to a verb left waiting for its argument composes with it: `(key flip value@) t`, `f: 2#reverse@`. An
+  amend with a place left empty (`@[;`sym;`g#]`, `.[;();:;]`) is a projection like any other
+* namespaces (`\d .name`). A table given by its name (`` `t insert x ``, ``@[`t;...]``, `` delete from `t ``) in a
+  function of a namespace is the root's if the namespace has none of that name; ``@[`.;names;f]`` changes globals
+  of the root, and `` delete a,b from `.ns `` removes names from a namespace
+* `0 x` evaluates `x` here, as a message through a handle is evaluated
 
 ## Verbs
 
@@ -80,16 +87,16 @@ Unlike kdb+, which holds positions in the domain:
 | comparison, logic | `= <> < <= > >= ~ & \| not and or all any null within in like` |
 | lists | `til count first last # _ sublist enlist raze flip reverse rotate distinct where group iasc idesc asc desc rank xrank xprev cut cross inter union except bin binr` |
 | aggregates | `sum prd avg wavg wsum min max med var dev svar sdev cov scov cor` |
-| matrices | `mmu inv lsq` |
+| matrices | `mmu inv lsq`, and `x$y` of float lists and matrices (`mmu`) |
 | running, moving | `sums prds avgs mins maxs deltas ratios differ prev next fills mavg msum mcount mmin mmax mdev ema xbar` |
 | tables | `cols keys meta fkeys xasc xdesc xkey xcol xcols xgroup ungroup insert upsert fby tables views` |
 | strings, casts | `string upper lower trim ltrim rtrim ss ssr vs sv $ md5` |
-| system | `get set value parse eval attr system show getenv setenv ltime gtime -8! -9!` |
-| files, handles | `hopen hclose hcount hsym hdel key read0 read1 save load rsave rload csv 0: 1: -25! -1 -2 1 2` ([storage.md](storage.md#files-and-tables-on-disk), [ipc.md](ipc.md#sending-to-clients)) |
+| system | `get set value parse eval attr system show getenv setenv ltime gtime -8! -9! -11!` ([logs](storage.md#logs)) |
+| files, handles | `hopen hclose hcount hsym hdel key read0 read1 save load rsave rload csv 0: 1: -25! -30! -1 -2 1 2` ([storage.md](storage.md#files-and-tables-on-disk), [ipc.md](ipc.md#sending-to-clients)) |
 | iterators | `each peach over scan prior` (`peach` runs as `each`) |
 
-`.z.p .z.P .z.d .z.D .z.t .z.T .z.n .z.N .z.z .z.Z` give the time and date; `.z.u .z.i .z.o .z.K .z.h .z.c .z.l .z.q
-.z.r` the user and process; `.z.x .z.X .z.f` the command line (`.z.x`: the arguments after `--`; passwords show as
+`.z.p .z.P .z.d .z.D .z.t .z.T .z.n .z.N .z.z .z.Z` give the time and date; `.z.u .z.i .z.o .z.K .z.k .z.h .z.c .z.l
+.z.q .z.r` the user and process (`.z.K` is 4.1 and `.z.k` the date that kdb+ 4.1 was released); `.z.x .z.X .z.f` the command line (`.z.x`: the arguments after `--`; passwords show as
 `***`); `.z.w .z.a .z.H .z.W` connections ([ipc.md](ipc.md#callbacks)). Date and time parts are read with
 `` `year$x `` or `x.year`, `.mm`, `.dd`, `.hh`, `.uu`, `.ss`, `.minute`, `.date` and so on.
 
@@ -138,7 +145,12 @@ parses to a `.kix.table` form, and `'` applied to a named function appears as `e
 `\a` tables, `\b` views, `\v` variables, `\f` functions, `\d` namespace, `\l` load a script or directory, `\t` and `\ts`
 (with `:n` repetitions) timing, `\t 1000` the timer's interval in milliseconds (`\t 0` stops it), `\x name` removes a
 variable, `\w` workspace statistics, `\P` significant digits of floats, `\c` lines and characters
-of printed output, `\cd` the directory. Any other `\` command, and `system` of it, runs in the operating system's shell
+of printed output, `\cd` the directory that relative paths are taken from (`\cd dir` changes it, for the whole
+workspace), `\p` the port (`\p 5010` opens one in `kix`, `\p 0` closes it), `\S` the random seed, `\W` the day that
+weeks start on (0 Saturday; 2, Monday, at first) and `\z` how `"D"$` reads `06/01/2010` (0, month first, at first; 1,
+day first). `\S`, `\W` and `\z` hold for the whole workspace and are not saved with it. Until `\S n` is given, `?`
+draws differently on every run (`\S` then shows `0Ni`); with a seed its draws repeat, though they are not kdb+'s, and
+guids differ still. Any other `\` command, and `system` of it, runs in the operating system's shell
 where that is allowed ([shell commands](ipc.md#shell-commands)).
 
 ## Printing
@@ -165,7 +177,7 @@ digit, unlike kdb+.
 | text and dates | `.Q.f .Q.fmt .Q.id .Q.dd .Q.s .Q.s1 .Q.addmonths` |
 | encoding | `.Q.btoa .Q.atob .Q.sha1 .Q.gz .Q.j10 .Q.x10 .Q.j12 .Q.x12 .Q.addr` |
 | tables | `.Q.ff .Q.fk .Q.ft .Q.ind .Q.V` |
-| databases ([storage.md](storage.md#partitioned-databases-and-column-attributes)) | `.Q.en .Q.ens .Q.dpft .Q.dpfts .Q.chk .Q.view .Q.pv .Q.PV .Q.pf .Q.pt` |
+| databases ([storage.md](storage.md#partitioned-databases-and-column-attributes)) | `.Q.en .Q.ens .Q.dpft .Q.dpfts .Q.dpt .Q.dpts .Q.hdpf .Q.par .Q.chk .Q.view .Q.cn .Q.pn .Q.pv .Q.PV .Q.pd .Q.PD .Q.P .Q.pf .Q.pt .Q.MAP` |
 | files | `.Q.fs .Q.fsn` |
 | functions | `.Q.fc .Q.fu .Q.ts .Q.trp .Q.trpd .Q.sbt .Q.bt .Q.v` |
 | command line, memory | `.Q.opt .Q.def .Q.x .Q.gc .Q.w` |
@@ -184,15 +196,15 @@ A variable assigned one of these names takes its place. Where they differ from k
 ## Not implemented
 
 * `ej` only in bracket form.
-* Deferred responses (`-30!`) and a synchronous call from a server to a client.
-* `\cd dir`, and q's other commands of one character (`\B \C \e \g \o \p \r \s \S \T \u \W \z \_ \1 \2`; the
-  shell has its own `\p`).
+* A synchronous call from a server to a client.
+* q's other commands of one character (`\B \C \e \g \o \r \s \T \u \_ \1 \2`).
+* The parse tree of a composition, and `'[f;g]`.
 * The callbacks of web and socket servers (`.z.ph .z.pp .z.pm .z.ac .z.ws .z.wo .z.wc`), `.z.pq` and `.z.pd`: kixdb has
   none of these.
-* `.z.e .z.ex .z.ey .z.k .z.m .z.M .z.zd`.
+* `.z.e .z.ex .z.ey .z.m .z.M .z.zd`.
 * Reading binary records with `1:`, and compressed files.
-* Log replay (`-11!`), and the rest of the `.Q` namespace: other functions for partitioned databases (such as
-  `.Q.par .Q.dpt .Q.hdpf .Q.cn .Q.pn .Q.pd .Q.P .Q.qp .Q.MAP`), `.Q.hg` and `.Q.hp` (HTTP), `.Q.host`, `.Q.K`, and
+* Reading logs that kdb+ wrote: kixdb's [logs](storage.md#logs) are its own.
+* The rest of the `.Q` namespace: `.Q.qp`, `.Q.bv` and `.Q.vp`, `.Q.hg` and `.Q.hp` (HTTP), `.Q.host`, `.Q.K`, and
   kdb+ internals (`.Q.ipc`, `.Q.prf0`, `.Q.rp`, `.Q.m`).
 * The parts of `.h` that serve web pages (`.h.he .h.hn .h.hp .h.hy .h.ka .h.jx .h.val .h.HOME .h.ht .h.fram .h.logo`):
   kixdb has no web server.

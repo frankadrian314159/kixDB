@@ -26,15 +26,15 @@ fn commands_give_the_lines_they_print() {
         ("\\echo one two", ",\"one two\""),
         ("system \"  echo a&&echo b\"", "(,\"a\";,\"b\")"),
         ("f: {system \"echo \", string x}; f 42", ",\"42\""),
-        ("count system \"cd .\"", "'nyi"),
+        ("system \"cd .\"", "::"),
         ("system \"exit 3\"", "'os"),
         ("@[system; \"exit 1\"; {`caught}]", "`caught"),
         // quotes reach the shell as they are
         ("count system \"echo \\\"a b\\\"\"", "1"),
         // q's own commands are never the shell's
-        ("\\p", "'nyi"),
+        ("\\p", "0i"),
         ("\\o 1", "'nyi"),
-        ("system \"cd elsewhere\"", "'nyi"),
+        ("system \"cd elsewhere\"", "'os"),
     ]);
     // commands run where relative paths start: in the workspace's directory
     let show = if cfg!(windows) { "type" } else { "cat" };

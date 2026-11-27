@@ -31,8 +31,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 // ----- Result & Event types for CLI, GUI, and Cluster -----------------------
@@ -147,6 +147,15 @@ impl<T: Clone> DerefMut for Shared<T> {
     }
 }
 
+/// Opens the port with the number it is given, in place of any it opened before; 0 closes that.
+pub struct Opener(pub Box<dyn Fn(u16) -> KResult<()> + Send + Sync>);
+
+impl std::fmt::Debug for Opener {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Opener")
+    }
+}
+
 /// What a workspace shares with the processes that serve it, and with its copies.
 #[derive(Debug, Default)]
 pub struct Host {
@@ -160,6 +169,16 @@ pub struct Host {
     pub shell: AtomicBool,
     /// The interval of the timer (`\t`), 0 for none.
     pub timer_ms: AtomicU64,
+    /// The port that the process listens on (`\p`), 0 for none.
+    pub port: AtomicU16,
+    /// How `\p` opens a port, in a process that can.
+    pub opener: OnceLock<Opener>,
+    /// The directory that `\cd` chose, from which relative paths are then taken.
+    pub cwd: Mutex<Option<PathBuf>>,
+    /// `\W` and `\z`.
+    pub calendar: Mutex<ops::Calendar>,
+    /// The seed that `\S` set and what draws from it; without one, `?` draws differently on every run.
+    pub random: Mutex<Option<(i32, rand::rngs::StdRng)>>,
     /// Set on a cluster's control node, which does not make the callbacks in `NOT_ON_A_CLUSTER`.
     pub cluster: AtomicBool,
 }
@@ -251,6 +270,8 @@ pub struct SessionState {
     pub display: crate::display::Settings,
     /// While a client's connection or a server's message is served, its handle (`.z.w`) and IPv4 address (`.z.a`).
     pub client: Option<(i32, i32)>,
+    /// While a client's synchronous request is answered, whether the answer has been put off (`-30!`).
+    pub deferred: Option<bool>,
     /// Set (from any thread) to stop what the session is evaluating before its next step, with `'stop`.
     pub cancel: Arc<AtomicBool>,
 }
@@ -263,6 +284,7 @@ impl SessionState {
             current_ns: String::new(),
             display: Default::default(),
             client: None,
+            deferred: None,
             cancel: Arc::default(),
         }
     }
@@ -323,6 +345,7 @@ impl From<KError> for StepErr {
 impl<'a> Engine<'a> {
     pub fn new(ws: &'a mut Workspace, session: &'a mut SessionState) -> Self {
         crate::display::apply(session.display);
+        ops::use_calendar(*ws.host.calendar.lock().unwrap_or_else(|e| e.into_inner()));
         Self {
             ws,
             session,
@@ -464,6 +487,28 @@ impl<'a> Engine<'a> {
         } else {
             intern(&format!("{}.{s}", self.session.current_ns))
         }
+    }
+
+    /// Whether `name`, given as a symbol to be changed, is the root's although a namespace is current, as in a function
+    /// of one: the namespace has no global of that name and the root has.
+    pub(crate) fn names_the_roots(&self, name: SymId) -> bool {
+        !self.session.current_ns.is_empty() && !self.ws.vars.contains_key(&self.qualify(name)) && self.ws.vars.contains_key(&name)
+    }
+
+    /// Set the global that `name`, given as a symbol, stands for.
+    pub(crate) fn set_named(&mut self, name: SymId, val: K) -> KResult<()> {
+        match self.names_the_roots(name) {
+            true => self.set_globals(vec![(name, Some(val))]),
+            false => self.set_global(name, val),
+        }
+    }
+
+    /// Run `f` with the root as the current namespace.
+    pub(crate) fn in_root<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let namespace = std::mem::take(&mut self.session.current_ns);
+        let result = f(self);
+        self.session.current_ns = namespace;
+        result
     }
 
     pub fn set_global(&mut self, name: SymId, val: K) -> KResult<()> {
@@ -703,7 +748,7 @@ impl<'a> Engine<'a> {
     }
 
     /// The dictionary of the namespace `name` (`.` is the root), if there is one.
-    fn namespace(&self, name: &str) -> Option<K> {
+    pub(crate) fn namespace(&self, name: &str) -> Option<K> {
         let prefix = match name {
             "." => String::new(),
             n if n.starts_with('.') => format!("{n}."),
@@ -821,7 +866,9 @@ impl<'a> Engine<'a> {
                 Ok(Some(K::Time(ms)))
             }
             ".z.K" => Ok(Some(K::Float(4.1))),
-            ".Q.pv" | ".Q.PV" | ".Q.pf" | ".Q.pt" => Ok(self.partition_info(s)),
+            ".Q.pv" | ".Q.PV" | ".Q.pd" | ".Q.PD" | ".Q.pn" | ".Q.pf" | ".Q.pt" | ".Q.P" => self.partition_info(s),
+            // (the day that kdb+ 4.1, which `.z.K` names, was released)
+            ".z.k" => Ok(Some(K::Date(date_from_ymd(2024, 2, 13).unwrap_or(0)))),
             ".z.b" => Ok(Some(self.dependencies())),
             ".z.s" => Ok(self.running.last().map(|lam| K::Func(Func::Lambda(lam.clone())))),
             ".z.i" => Ok(Some(K::Int(std::process::id() as i32))),
@@ -924,6 +971,14 @@ impl<'a> Engine<'a> {
                 Ok(self.eval_binary_dispatch(op_name, &lval, &rval)?)
             }
 
+            Expr::Compose(outer, inner) => {
+                let second = self.eval_step(inner)?;
+                Ok(match (self.eval_step(outer)?, second) {
+                    (K::Func(f), K::Func(g)) => K::Func(Func::Comp(Box::new(f), Box::new(g))),
+                    (f, g) => self.apply_value(&f, &[Some(g)])?,
+                })
+            }
+
             Expr::Juxt { func, arg } => {
                 let rval = self.eval_step(arg)?;
                 let fval = self.eval_step(func)?;
@@ -934,8 +989,13 @@ impl<'a> Engine<'a> {
                 // Special forms: `@[target; i; f; ...]` (protected eval / functional amend) and `.[target; path; f; ...]`!
                 if let Expr::Lit(K::Func(Func::Prim(op_sym))) = &**target {
                     let op_s = resolve(*op_sym);
-                    if (op_s == "@" || op_s == ".") && args.len() >= 3 {
-                        return self.eval_trap_or_amend(op_s, args);
+                    // (with a place left empty, as in `@[;`sym;`g#]`, it is a projection like any other)
+                    if (op_s == "@" || op_s == ".") && args.len() >= 3 && args.iter().all(Option::is_some) {
+                        let mut given = Vec::with_capacity(args.len());
+                        for a in args.iter().flatten() {
+                            given.push(self.eval_step(a)?);
+                        }
+                        return Ok(self.trap_or_amend(op_s, given)?);
                     }
                     if op_s == "?" && (args.len() == 4 || args.len() == 5 || args.len() == 6) {
                         return Ok(self.eval_functional_select(args)?);
@@ -986,8 +1046,11 @@ impl<'a> Engine<'a> {
                 }
 
                 let rhs = self.eval_step(val)?;
+                // (`n+:1` in a function changes the global `n`, unless the function has a local of that name; a name with a
+                // namespace, as `.u.w`, is always a global's)
+                let global = *global || resolve(*name).starts_with('.') || op.is_some() && self.global_to_change(*name).is_some();
                 if op.is_some_and(|op| resolve(op) == ",") {
-                    if let Some(value) = self.append_where_it_is(*name, *global, &rhs)? {
+                    if let Some(value) = self.append_where_it_is(*name, global, &rhs)? {
                         return Ok(value);
                     }
                 }
@@ -1009,7 +1072,7 @@ impl<'a> Engine<'a> {
                     rhs
                 };
 
-                if self.locals.last().is_some_and(|f| !*global || f.contains_key(name)) {
+                if self.locals.last().is_some_and(|f| !global || f.contains_key(name)) {
                     self.locals.last_mut().unwrap().insert(*name, final_val.clone());
                 } else {
                     self.set_global(*name, final_val.clone())?;
@@ -1141,12 +1204,19 @@ impl<'a> Engine<'a> {
         let x = &*ops::unary_given(name, x);
         match name {
             "tables" => {
+                // the tables of the namespace named, else of the current one
+                let namespace = match x {
+                    K::Sym(s) => resolve(*s).trim_end_matches('.').to_string(),
+                    _ => self.session.current_ns.trim_end_matches('.').to_string(),
+                };
+                let mounted = namespace.is_empty().then(|| self.ws.partitioned.keys().copied());
                 let mut syms: Vec<SymId> = self
                     .ws
                     .vars
                     .iter()
-                    .filter_map(|(&k, v)| if matches!(v, K::Table(_) | K::KeyedTable(_)) { Some(k) } else { None })
-                    .chain(self.ws.partitioned.keys().copied())
+                    .filter(|(_, v)| matches!(v, K::Table(_) | K::KeyedTable(_)))
+                    .filter_map(|(&k, _)| namespaces::member(&namespace, k))
+                    .chain(mounted.into_iter().flatten())
                     .collect();
                 syms.sort();
                 syms.dedup();
@@ -1270,16 +1340,25 @@ impl<'a> Engine<'a> {
                 self.apply_value(lhs, &args)
             }
             "set" => self.eval_set(lhs, rhs),
+            // (with a seed set by `\S`, `n?y` draws from it)
+            "?" if matches!(lhs, K::Long(_) | K::Int(_)) => {
+                match self.ws.host.random.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                    Some((_, seeded)) => ops::roll(lhs.as_i64()?, &rhs.unpacked(), seeded),
+                    None => ops::eval_binary_prim(op, lhs, rhs),
+                }
+            }
             "insert" => self.eval_insert(lhs, rhs),
             "upsert" => self.eval_upsert(lhs, rhs),
             "fby" => self.eval_fby(lhs, rhs),
             "0:" => storage::zero_colon(self.ws, lhs, rhs),
             "1:" => storage::one_colon(self.ws, lhs, rhs),
             "!" => {
-                // `-8!x` (IPC serialize to byte vector), `-9!bytes` (IPC deserialize), `-11!logfile`!
+                // `-8!x` (IPC serialize to byte vector), `-9!bytes` (IPC deserialize), `-11!logfile` (replay)
                 if matches!(lhs, K::Long(_) | K::Int(_)) {
                     match lhs.as_i64()? {
+                        -30 => return self.defer_response(rhs),
                         -25 => return self.broadcast(rhs),
+                        -11 => return self.replay_log(rhs),
                         -8 => {
                             let bytes = crate::ipc::encode_k_payload(&rhs.untagged());
                             return Ok(K::Vector(ColVec::Byte(Attr::None, Arc::new(bytes))));
@@ -1316,6 +1395,8 @@ impl<'a> Engine<'a> {
             }
             // (a cluster's control node evaluates on a workspace that its clients are not connected to)
             K::Int(0 | i32::MIN..=-1) if self.ws.host.cluster.load(Ordering::SeqCst) => Err(KError::nyi("sending to a client of a cluster")),
+            // handle 0 is this process: what it is applied to is evaluated as a message is
+            K::Int(0) | K::Long(0) if args.len() == 1 => self.eval_message(args[0].as_ref().unwrap_or(&K::Null)),
             // Symbol handle one-shot IPC `` `:localhost:5000 "1+1" ``
             K::Sym(s) if resolve(*s).starts_with(':') && files::server_address(resolve(*s)).is_some() => {
                 let mut client = self.connect_to(resolve(*s)).unwrap_or_else(|| Err(KError::ipc("not a server")))?;
@@ -1424,6 +1505,7 @@ impl<'a> Engine<'a> {
             ("aj0", 3) => joins::asof_join(&vals[0], &vals[1], &vals[2], false),
             ("ej", 3) => joins::equi_join(&vals[0], &vals[1], &vals[2]),
             ("::", 1) => Ok(vals[0].clone()),
+            ("@" | ".", 3..) => self.trap_or_amend(name, vals.to_vec()),
             ("ssr", 3) => ops::ssr_op(&vals[0].unpacked(), &vals[1], &vals[2]),
             ("wj", 4) => joins::window_join(&vals[0], &vals[1], &vals[2], &vals[3], true, |f, a| self.apply_func(f, a)),
             ("wj1", 4) => joins::window_join(&vals[0], &vals[1], &vals[2], &vals[3], false, |f, a| self.apply_func(f, a)),
@@ -1600,7 +1682,12 @@ impl<'a> Engine<'a> {
                         }
                         return Ok(cur);
                     }
-                    let K::Vector(cv) = &vals[0] else {
+                    // (a dictionary is folded through its values)
+                    let list = match &vals[0] {
+                        K::Dict(d) => &*d.vals,
+                        other => other,
+                    };
+                    let K::Vector(cv) = list else {
                         return Ok(vals[0].clone());
                     };
                     if cv.is_empty() {
@@ -1805,13 +1892,9 @@ impl<'a> Engine<'a> {
     }
 
     /// `@[f; x; err]` (protected evaluation) and `@[d; i; f; [y]]` (functional amend).
-    fn eval_trap_or_amend(&mut self, op: &str, args: &[Option<Expr>]) -> Result<K, StepErr> {
-        let mut v = Vec::with_capacity(args.len());
-        for a in args {
-            v.push(match a {
-                Some(e) => self.eval_step(e)?,
-                None => K::Null,
-            });
+    fn trap_or_amend(&mut self, op: &str, v: Vec<K>) -> KResult<K> {
+        if matches!(v[0], K::Sym(s) if self.names_the_roots(s)) {
+            return self.in_root(|engine| engine.trap_or_amend(op, v));
         }
         // If 3 arguments and `v[0]` is a `Func` or an open handle, this is protected evaluation `@[f; x; handler]` or `.[f; args_list; handler]`!
         let handle = self.open_handle(&v[0]).is_some();
@@ -1846,6 +1929,28 @@ impl<'a> Engine<'a> {
                     return Ok(v[0].clone());
                 }
             }
+            // `@[`.;names;f]` changes the globals of a namespace that are named
+            if let ("@", K::Sym(s), K::Func(f)) = (op, &v[0], &v[2]) {
+                let namespace = resolve(*s).trim_end_matches('.');
+                if namespace.is_empty() || (!self.ws.vars.contains_key(s) && self.namespace(resolve(*s)).is_some()) {
+                    let names = match &v[1] {
+                        K::Vector(names) => (0..names.len()).map(|i| names.get_atom(i)).collect(),
+                        one => vec![one.clone()],
+                    };
+                    for (n, name) in names.iter().enumerate() {
+                        let K::Sym(name) = name else { return Err(KError::ty("a namespace is indexed by names")) };
+                        let full = if namespace.is_empty() { *name } else { intern(&format!("{namespace}.{}", resolve(*name))) };
+                        let held = self.ws.vars.get(&full).cloned().ok_or_else(|| KError::value(resolve(full)))?;
+                        let mut given = vec![held];
+                        if let Some(y) = v.get(3) {
+                            given.push(if matches!(v[1], K::Vector(_)) { amend::part(y, n, names.len())? } else { y.clone() });
+                        }
+                        let new = self.apply_func(f, &given)?;
+                        self.set_globals(vec![(full, Some(new))])?;
+                    }
+                    return Ok(v[0].clone());
+                }
+            }
             let mut inplace_sym = None;
             let base = if let K::Sym(s) = &v[0] {
                 inplace_sym = Some(*s);
@@ -1854,7 +1959,7 @@ impl<'a> Engine<'a> {
                 v[0].clone()
             };
             let K::Func(f) = &v[2] else {
-                return Err(KError::ty("functional amend third argument must be a function").into());
+                return Err(KError::ty("functional amend third argument must be a function"));
             };
             if op == "." {
                 if let K::Vector(path) = &v[1] {
@@ -1889,7 +1994,7 @@ impl<'a> Engine<'a> {
             }
             return Ok(updated);
         }
-        Err(KError::rank("invalid @ / . arguments").into())
+        Err(KError::rank("invalid @ / . arguments"))
     }
 
     /// Amend the element reached by following `path` into nested lists and dictionaries.
@@ -2265,7 +2370,7 @@ impl<'a> Engine<'a> {
                     self.load(&K::sym(&p.to_string_lossy()))
                 } else {
                     let src = std::fs::read_to_string(p)?;
-                    self.eval_str(&src)
+                    self.eval_str(&src).map(|_| K::Null)
                 }
             }
             "P" | "c" => {
@@ -2283,7 +2388,50 @@ impl<'a> Engine<'a> {
             }
             "\\" => Ok(K::Null),
             "cd" if arg.is_empty() => Ok(K::string(&self.directory()?.to_string_lossy())),
-            "cd" => Err(KError::nyi("changing the directory")),
+            "cd" => {
+                self.ws.writable()?;
+                let to = self.directory()?.join(arg);
+                if !to.is_dir() {
+                    return Err(KError::io(format!("{arg}: no such directory")));
+                }
+                *self.ws.host.cwd.lock().unwrap_or_else(|e| e.into_inner()) = Some(to);
+                Ok(K::Null)
+            }
+            "S" => {
+                let mut random = self.ws.host.random.lock().unwrap_or_else(|e| e.into_inner());
+                match arg {
+                    "" | "0N" => return Ok(K::Int(random.as_ref().map_or(NULL_INT, |r| r.0))),
+                    seed => {
+                        let seed: i32 = seed.parse().ok().filter(|&n| n != 0).ok_or_else(|| KError::domain("\\S takes a whole number other than 0"))?;
+                        self.ws.writable()?;
+                        *random = Some((seed, rand::SeedableRng::seed_from_u64(seed as u64)));
+                    }
+                }
+                Ok(K::Null)
+            }
+            "W" | "z" => {
+                let mut held = *self.ws.host.calendar.lock().unwrap_or_else(|e| e.into_inner());
+                if arg.is_empty() {
+                    return Ok(K::Int(i32::from(if cmd == "W" { held.week_start } else { u8::from(held.day_first) })));
+                }
+                let limit = if cmd == "W" { 6 } else { 1 };
+                let n: u8 = arg.parse().ok().filter(|&n| n <= limit).ok_or_else(|| KError::domain(format!("\\{cmd} takes 0 to {limit}")))?;
+                self.ws.writable()?;
+                match cmd {
+                    "W" => held.week_start = n,
+                    _ => held.day_first = n == 1,
+                }
+                *self.ws.host.calendar.lock().unwrap_or_else(|e| e.into_inner()) = held;
+                ops::use_calendar(held);
+                Ok(K::Null)
+            }
+            "p" if arg.is_empty() => Ok(K::Int(i32::from(self.ws.host.port.load(Ordering::SeqCst)))),
+            "p" => {
+                let port = arg.parse().map_err(|_| KError::domain(format!("invalid port '{arg}'")))?;
+                self.ws.writable()?;
+                let opener = self.ws.host.opener.get().ok_or_else(|| KError::nyi("opening a port here (start the process with -p)"))?;
+                (opener.0)(port).map(|_| K::Null)
+            }
             // (q's own commands are `ts`, `cd` and single characters: any other is the operating system's)
             _ if cmd.chars().count() > 1 => self.shell(format!("{cmd} {arg}").trim_end()),
             _ => Err(KError::nyi(format!("unknown system command \\{cmd}"))),

@@ -14,9 +14,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 /// Each function and the number of its arguments.
-const FUNCTIONS: [(&str, usize); 49] = [
+const FUNCTIONS: [(&str, usize); 55] = [
     (".Q.addmonths", 2), (".Q.addr", 1), (".Q.atob", 1), (".Q.bt", 1), (".Q.btoa", 1), (".Q.chk", 1), (".Q.dd", 2), (".Q.def", 2),
-    (".Q.dpft", 4), (".Q.dpfts", 5), (".Q.en", 2), (".Q.ens", 3), (".Q.ind", 2), (".Q.view", 1), (".Q.f", 2), (".Q.fc", 2), (".Q.ff", 2), (".Q.fk", 1), (".Q.fmt", 3), (".Q.fs", 2),
+    (".Q.cn", 1), (".Q.dpft", 4), (".Q.dpfts", 5), (".Q.dpt", 3), (".Q.dpts", 4), (".Q.hdpf", 4), (".Q.MAP", 1), (".Q.par", 3), (".Q.en", 2), (".Q.ens", 3), (".Q.ind", 2), (".Q.view", 1), (".Q.f", 2), (".Q.fc", 2), (".Q.ff", 2), (".Q.fk", 1), (".Q.fmt", 3), (".Q.fs", 2),
     (".Q.fsn", 3), (".Q.ft", 2), (".Q.fu", 2), (".Q.gc", 1), (".Q.gz", 1), (".Q.id", 1), (".Q.j10", 1), (".Q.j12", 1), (".Q.opt", 1), (".Q.qt", 1),
     (".Q.s", 1), (".Q.s1", 1), (".Q.sbt", 1), (".Q.sha1", 1), (".Q.trp", 3), (".Q.trpd", 3), (".Q.ts", 2),
     (".Q.ty", 1), (".Q.v", 1), (".Q.V", 1), (".Q.w", 1), (".Q.x10", 1), (".Q.x12", 1), (".j.j", 1), (".j.jd", 1),
@@ -24,7 +24,7 @@ const FUNCTIONS: [(&str, usize); 49] = [
 ];
 
 /// Those that change the workspace or write files.
-const WRITERS: [&str; 8] = [".Q.chk", ".Q.dpft", ".Q.dpfts", ".Q.en", ".Q.ens", ".Q.opt", ".Q.view", ".kix.dist"];
+const WRITERS: [&str; 11] = [".Q.chk", ".Q.dpft", ".Q.dpfts", ".Q.dpt", ".Q.dpts", ".Q.hdpf", ".Q.en", ".Q.ens", ".Q.opt", ".Q.view", ".kix.dist"];
 
 /// q's control words and the keywords of k.
 const RESERVED: &str = "abs acos asin atan avg bin binr by cor cos cov delete dev div do enlist exec exit exp from getenv \
@@ -57,6 +57,16 @@ pub fn arity(name: &str) -> Option<usize> {
         return None;
     }
     FUNCTIONS.iter().chain(&markup::FUNCTIONS).find(|f| f.0 == name).map(|f| f.1)
+}
+
+/// The name that the global `name` has within `namespace` (`""` for the root), if it is one of that one's own.
+pub fn member(namespace: &str, name: SymId) -> Option<SymId> {
+    let full = resolve(name);
+    let own = match namespace {
+        "" => Some(full),
+        _ => full.strip_prefix(namespace).and_then(|rest| rest.strip_prefix('.')),
+    };
+    own.filter(|n| !n.contains('.')).map(intern)
 }
 
 pub fn constant(name: &str) -> Option<K> {
@@ -414,13 +424,23 @@ impl Engine<'_> {
             }
             ".Q.dpfts" => {
                 let K::Sym(domain) = &args[4] else { return Err(KError::ty(".Q.dpfts takes the domain's name")) };
-                self.write_partition(x, y, &args[2], &args[3], *domain)?
+                self.write_partition(x, y, Some(&args[2]), &args[3], *domain)?
             }
+            ".Q.dpts" => {
+                let K::Sym(domain) = &args[3] else { return Err(KError::ty(".Q.dpts takes the domain's name")) };
+                self.write_partition(x, y, None, &args[2], *domain)?
+            }
+            ".Q.dpt" => self.write_partition(x, y, None, &args[2], intern("sym"))?,
+            ".Q.hdpf" => self.save_day(x, y, &args[2], &args[3])?,
+            ".Q.par" => self.partition_path(x, y, &args[2])?,
+            ".Q.cn" => self.partition_counts(x)?,
+            // (nothing is held mapped: a query reads what it needs)
+            ".Q.MAP" => K::Null,
             ".Q.chk" => self.check_partitions(x)?,
             ".Q.view" => self.view_partitions(x)?,
             // (a partitioned table is loaded whole when it is named, so its rows are indexed like any table's)
             ".Q.ind" => index_k(x, &[Some(y.clone())])?,
-            ".Q.dpft" => self.write_partition(x, y, &args[2], &args[3], intern("sym"))?,
+            ".Q.dpft" => self.write_partition(x, y, Some(&args[2]), &args[3], intern("sym"))?,
             ".j.j" => K::string(&json::write(x, false)),
             ".j.jd" => {
                 let pair = items(x);

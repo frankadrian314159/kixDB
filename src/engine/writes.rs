@@ -15,11 +15,13 @@ pub struct RowChanges {
 
 /// `column` with the type of `target`, as `insert` converts it; `None` where the column would have to change type.
 fn fitted(target: &ColVec, column: &ColVec) -> KResult<Option<ColVec>> {
+    // (a grouped column stays so as it grows)
+    let attr = if target.attr() == Attr::Grouped { Attr::Grouped } else { Attr::None };
     // strings are added to strings where they are; other lists are made anew
     if let ColVec::Strings(..) = target {
         let packed = column.packed().map(|c| c.into_owned());
         return Ok(packed.map(|mut c| {
-            c.set_attr_unchecked(Attr::None);
+            c.set_attr_unchecked(attr);
             c
         }));
     }
@@ -29,7 +31,7 @@ fn fitted(target: &ColVec, column: &ColVec) -> KResult<Option<ColVec>> {
     // (a column of the target's type is taken as it is)
     let same = target.type_num() == column.type_num() && !matches!(target, ColVec::Enum(..)) && !matches!(column, ColVec::Enum(..));
     let mut fitted = if same { column.clone() } else { target.take(0).append_strict(column)? };
-    fitted.set_attr_unchecked(Attr::None);
+    fitted.set_attr_unchecked(attr);
     Ok((fitted.type_num() == target.type_num() && fitted.len() == column.len()).then_some(fitted))
 }
 
