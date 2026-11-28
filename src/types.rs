@@ -1966,7 +1966,7 @@ fn format_float_q(v: f64) -> String {
 /// A datetime (days since 2000.01.01), to the millisecond.
 pub fn format_datetime(days: f64) -> String {
     if !days.is_finite() {
-        return format!("{}z", &crate::display::float(days).replace('n', "N"));
+        return format!("{}z", &crate::display::float(days).replace('n', "N").replace('w', "W"));
     }
     let ms = (days * 86_400_000.0).round() as i64;
     format!("{}T{}", format_date(ms.div_euclid(86_400_000) as i32), format_time(ms.rem_euclid(86_400_000) as i32))

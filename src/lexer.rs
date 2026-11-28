@@ -749,17 +749,11 @@ pub(crate) fn parse_scalar_token(raw: &str) -> KResult<(K, Option<char>)> {
         "0Ne" => return Ok((K::Real(f32::NAN), Some('e'))),
         "0We" => return Ok((K::Real(f32::INFINITY), Some('e'))),
         "-0We" => return Ok((K::Real(f32::NEG_INFINITY), Some('e'))),
-        "0Nd" => return Ok((K::Date(NULL_INT), None)),
-        "0Wd" => return Ok((K::Date(INF_INT), None)),
-        "-0Wd" => return Ok((K::Date(NINF_INT), None)),
-        "0Nm" => return Ok((K::Month(NULL_INT), None)),
-        "0Np" => return Ok((K::Timestamp(NULL_LONG), None)),
-        "0Nn" => return Ok((K::Timespan(NULL_LONG), None)),
-        "0Nu" => return Ok((K::Minute(NULL_INT), None)),
-        "0Nv" => return Ok((K::Second(NULL_INT), None)),
-        "0Nt" => return Ok((K::Time(NULL_INT), None)),
         "0Ng" => return Ok((K::Guid(NULL_GUID), None)),
         _ => {}
+    }
+    if let Some(k) = temporal_null_or_infinity(raw) {
+        return Ok((k, None));
     }
 
     // Datetime (`YYYY.MM.DDThh:mm:ss.mmm`)
@@ -885,6 +879,28 @@ pub(crate) fn parse_scalar_token(raw: &str) -> KResult<(K, Option<char>)> {
     }
 }
 
+/// `0N`, `0W` or `-0W` followed by the letter of a temporal type (`0Nz`, `0Wp`, `-0Wu`).
+fn temporal_null_or_infinity(raw: &str) -> Option<K> {
+    let (body, letter) = raw.split_at_checked(raw.len() - 1)?;
+    let (int, long, float) = match body {
+        "0N" => (NULL_INT, NULL_LONG, f64::NAN),
+        "0W" => (INF_INT, INF_LONG, f64::INFINITY),
+        "-0W" => (NINF_INT, NINF_LONG, f64::NEG_INFINITY),
+        _ => return None,
+    };
+    Some(match letter {
+        "p" => K::Timestamp(long),
+        "m" => K::Month(int),
+        "d" => K::Date(int),
+        "z" => K::Datetime(float),
+        "n" => K::Timespan(long),
+        "u" => K::Minute(int),
+        "v" => K::Second(int),
+        "t" => K::Time(int),
+        _ => return None,
+    })
+}
+
 fn parse_date_str(s: &str) -> KResult<i32> {
     let Some((ys, rest)) = s.split_once('.') else { return Err(KError::syntax(format!("bad date '{s}'"))) };
     let Some((ms, ds)) = rest.split_once('.').filter(|(_, ds)| !ds.contains('.')) else {
@@ -897,7 +913,9 @@ fn parse_date_str(s: &str) -> KResult<i32> {
 }
 
 fn parse_hms_nanos(s: &str) -> KResult<i64> {
-    let Some((hh_s, rest)) = s.split_once(':') else { return Err(KError::syntax(format!("bad time '{s}'"))) };
+    // (an hour may stand alone: `2026.01.01D12`, `0D0`)
+    let hour_only = || (s.len() <= 2 && s.bytes().all(|b| b.is_ascii_digit())).then_some((s, "0"));
+    let Some((hh_s, rest)) = s.split_once(':').or_else(hour_only) else { return Err(KError::syntax(format!("bad time '{s}'"))) };
     let hh: i64 = hh_s.parse().map_err(|_| KError::syntax(format!("bad time '{s}'")))?;
     let (mm_s, ss_opt) = match rest.split_once(':') {
         None => (rest, None),
@@ -993,11 +1011,12 @@ fn coalesce_numeric_vector(atoms: Vec<K>, suf: Option<char>) -> KResult<K> {
     }
     let dom = atoms.iter().find(|a| !matches!(a, K::Long(NULL_LONG))).map(|a| a.type_num());
     if let Some(dt) = dom {
-        if matches!(dt, -12 | -13 | -14 | -16 | -17 | -18 | -19 | -6 | -5) {
+        if matches!(dt, -12 | -13 | -14 | -15 | -16 | -17 | -18 | -19 | -6 | -5) {
             let coerced: Vec<K> = atoms
                 .into_iter()
                 .map(|a| match (dt, a) {
                     (-12, K::Long(NULL_LONG)) => K::Timestamp(NULL_LONG),
+                    (-15, K::Long(NULL_LONG)) => K::Datetime(f64::NAN),
                     (-13, K::Long(NULL_LONG)) => K::Month(NULL_INT),
                     (-14, K::Long(NULL_LONG)) => K::Date(NULL_INT),
                     (-16, K::Long(NULL_LONG)) => K::Timespan(NULL_LONG),

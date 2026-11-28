@@ -3481,10 +3481,8 @@ fn cast_atom_by_name(tname: &str, v: &K) -> KResult<K> {
             n => K::Char(n.as_i64()? as u8),
         },
         "date" => {
-            if let (K::Month(_), Some(ns)) = (v, temporal::nanos(v)) {
-                K::Date(ns.div_euclid(NANOS_PER_DAY) as i32)
-            } else if let K::Timestamp(ns) = v {
-                K::Date(if *ns == NULL_LONG { NULL_INT } else { ns.div_euclid(NANOS_PER_DAY) as i32 })
+            if matches!(v, K::Month(_) | K::Timestamp(_)) {
+                temporal::convert(v, 14)
             } else {
                 let n = v.as_i64()?;
                 K::Date(if n == NULL_LONG { NULL_INT } else { n as i32 })

@@ -30,6 +30,54 @@ fn typed_nulls_infinities_and_temporals() {
 }
 
 #[test]
+fn temporal_nulls_and_infinities_read_back_as_they_print() {
+    let srv = Server::new();
+    let mut c = srv.connect();
+
+    for t in ['p', 'm', 'd', 'z', 'n', 'u', 'v', 't'] {
+        let list = format!("0N{t} 0W{t} -0W{t}");
+        assert_eq!(c.eval(&list).unwrap().to_string(), list);
+        assert_eq!(c.eval(&format!("x: {list}; null x")).unwrap().to_string(), "100b");
+        assert_eq!(c.eval(&format!("-9!-8!{list}")).unwrap().to_string(), list);
+    }
+    assert_eq!(c.eval("(type 0Nz; type -0Wz; null 0N 2026.01.01T12)").unwrap().to_string(), "(-15h;-15h;10b)");
+}
+
+#[test]
+fn an_hour_may_stand_alone_in_a_time_with_a_date_or_days() {
+    let srv = Server::new();
+    let mut c = srv.connect();
+
+    for (short, long) in [
+        ("2026.01.01D0", "2026.01.01D00:00:00"),
+        ("2026.01.01D12 2026.01.01D7", "2026.01.01D12:00 2026.01.01D07:00"),
+        ("2026.01.01T23", "2026.01.01T23:00"),
+        ("0D0 1D12 -1D12", "0D00:00 1D12:00 -1D12:00"),
+        ("\"P\"$\"2026.01.01D12\"", "2026.01.01D12:00"),
+    ] {
+        assert_eq!(c.eval(short).unwrap(), c.eval(long).unwrap(), "{short}");
+    }
+    assert!(c.eval("2026.01.01D123").is_err());
+}
+
+#[test]
+fn temporal_infinities_stay_infinite_in_a_finer_type() {
+    let srv = Server::new();
+    let mut c = srv.connect();
+
+    for (q, expected) in [
+        ("00:00:01 0Wu -0Wu 0Nu", "00:00:01 0Wv -0Wv 0Nv"),
+        ("0D1 0Wu -0Wt", "0D01:00:00.000000000 0Wn -0Wn"),
+        ("2026.01.01D0 0Wd -0Wz", "2026.01.01D00:00:00.000000000 0Wp -0Wp"),
+        ("2026.01.01T0 0Wd -0Wd", "2026.01.01T00:00:00.000 0Wz -0Wz"),
+        ("`date$(0Wm;-0Wm;0Nm)", "0Wd -0Wd 0Nd"),
+        ("(12:00:00<0Wu; 12:00:00>-0Wu; 2026.01.01<0Wm; 2026.01.01>-0Wm; .z.p<0Wd; .z.p>-0Wz)", "111111b"),
+    ] {
+        assert_eq!(c.eval(q).unwrap().to_string(), expected, "{q}");
+    }
+}
+
+#[test]
 fn attributes_and_validation() {
     let srv = Server::new();
     let mut c = srv.connect();

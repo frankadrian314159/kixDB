@@ -5,7 +5,8 @@ Expressions evaluate right to left with no operator precedence: `2 * 3 + 4` is `
 ## Values
 
 Atoms and typed vectors of boolean, guid, byte, short, int, long, real, float, char, symbol, timestamp, month, date,
-datetime, timespan, minute, second and time, with typed nulls and infinities (`0N`, `0W`, `0n`, `0w`); general lists;
+datetime, timespan, minute, second and time, with typed nulls and infinities (`0N`, `0W`, `0n`, `0w`, and the same
+followed by a type's letter: `0Wh`, `0Np`, `-0Wz`); general lists;
 enumerations ([below](#enumerations-foreign-keys-and-linked-columns)); dictionaries; tables and keyed tables; functions. Vectors carry the attributes `` `s# `` `` `u# `` `` `p# `` `` `g# ``.
 Integer arithmetic and aggregates wrap on overflow.
 
@@ -13,7 +14,8 @@ Integer arithmetic and aggregates wrap on overflow.
   down and `mod` takes the divisor's sign. Floats compare as equal within a relative difference of 2^-43.
 * Month, date, datetime and timestamp compare in the finer of two types, as do minute, second, time and timespan. A list
   such as `12:34 01:02:03` takes the finer type, or the type a letter after its last item names (`u v t n`). A date plus a
-  timespan is a timestamp.
+  timespan is a timestamp. An infinity stays one when it is converted to the finer type.
+* In a timestamp, timespan or datetime an hour may stand alone: `2026.01.01D12`, `0D0`, `2026.01.01T9`.
 * A symbol compares only with a symbol (`'type`). Writing a value of another type into a simple list, or adding one with
   `,:`, is `'type`; a general list whose items come to share a type becomes simple. One exception: longs that fit are
   taken into an `int` column of a table by `insert`, `upsert` and `t,:row` (`update` still wants ints).
