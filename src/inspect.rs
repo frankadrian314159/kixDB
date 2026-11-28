@@ -128,7 +128,8 @@ impl Connection {
         }
         if let Some(pt) = g.partitioned.get(&sym).cloned() {
             drop(g);
-            let flip = crate::storage::load_partitioned_filtered(&pt, &[], None, |_| Ok(K::Null)).ok()?;
+            let flip = crate::storage::partitioned_schema_flip(&pt, None, true).ok()?;
+            let nrows: usize = pt.slices.iter().map(|s| crate::storage::slice_row_count(&pt, s).unwrap_or(0)).sum();
             let columns = flip
                 .cols
                 .iter()
@@ -145,8 +146,8 @@ impl Connection {
                 name: name.to_string(),
                 kind: ObjectKind::PartitionedTable,
                 columns,
-                nrows: flip.nrows(),
-                approx_bytes: flip.approx_bytes(),
+                nrows,
+                approx_bytes: pt.mapped_bytes(),
             });
         }
         None
@@ -332,7 +333,8 @@ pub(crate) fn workspace_definition(ws: &Workspace, name: &str) -> KResult<K> {
         return Ok(K::string(&format!("{name}: {}", val.q_repr())));
     }
     if let Some(pt) = ws.partitioned.get(&sym) {
-        if let Ok(flip) = crate::storage::load_partitioned_filtered(pt, &[], None, |_| Ok(K::Null)) {
+        if let Ok(flip) = crate::storage::partitioned_schema_flip(pt, None, true) {
+            let nrows: usize = pt.slices.iter().map(|s| crate::storage::slice_row_count(pt, s).unwrap_or(0)).sum();
             let columns = flip
                 .cols
                 .iter()
@@ -349,8 +351,8 @@ pub(crate) fn workspace_definition(ws: &Workspace, name: &str) -> KResult<K> {
                 name: name.to_string(),
                 kind: ObjectKind::PartitionedTable,
                 columns,
-                nrows: flip.nrows(),
-                approx_bytes: flip.approx_bytes(),
+                nrows,
+                approx_bytes: pt.mapped_bytes(),
             };
             return Ok(K::string(&crate::tools::table_script(&ti)));
         }

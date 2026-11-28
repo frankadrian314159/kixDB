@@ -14,9 +14,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 /// Each function and the number of its arguments.
-const FUNCTIONS: [(&str, usize); 56] = [
-    (".Q.addmonths", 2), (".Q.addr", 1), (".Q.atob", 1), (".Q.bt", 1), (".Q.btoa", 1), (".Q.chk", 1), (".Q.dd", 2), (".Q.def", 2),
-    (".Q.cn", 1), (".Q.dpft", 4), (".Q.dpfts", 5), (".Q.dpt", 3), (".Q.dpts", 4), (".Q.hdpf", 4), (".Q.MAP", 1), (".Q.par", 3), (".Q.en", 2), (".Q.ens", 3), (".Q.ind", 2), (".Q.view", 1), (".Q.f", 2), (".Q.fc", 2), (".Q.ff", 2), (".Q.fk", 1), (".Q.fmt", 3), (".Q.fs", 2),
+const FUNCTIONS: [(&str, usize); 58] = [
+    (".Q.addmonths", 2), (".Q.addr", 1), (".Q.atob", 1), (".Q.bt", 1), (".Q.btoa", 1), (".Q.bv", 1), (".Q.chk", 1), (".Q.dd", 2), (".Q.def", 2),
+    (".Q.cn", 1), (".Q.dpft", 4), (".Q.dpfts", 5), (".Q.dpt", 3), (".Q.dpts", 4), (".Q.hdpf", 4), (".Q.MAP", 1), (".Q.par", 3), (".Q.en", 2), (".Q.ens", 3), (".Q.ind", 2), (".Q.qp", 1), (".Q.view", 1), (".Q.f", 2), (".Q.fc", 2), (".Q.ff", 2), (".Q.fk", 1), (".Q.fmt", 3), (".Q.fs", 2),
     (".Q.fsn", 3), (".Q.ft", 2), (".Q.fu", 2), (".Q.gc", 1), (".Q.gz", 1), (".Q.id", 1), (".Q.j10", 1), (".Q.j12", 1), (".Q.opt", 1), (".Q.qt", 1),
     (".Q.s", 1), (".Q.s1", 1), (".Q.sbt", 1), (".Q.sha1", 1), (".Q.trp", 3), (".Q.trpd", 3), (".Q.ts", 2),
     (".Q.ty", 1), (".Q.v", 1), (".Q.V", 1), (".Q.w", 1), (".Q.x10", 1), (".Q.x12", 1), (".j.j", 1), (".j.jd", 1),
@@ -24,7 +24,7 @@ const FUNCTIONS: [(&str, usize); 56] = [
 ];
 
 /// Those that change the workspace or write files.
-const WRITERS: [&str; 11] = [".Q.chk", ".Q.dpft", ".Q.dpfts", ".Q.dpt", ".Q.dpts", ".Q.hdpf", ".Q.en", ".Q.ens", ".Q.opt", ".Q.view", ".kix.dist"];
+const WRITERS: [&str; 13] = [".Q.bv", ".Q.chk", ".Q.dpft", ".Q.dpfts", ".Q.dpt", ".Q.dpts", ".Q.hdpf", ".Q.en", ".Q.ens", ".Q.MAP", ".Q.opt", ".Q.view", ".kix.dist"];
 
 /// q's control words and the keywords of k.
 const RESERVED: &str = "abs acos asin atan avg bin binr by cor cos cov delete dev div do enlist exec exit exp from getenv \
@@ -82,6 +82,7 @@ pub fn constant(name: &str) -> Option<K> {
         ".Q.t" => K::string(" bg xhijefcspmdznuvts"),
         ".Q.k" => K::Float(4.1),
         ".Q.res" => syms(RESERVED.split(' ').map(intern).collect()),
+        ".Q.vp" => dict(syms(vec![]), K::Vector(ColVec::General(Attr::None, Arc::new(vec![])))),
         _ => return markup::constant(name),
     })
 }
@@ -274,6 +275,62 @@ impl Engine<'_> {
         self.running.iter().rev().map(|lam| K::string(&lam.source)).collect()
     }
 
+    /// `.Q.fc[f; y]`: split vector `y` across Rayon threads, apply vector-function `f` to each chunk, and concatenate.
+    fn eval_q_fc(&mut self, x: &K, y: &K) -> KResult<K> {
+        if let (K::Func(f), K::Vector(cv)) = (x, y) {
+            let nthreads = rayon::current_num_threads();
+            if cv.len() >= 2 && nthreads > 1 && crate::engine::pure::func_reads_only(self.ws, f) {
+                use rayon::prelude::*;
+                let parts = nthreads.min(cv.len());
+                let len = cv.len();
+                let ranges: Vec<(usize, usize)> = (0..parts)
+                    .map(|p| (p * len / parts, (p + 1) * len / parts))
+                    .filter(|(a, b)| a < b)
+                    .collect();
+                let chunks: KResult<Vec<K>> = ranges
+                    .into_iter()
+                    .map(|(a, b)| {
+                        let pair = K::Vector(ColVec::Long(Attr::None, Arc::new(vec![a as i64, (b - a) as i64])));
+                        ops::sublist_op(&pair, y)
+                    })
+                    .collect();
+                let chunks = chunks?;
+                let base_ws = self.ws.snapshot();
+                let base_ns = self.session.current_ns.clone();
+                let base_login = self.session.login.clone();
+                let base_disp = self.session.display;
+                let cancel = self.session.cancel.clone();
+                let par_res: KResult<Vec<K>> = chunks
+                    .into_par_iter()
+                    .map_init(
+                        || {
+                            let mut sess = crate::engine::SessionState::new(0, base_login.clone());
+                            sess.current_ns = base_ns.clone();
+                            sess.display = base_disp;
+                            sess.cancel = cancel.clone();
+                            (base_ws.snapshot(), sess)
+                        },
+                        |(ws, sess), chunk| Engine::new(ws, sess).apply_func(f, &[chunk]),
+                    )
+                    .collect();
+                match par_res {
+                    Ok(mut pieces) if !pieces.is_empty() => {
+                        let mut iter = pieces.drain(..);
+                        let mut acc = iter.next().unwrap();
+                        for next in iter {
+                            acc = ops::concat_k(&acc, &next)?;
+                        }
+                        return Ok(acc);
+                    }
+                    Err(e) if e.signal == "snapshot" && !self.ws.read_only => {}
+                    Err(e) => return Err(e),
+                    _ => {}
+                }
+            }
+        }
+        self.apply_value(x, &[Some(y.clone())])
+    }
+
     /// `.Q.trp` and `.Q.trpd`: as `@[f;x;g]` and `.[f;x;g]`, with `g` given the backtrace too.
     fn trap_with_backtrace(&mut self, f: &K, args: &[Option<K>], handler: &K) -> KResult<K> {
         self.backtrace.clear();
@@ -365,7 +422,7 @@ impl Engine<'_> {
                 K::Sym(s) => self.get_var(*s)?,
                 other => other.clone(),
             },
-            ".Q.fc" => self.apply_value(x, &[Some(y.clone())])?,
+            ".Q.fc" => self.eval_q_fc(x, y)?,
             ".Q.fu" => match y {
                 K::Vector(_) => {
                     let unique = ops::distinct_op(y)?;
@@ -414,7 +471,8 @@ impl Engine<'_> {
                 let names = ["used", "heap", "peak", "wmax", "mmap", "mphy", "syms", "symw"].map(intern).to_vec();
                 // (nulls: not measured)
                 let used = self.ws.approx_memory_bytes() as i64;
-                let values = vec![used, NULL_LONG, NULL_LONG, 0, 0, NULL_LONG, sym_count() as i64, NULL_LONG];
+                let mapped = self.ws.mapped_bytes() as i64;
+                let values = vec![used, NULL_LONG, NULL_LONG, 0, mapped, NULL_LONG, sym_count() as i64, NULL_LONG];
                 dict(syms(names), K::Vector(ColVec::Long(Attr::None, Arc::new(values))))
             }
             ".Q.en" => self.enumerate_symbols(x, y, intern("sym"))?,
@@ -434,8 +492,9 @@ impl Engine<'_> {
             ".Q.hdpf" => self.save_day(x, y, &args[2], &args[3])?,
             ".Q.par" => self.partition_path(x, y, &args[2])?,
             ".Q.cn" => self.partition_counts(x)?,
-            // (nothing is held mapped: a query reads what it needs)
-            ".Q.MAP" => K::Null,
+            ".Q.MAP" => self.map_partitions()?,
+            ".Q.bv" => self.build_virtual(x)?,
+            ".Q.qp" => K::Long(0),
             ".Q.chk" => self.check_partitions(x)?,
             ".Q.view" => self.view_partitions(x)?,
             // (a partitioned table is loaded whole when it is named, so its rows are indexed like any table's)

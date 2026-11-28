@@ -346,6 +346,7 @@ impl Engine<'_> {
 
     /// `hdel`: remove a file or an empty directory.
     pub(crate) fn hdel(&mut self, x: &K) -> KResult<K> {
+        self.ws.writable()?;
         let path = storage::path_of(self.ws, x)?;
         if path.is_dir() {
             fs::remove_dir(path)?;
@@ -400,9 +401,13 @@ impl Engine<'_> {
     pub(crate) fn load(&mut self, x: &K) -> KResult<K> {
         let path = storage::path_of(self.ws, x)?;
         let name = path.file_name().map(|n| intern(&n.to_string_lossy())).ok_or_else(|| KError::domain("load needs a file name"))?;
+        let is_splayed = path.is_dir() && path.join(".d").exists();
         // (the path already starts from the workspace's directory)
         let value = storage::load_file(&path)?;
         self.set_global(name, value)?;
+        if is_splayed {
+            self.ws.splayed.insert(name);
+        }
         Ok(K::Sym(name))
     }
 

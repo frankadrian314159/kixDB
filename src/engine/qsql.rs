@@ -224,17 +224,18 @@ impl<'a> Engine<'a> {
         let outputs = || q.cols.iter().chain(q.by.iter().flatten()).map(|c| &c.expr);
         let reads_listed = matches!(q.kind, QSqlKind::Select | QSqlKind::Exec) && !q.cols.is_empty();
         let needed = if reads_listed { self.names_read(outputs().chain(&q.where_clauses)) } else { None };
+        let can_prefilter = matches!(q.kind, QSqlKind::Select | QSqlKind::Exec) && !query_has_bare_i(q);
         let source_k = match &*q.from {
             Expr::Lit(K::Sym(tname)) => {
                 if matches!(q.kind, QSqlKind::Update | QSqlKind::DeleteRows | QSqlKind::DeleteCols) {
                     inplace_target = Some(*tname);
                 }
-                self.resolve_table_for_query(*tname, &q.where_clauses, needed.as_deref())?
+                self.resolve_table_for_query(*tname, &q.where_clauses, needed.as_deref(), can_prefilter)?
             }
             Expr::Var(tname) => {
                 // If `tname` is a mounted partitioned HDB table, prune partitions using `where_clauses`!
                 if self.has_partitioned(*tname) {
-                    self.resolve_table_for_query(*tname, &q.where_clauses, needed.as_deref())?
+                    self.resolve_table_for_query(*tname, &q.where_clauses, needed.as_deref(), can_prefilter)?
                 } else {
                     self.eval_expr(&q.from)?
                 }
@@ -249,7 +250,7 @@ impl<'a> Engine<'a> {
                 }
                 // (the name is a global's, whatever locals are called)
                 let locals = std::mem::take(&mut self.locals);
-                let table = self.resolve_table_for_query(name, &q.where_clauses, needed.as_deref());
+                let table = self.resolve_table_for_query(name, &q.where_clauses, needed.as_deref(), can_prefilter);
                 self.locals = locals;
                 table?
             }
@@ -1153,6 +1154,22 @@ fn restore_keys(flip: Flip, orig_keys: Option<Vec<SymId>>) -> KResult<K> {
 }
 
 /// The result column names of a qSQL column list (inferred, with suffixes for repeats).
+fn query_has_bare_i(q: &QSql) -> bool {
+    fn bare_i(e: &Expr) -> bool {
+        match e {
+            Expr::Query(_) => false,
+            Expr::Unary { op, arg } if resolve(*op) == "count" && matches!(&**arg, Expr::Var(s) if resolve(*s) == "i") => false,
+            Expr::Var(s) if resolve(*s) == "i" => true,
+            other => other.children().into_iter().any(bare_i),
+        }
+    }
+    q.where_clauses
+        .iter()
+        .chain(q.cols.iter().map(|c| &c.expr))
+        .chain(q.by.iter().flatten().map(|c| &c.expr))
+        .any(bare_i)
+}
+
 pub fn resolve_col_names(specs: &[ColSpec]) -> Vec<SymId> {
     let mut used: HashMap<SymId, usize> = HashMap::new();
     let mut out = Vec::with_capacity(specs.len());

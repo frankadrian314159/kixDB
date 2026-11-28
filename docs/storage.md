@@ -153,7 +153,9 @@ that name (`date`). A `par.txt` file in the database's directory lists further d
 whose partitions belong to it too.
 
 * The columns of a table are those of its last partition. A query that needs one that an older partition lacks signals
-  `'mismatch`; `.Q.chk` gives partitions the tables that they lack, empty, but adds no columns.
+  `'mismatch` until `.Q.bv[]` (or `` .Q.bv[`] ``, which also fills in virtual empty slices where an older partition lacks
+  the table directory altogether) populates `.Q.vp` with empty schema prototypes to backfill missing columns with nulls.
+  `.Q.chk` writes empty splayed tables on disk for partitions that lack them.
 * Assigning to the name of a mounted table replaces it, until the database is mounted again; `\l` of the database
   replaces variables of its tables' names. (A variable that was there before `.Q.dpft`, or that a durable workspace
   restores, stays beside the table: queries read the table, and other uses of the name the variable.)
@@ -168,17 +170,21 @@ whose partitions belong to it too.
   domain) writes without sorting by a field.
 * `.Q.hdpf[address; dir; partition; field]` ends a day: it writes every table of the root namespace, empties it and,
   if a process listens at `address`, has it run `\l .`. The tables are not mounted in the process that writes them.
-* `.Q.cn table` counts the rows of each partition shown, from the table given; `.Q.pn` does so for every table, reading
-  a column of each partition. `.Q.pd` and `.Q.PD` are the partitions' directories (shown, all), `.Q.P` the segments.
-  `.Q.MAP[]` does nothing: nothing is held mapped.
+* `.Q.cn table` counts the rows of each partition shown, from the table's column headers; `.Q.pn` does so for every
+  table. `.Q.pd` and `.Q.PD` are the partitions' directories (shown, all), `.Q.P` the segments, and `.Q.qp x` gives
+  `1b` for a partitioned table, `0b` for a splayed table and `0` otherwise. `.Q.MAP[]` keeps every mounted partition's
+  column files memory-mapped across queries (with mapped bytes reported in `.Q.w[]` and `\w`).
 
 * Any `where` clause on the partition column prunes partitions (`=`, `<`, `<=`, `>`, `>=`, `in`, `within`), whether it is
-  the first clause or appears after other row-wise filters.
+  the first clause or appears after other row-wise filters. Leading single-column filters also narrow each partition
+  before reading the matching rows of other columns, using per-partition `` `p# `` and `` `s# `` attributes directly.
 * A `select` or `exec` that lists its columns reads only the columns it mentions, unless it can name one at run time
-  (through `value`, `get`, `eval`, `reval`, `system` or a variable holding a verb). In memory too, only the
-  columns that are read are copied.
+  (through `value`, `get`, `eval`, `reval`, `system` or a variable holding a verb), and `count`, `cols`, `meta` and
+  queries that touch only the partition column read column headers alone. In memory too, only the columns that are read
+  are copied.
 * Column attributes accelerate lookups and joins: `` `s# `` uses `O(log N)` binary search (`=`, `<`, `<=`, `>`, `>=`, `in`,
   `within`, `?`, keyed joins), while `` `u# ``, `` `p# `` (such as HDB `sym` written by `.Q.dpft`) and `` `g# `` maintain
   cached `O(1)` hash, run-range, and inverted indexes. A column keeps `` `g# `` as it is added to (`insert`, `,:`); its
   index is built the second time the column is looked in without having changed.
-* Selected partitions are loaded into memory for each query; nothing is memory-mapped.
+* Splayed and partitioned column files are read through read-only OS memory mappings (`Mmap`), extracting only the
+  surviving rows when filtered.

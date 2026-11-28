@@ -115,7 +115,7 @@ pub struct ViewDef {
     pub source: String,
     pub expr: Expr,
     #[serde(skip)]
-    pub cached: Option<K>,
+    pub cached: Arc<OnceLock<K>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,6 +192,8 @@ pub struct Workspace {
     pub views: Shared<HashMap<SymId, ViewDef>>,
     pub dist: Shared<HashMap<SymId, DistMode>>,
     pub partitioned: Shared<HashMap<SymId, PartitionedTable>>,
+    /// Global tables loaded directly from splayed directories (for `.Q.qp`).
+    pub splayed: Shared<HashSet<SymId>>,
     /// Variables whose value readers of the log may not have (read from files): their next change is logged whole.
     pub unlogged: HashSet<SymId>,
     pub data_dir: Option<PathBuf>,
@@ -217,6 +219,7 @@ impl Workspace {
             views: Shared::default(),
             dist: Shared::default(),
             partitioned: Shared::default(),
+            splayed: Shared::default(),
             unlogged: HashSet::new(),
             data_dir: None,
             clock: 0,
@@ -236,6 +239,7 @@ impl Workspace {
             views: self.views.clone(),
             dist: self.dist.clone(),
             partitioned: self.partitioned.clone(),
+            splayed: self.splayed.clone(),
             data_dir: self.data_dir.clone(),
             clock: self.clock,
             epoch: self.epoch,
@@ -244,7 +248,7 @@ impl Workspace {
         }
     }
 
-    fn writable(&self) -> KResult<()> {
+    pub(crate) fn writable(&self) -> KResult<()> {
         match self.read_only {
             true => Err(KError::new("snapshot", "this copy of the workspace takes no writes")),
             false => Ok(()),
@@ -252,13 +256,21 @@ impl Workspace {
     }
 
     pub fn invalidate_views(&mut self) {
-        for v in self.views.values_mut() {
-            v.cached = None;
+        if self.views.values().any(|v| v.cached.get().is_some()) {
+            for v in self.views.values_mut() {
+                if v.cached.get().is_some() {
+                    v.cached = Arc::new(OnceLock::new());
+                }
+            }
         }
     }
 
     pub fn approx_memory_bytes(&self) -> usize {
         self.vars.values().map(|v| v.approx_bytes()).sum()
+    }
+
+    pub fn mapped_bytes(&self) -> usize {
+        self.partitioned.values().map(|pt| pt.mapped_bytes()).sum()
     }
 }
 
@@ -451,14 +463,69 @@ impl<'a> Engine<'a> {
     }
 
     pub fn has_partitioned(&self, name: SymId) -> bool {
-        // (a local of the name takes its place, as in reading the name)
-        let local = self.locals.last().is_some_and(|f| f.contains_key(&name));
-        !local && self.ws.partitioned.contains_key(&name)
+        self.unshadowed_partitioned(name).is_some()
     }
 
-    pub fn resolve_table_for_query(&mut self, name: SymId, where_clauses: &[Expr], needed: Option<&[SymId]>) -> KResult<K> {
-        if let Some(pt) = self.ws.partitioned.get(&name).cloned() {
-            let flip = storage::load_partitioned_filtered(&pt, where_clauses, needed, |e| self.eval_expr(e))?;
+    pub(crate) fn unshadowed_partitioned(&self, name: SymId) -> Option<PartitionedTable> {
+        if self.locals.last().is_some_and(|f| f.contains_key(&name)) || self.table_scopes.last().is_some_and(|s| s.flip.col(name).is_some()) {
+            return None;
+        }
+        let qname = self.qualify(name);
+        if self.ws.vars.contains_key(&qname)
+            || self.ws.vars.contains_key(&name)
+            || self.ws.views.contains_key(&qname)
+            || self.ws.views.contains_key(&name)
+        {
+            return None;
+        }
+        self.ws.partitioned.get(&name).cloned()
+    }
+
+    fn eval_qp_arg(&mut self, arg: &Expr) -> Result<K, StepErr> {
+        match arg {
+            Expr::Var(name) => {
+                if !self.locals.last().is_some_and(|f| f.contains_key(name))
+                    && !self.table_scopes.last().is_some_and(|s| s.flip.col(*name).is_some())
+                {
+                    let qname = self.qualify(*name);
+                    if self.ws.splayed.contains(&qname) || (qname != *name && self.ws.splayed.contains(name)) {
+                        return Ok(K::Bool(false));
+                    }
+                    if let Some(_) = self.unshadowed_partitioned(*name) {
+                        return Ok(K::Bool(true));
+                    }
+                }
+                let _ = self.eval_step(arg)?;
+                Ok(K::Long(0))
+            }
+            Expr::Unary { op, arg: inner } if resolve(*op) == "get" => {
+                let target = self.eval_step(inner)?;
+                if matches!(&target, K::Sym(s) if resolve(*s).starts_with(':')) {
+                    let p = storage::path_of(self.ws, &target)?;
+                    if p.is_dir() && p.join(".d").exists() {
+                        return Ok(K::Bool(false));
+                    }
+                }
+                let _ = self.eval_unary_dispatch(*op, &target)?;
+                Ok(K::Long(0))
+            }
+            _ => {
+                let _ = self.eval_step(arg)?;
+                Ok(K::Long(0))
+            }
+        }
+    }
+
+    pub fn resolve_table_for_query(
+        &mut self,
+        name: SymId,
+        where_clauses: &[Expr],
+        needed: Option<&[SymId]>,
+        can_prefilter_rows: bool,
+    ) -> KResult<K> {
+        if let Some(pt) = self.unshadowed_partitioned(name) {
+            let vp = self.vp_prototype(name);
+            let flip = storage::load_partitioned_filtered(&pt, vp.as_ref(), where_clauses, needed, can_prefilter_rows, |e| self.eval_expr(e))?;
             return Ok(K::Table(Arc::new(flip)));
         }
         self.get_var(name)
@@ -536,6 +603,9 @@ impl<'a> Engine<'a> {
         ops.extend(drop.iter().map(|&name| LogOp::DropVar { name }));
         if !Arc::ptr_eq(&before.partitioned.0, &after.partitioned.0) {
             self.ws.partitioned = after.partitioned.clone();
+        }
+        if !Arc::ptr_eq(&before.splayed.0, &after.splayed.0) {
+            self.ws.splayed = after.splayed.clone();
         }
         self.replay(ops)
     }
@@ -724,17 +794,16 @@ impl<'a> Engine<'a> {
             }
         }
         if let Some(vdef) = self.ws.views.get(&qname).or_else(|| self.ws.views.get(&name)).cloned() {
-            if let Some(cached) = vdef.cached {
-                return Ok(cached);
+            if let Some(cached) = vdef.cached.get() {
+                return Ok(cached.clone());
             }
             let computed = self.eval_view(&vdef)?;
-            if let Some(slot) = self.ws.views.get_mut(&vdef.name) {
-                slot.cached = Some(computed.clone());
-            }
+            let _ = vdef.cached.set(computed.clone());
             return Ok(computed);
         }
         if let Some(pt) = self.ws.partitioned.get(&name).cloned() {
-            let flip = storage::load_partitioned_filtered(&pt, &[], None, |e| self.eval_expr(e))?;
+            let vp = self.vp_prototype(name);
+            let flip = storage::load_partitioned_filtered(&pt, vp.as_ref(), &[], None, false, |e| self.eval_expr(e))?;
             return Ok(K::Table(Arc::new(flip)));
         }
 
@@ -957,6 +1026,26 @@ impl<'a> Engine<'a> {
             }
 
             Expr::Unary { op, arg } => {
+                if let Expr::Var(name) = &**arg {
+                    if let Some(pt) = self.unshadowed_partitioned(*name) {
+                        match resolve(*op) {
+                            "cols" => return Ok(K::Vector(ColVec::Sym(Attr::None, Arc::new(pt.cols.clone())))),
+                            "count" => {
+                                let mut n = 0i64;
+                                for s in &pt.slices {
+                                    n += storage::slice_row_count(&pt, s)? as i64;
+                                }
+                                return Ok(K::Long(n));
+                            }
+                            "meta" => {
+                                let vp = self.vp_prototype(pt.name);
+                                let schema = storage::partitioned_schema_flip(&pt, vp.as_ref(), true)?;
+                                return Ok(self.eval_unary_dispatch(*op, &K::Table(Arc::new(schema)))?);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 let x = self.eval_step(arg)?;
                 Ok(self.eval_unary_dispatch(*op, &x)?)
             }
@@ -995,12 +1084,42 @@ impl<'a> Engine<'a> {
             }
 
             Expr::Juxt { func, arg } => {
+                if let Expr::Var(f) = &**func {
+                    if !self.ws.vars.contains_key(f) && !self.locals.last().is_some_and(|l| l.contains_key(f)) {
+                        match resolve(*f) {
+                            ".Q.qp" => return self.eval_qp_arg(arg),
+                            ".Q.cn" => {
+                                if let Expr::Var(t) = &**arg {
+                                    if let Some(pt) = self.unshadowed_partitioned(*t) {
+                                        return Ok(self.partition_counts_direct(&pt)?);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 let rval = self.eval_step(arg)?;
                 let fval = self.eval_step(func)?;
                 Ok(self.apply_value(&fval, &[Some(rval)])?)
             }
 
             Expr::Apply { target, args } => {
+                if let (Expr::Var(f), [Some(arg)]) = (&**target, args.as_slice()) {
+                    if !self.ws.vars.contains_key(f) && !self.locals.last().is_some_and(|l| l.contains_key(f)) {
+                        match resolve(*f) {
+                            ".Q.qp" => return self.eval_qp_arg(arg),
+                            ".Q.cn" => {
+                                if let Expr::Var(t) = arg {
+                                    if let Some(pt) = self.unshadowed_partitioned(*t) {
+                                        return Ok(self.partition_counts_direct(&pt)?);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 // Special forms: `@[target; i; f; ...]` (protected eval / functional amend) and `.[target; path; f; ...]`!
                 if let Expr::Lit(K::Func(Func::Prim(op_sym))) = &**target {
                     let op_s = resolve(*op_sym);
@@ -1051,7 +1170,7 @@ impl<'a> Engine<'a> {
                         name: qname,
                         source: src_str,
                         expr: (**val).clone(),
-                        cached: None,
+                        cached: Arc::new(OnceLock::new()),
                     };
                     self.record_ops(vec![LogOp::SetView { def: vdef.clone() }])?;
                     self.ws.vars.remove(&qname);
@@ -1404,12 +1523,18 @@ impl<'a> Engine<'a> {
                 });
                 Ok(K::Vector(ColVec::from_atoms(sent.collect::<KResult<_>>()?)))
             }
-            "each" | "peach" | "over" | "scan" | "prior" => {
+            "peach" => {
+                let K::Func(f) = lhs else {
+                    return Err(KError::ty("peach requires a function on its left"));
+                };
+                self.eval_peach(f, rhs)
+            }
+            "each" | "over" | "scan" | "prior" => {
                 let K::Func(f) = lhs else {
                     return Err(KError::ty(format!("{op} requires a function on its left")));
                 };
                 let kind = match op {
-                    "each" | "peach" => AdverbKind::Each,
+                    "each" => AdverbKind::Each,
                     "over" => AdverbKind::Over,
                     "scan" => AdverbKind::Scan,
                     _ => AdverbKind::EachPrior,
@@ -1460,6 +1585,10 @@ impl<'a> Engine<'a> {
                 }
                 ops::eval_binary_prim("!", lhs, rhs)
             }
+            "setenv" => {
+                self.ws.writable()?;
+                ops::eval_binary_prim(op, lhs, rhs)
+            }
             _ => ops::eval_binary_prim(op, lhs, rhs),
         }
     }
@@ -1483,12 +1612,20 @@ impl<'a> Engine<'a> {
             K::Int(0) | K::Long(0) if args.len() == 1 => self.eval_message(args[0].as_ref().unwrap_or(&K::Null)),
             // Symbol handle one-shot IPC `` `:localhost:5000 "1+1" ``
             K::Sym(s) if resolve(*s).starts_with(':') && files::server_address(resolve(*s)).is_some() => {
+                self.ws.writable()?;
                 let mut client = self.connect_to(resolve(*s)).unwrap_or_else(|| Err(KError::ipc("not a server")))?;
                 let arg = args.first().and_then(|a| a.clone()).unwrap_or(K::Null);
                 client.query_k(&arg)
             }
             K::Sym(s) if !resolve(*s).starts_with(':') => {
                 let named = self.get_var(*s)?;
+                if self.ws.read_only {
+                    if let K::Func(f) = &named {
+                        if !pure::func_reads_only(self.ws, f) {
+                            self.ws.writable()?;
+                        }
+                    }
+                }
                 self.apply_value(&named, args)
             }
             other => ops::index_k(other, args),
@@ -1675,6 +1812,60 @@ impl<'a> Engine<'a> {
             Some(e) => Err(e),
             None => Ok(last),
         }
+    }
+
+    /// Evaluate `f peach rhs` across Rayon worker threads when `f` is pure and `rhs` is a vector or dictionary.
+    pub(crate) fn eval_peach(&mut self, f: &Func, rhs: &K) -> KResult<K> {
+        if let K::Dict(d) = rhs {
+            let mapped = self.eval_peach(f, &d.vals)?;
+            return Ok(K::Dict(Arc::new(Dict { keys: d.keys.clone(), vals: Box::new(mapped) })));
+        }
+        let K::Vector(cv) = rhs else {
+            return self.apply_func(f, std::slice::from_ref(rhs));
+        };
+        if let (ColVec::Strings(_, s), Func::Prim(p)) = (cv, f) {
+            match resolve(*p) {
+                "count" => return Ok(K::Vector(ColVec::Long(Attr::None, Arc::new(s.lengths().map(i64::from).collect())))),
+                "reverse" | "|" => return Ok(K::Vector(s.reverse_each())),
+                _ => {}
+            }
+        }
+        fn has_lambda(f: &Func) -> bool {
+            match f {
+                Func::Lambda(_) => true,
+                Func::Proj { func, .. } | Func::Adverb { inner: func, .. } => has_lambda(func),
+                Func::Comp(a, b) => has_lambda(a) || has_lambda(b),
+                Func::Prim(_) => false,
+            }
+        }
+        let min_len = if has_lambda(f) { 2 } else { 4096 };
+        if cv.len() >= min_len && rayon::current_num_threads() > 1 && pure::func_reads_only(self.ws, f) {
+            use rayon::prelude::*;
+            let base_ws = self.ws.snapshot();
+            let base_ns = self.session.current_ns.clone();
+            let base_login = self.session.login.clone();
+            let base_disp = self.session.display;
+            let cancel = self.session.cancel.clone();
+            let par_res: KResult<Vec<K>> = (0..cv.len())
+                .into_par_iter()
+                .map_init(
+                    || {
+                        let mut sess = SessionState::new(0, base_login.clone());
+                        sess.current_ns = base_ns.clone();
+                        sess.display = base_disp;
+                        sess.cancel = cancel.clone();
+                        (base_ws.snapshot(), sess)
+                    },
+                    |(ws, sess), i| Engine::new(ws, sess).apply_func(f, &[cv.get_atom(i)]),
+                )
+                .collect();
+            match par_res {
+                Ok(out) => return Ok(rows::collapse(out)),
+                Err(e) if e.signal == "snapshot" && !self.ws.read_only => {}
+                Err(e) => return Err(e),
+            }
+        }
+        self.eval_adverb(AdverbKind::Each, f, std::slice::from_ref(rhs))
     }
 
     fn eval_adverb(&mut self, kind: AdverbKind, inner: &Func, vals: &[K]) -> KResult<K> {
@@ -2366,6 +2557,11 @@ impl<'a> Engine<'a> {
         if let Some((c @ ("t" | "ts"), n)) = cmd.split_once(':') {
             return self.eval_sys_cmd(c, &format!(":{n} {arg}"));
         }
+        let ro_query = matches!(cmd, "a" | "b" | "v" | "f" | "w" | "\\")
+            || (matches!(cmd, "d" | "t" | "P" | "c" | "cd" | "S" | "W" | "z" | "p") && arg.is_empty());
+        if !ro_query {
+            self.ws.writable()?;
+        }
         match cmd {
             "a" => self.eval_unary_dispatch(intern("tables"), &K::Null),
             "b" => self.eval_unary_dispatch(intern("views"), &K::Null),
@@ -2462,8 +2658,9 @@ impl<'a> Engine<'a> {
             }
             "w" => {
                 let used = self.ws.approx_memory_bytes() as i64;
+                let mapped = self.ws.mapped_bytes() as i64;
                 let syms = sym_count() as i64;
-                Ok(K::Vector(ColVec::Long(Attr::None, Arc::new(vec![used, used * 2, used, 0, 0, syms]))))
+                Ok(K::Vector(ColVec::Long(Attr::None, Arc::new(vec![used, used * 2, used, mapped, 0, syms]))))
             }
             "l" => {
                 if arg.is_empty() {
@@ -2473,9 +2670,12 @@ impl<'a> Engine<'a> {
                 let held = storage::path_of(self.ws, &K::sym(arg))?;
                 let p = if held.exists() { held } else { PathBuf::from(arg) };
                 if p.is_dir() && !p.join(".d").exists() {
-                    // the tables mounted take the place of variables of their names
+                    // the tables mounted take the place of variables of their names; `.Q.vp` starts fresh
                     let mounted = storage::mount_hdb_dir(self.ws, &p)?;
-                    let replaced: Vec<_> = mounted.into_iter().filter(|t| self.ws.vars.contains_key(t)).map(|t| (t, None)).collect();
+                    let mut replaced: Vec<_> = mounted.into_iter().filter(|t| self.ws.vars.contains_key(t)).map(|t| (t, None)).collect();
+                    if self.ws.vars.contains_key(&intern(".Q.vp")) {
+                        replaced.push((intern(".Q.vp"), None));
+                    }
                     if !replaced.is_empty() {
                         self.set_globals(replaced)?;
                     }

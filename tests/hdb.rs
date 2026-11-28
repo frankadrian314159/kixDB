@@ -78,3 +78,38 @@ fn segments_and_columns_that_differ() {
         ("exec v from t", "1 2 3 4"),
     ]);
 }
+
+#[test]
+fn mapped_partitions_schema_evolution_and_qp() {
+    let (_dir, mut c) = workspace();
+    check(&mut c, &[
+        // Day 1 has `t` (without `w` and `tag`) and splayed `sp`; Day 2 adds columns `w` and `tag` to `t` and adds table `q`
+        ("sym: `$(); `:db/sp/ set .Q.en[`:db] ([] s:`x`y; a:10 20)", "`:db/sp/"),
+        ("t: ([] sym:`b`a`b; v:10 20 30; px:1.5 2.5 3.5); .Q.dpft[`:db; 2026.01.01; `sym; `t]", "`t"),
+        ("t: ([] sym:`a`c; v:40 50; px:4.5 5.5; w:7 8; tag:(\"hi\";\"yo\")); .Q.dpft[`:db; 2026.01.02; `sym; `t]", "`t"),
+        ("q: ([] sym:enlist `a; b:enlist 9.5); .Q.dpft[`:db; 2026.01.02; `sym; `q]", "`q"),
+        ("mem: ([] k: 1 2); system \"l db\"", "::"),
+        // `.Q.qp` distinguishes partitioned (1b), splayed (0b), and in-memory / non-table values (0) without loading partitions
+        ("(.Q.qp t; .Q.qp[q]; .Q.qp sp; .Q.qp get `:db/sp; .Q.qp mem; .Q.qp `t; .Q.qp 42)", "(1b;1b;0b;0b;0;0;0)"),
+        // Header-only `cols`, `count`, `meta`, `.Q.cn`, `.Q.pn`, and `select count i by date`
+        ("(cols t; count t; .Q.cn t; .Q.pn`t)", "(`date`sym`v`px`w`tag;5;3 2;3 2)"),
+        ("(exec t from meta t; exec a from meta t)", "(\"dsjfjC\";`s`p````)"),
+        ("exec x from select count i by date from t", "3 2"),
+        // `.Q.MAP[]` maps partition files and reports mapped bytes in `.Q.w[]`, while still allowing partition overwrites on Windows
+        ("[a: .Q.w[][`mmap]; .Q.MAP[]; (a = 0; .Q.w[][`mmap] > 0)]", "11b"),
+        // Per-partition `p#sym` filtering + mapped row subset extraction across multiple partitions
+        ("exec v from t where sym = `a", "20 40"),
+        ("exec px from t where sym = `b, v > 15", ",3.5"),
+        // Missing columns signal `'mismatch` until `.Q.bv[]` builds `.Q.vp`
+        ("select from t", "'mismatch"),
+        (".Q.bv[]; key .Q.vp", ",`t"),
+        ("exec w from t", "0N 0N 0N 7 8"),
+        ("exec tag from t", "(\"\";\"\";\"\";\"hi\";\"yo\")"),
+        ("exec w from t where sym = `b", "0N 0N"),
+        // `.Q.bv[`]` also adds virtual empty slices for tables absent in older partitions (`q` on 2026.01.01)
+        (".Q.bv[`]; (.Q.cn q; count select from q where date = 2026.01.01)", "(0 1;0)"),
+        // Overwriting an already-mapped partition succeeds cleanly
+        ("t: ([] sym:enlist `z; v:enlist 99; px:enlist 9.9; w:enlist 1; tag:enlist \"ok\"); .Q.dpft[`:db; 2026.01.01; `sym; `t]", "`t"),
+        ("system \"l db\"; .Q.MAP[]; (count t; exec v from t)", "(3;99 40 50)"),
+    ]);
+}

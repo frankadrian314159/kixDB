@@ -260,22 +260,34 @@ fn inserts_and_upserts_change_the_rows_they_touch() {
 fn statements_that_only_read_run_while_others_hold_the_workspace() {
     let server = Server::new();
     let mut c = server.connect();
-    c.eval("t: ([] a: 1 2 3); n: 7; f: {n:: 8}; v:: n + 1").unwrap();
-    // held as by another reader: a writer would have to wait, a reader does not
+    c.eval("t: ([] a: 1 2 3 4); n: 7; f: {n:: 8}; pure_fn: {[x] s: sum exec a from t where a > x; s + n}; v:: n + sum exec a from t").unwrap();
+    // held as by another reader: a writer would have to wait, a reader (including pure lambdas, pure views, functional IPC, peach, and .Q.fc) does not
     let (done, finished) = std::sync::mpsc::channel();
     server.read_workspace(|_| {
         let mut other = server.connect();
-        std::thread::spawn(move || done.send(other.eval("(sum exec a from t; select from t where a > 1; n * 2)").is_ok()));
-        assert!(finished.recv_timeout(std::time::Duration::from_secs(10)).unwrap());
+        let s2 = server.clone();
+        std::thread::spawn(move || {
+            let r1 = other.eval("(sum exec a from t; pure_fn 1; v; {x * x} peach 1 2 3 4; .Q.fc[{x * 10}; til 20])").unwrap();
+            let mut ipc_conn = s2.connect();
+            let msg = ipc_conn.eval("(`pure_fn; 2)").unwrap();
+            let r2 = ipc_conn.eval_ipc_message(&msg).unwrap();
+            done.send((r1.to_string(), r2.to_string())).unwrap();
+        });
+        let (r1, r2) = finished.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        assert_eq!(r1, "(10;16;17;1 4 9 16;0 10 20 30 40 50 60 70 80 90 100 110 120 130 140 150 160 170 180 190)");
+        assert_eq!(r2, "14");
     });
-    // what looks like reading but writes still writes
+    // view cache populated during the concurrent read is invalidated as soon as `n` changes
+    assert_eq!(c.eval("v").unwrap().to_string(), "17");
+    // what looks like reading (including dynamic symbol application of an impure function) but writes still writes
     for (code, check, expected) in [
         ("f[]", "n", "8"),
-        ("update a: 0 from `t where a = 1", "exec a from t", "0 2 3"),
-        ("`t insert enlist 4", "count t", "4"),
-        ("m: select from t", "count m", "4"),
+        ("v", "v", "18"),
+        ("{[fn] fn[]} `f", "n", "8"),
+        ("update a: 0 from `t where a = 1", "exec a from t", "0 2 3 4"),
+        ("`t insert enlist 5", "count t", "5"),
+        ("m: select from t", "count m", "5"),
         ("{[x] `k set x} 5", "k", "5"),
-        ("v", "v", "9"),
     ] {
         c.eval(code).unwrap_or_else(|e| panic!("{code}: {e}"));
         assert_eq!(c.eval(check).unwrap().to_string(), expected, "{code}");

@@ -113,6 +113,13 @@ impl Engine<'_> {
             return Err(KError::ty("a partition holds unkeyed tables"));
         };
         let place = storage::path_of(self.ws, &self.partition_path(dir, partition, table)?)?;
+        if let Some(pt) = self.ws.partitioned.get(&name) {
+            for s in pt.slices.iter().chain(&pt.hidden) {
+                if s.path == place {
+                    s.unmap();
+                }
+            }
+        }
         storage::write_splayed_table(&place, &written)?;
         Ok(name)
     }
@@ -160,6 +167,107 @@ impl Engine<'_> {
             counts.get_mut(place as usize).into_iter().for_each(|n| *n += 1);
         }
         Ok(K::Vector(ColVec::Long(Attr::None, Arc::new(counts))))
+    }
+
+    /// Header-only `.Q.cn` when called directly on a mounted partitioned table name (`pt`).
+    pub(crate) fn partition_counts_direct(&self, pt: &storage::PartitionedTable) -> KResult<K> {
+        let Some(K::Vector(shown)) = self.partition_values(None, false) else {
+            return Err(KError::ty(".Q.cn takes a partitioned table"));
+        };
+        let mut counts = vec![0i64; shown.len()];
+        for (i, slot) in counts.iter_mut().enumerate() {
+            let pv = shown.get_atom(i);
+            if let Some(slice) = pt.slices.iter().find(|s| s.part_val == pv) {
+                *slot = storage::slice_row_count(pt, slice)? as i64;
+            }
+        }
+        Ok(K::Vector(ColVec::Long(Attr::None, Arc::new(counts))))
+    }
+
+    /// Prototype schema flip in `.Q.vp` for `table`, if defined.
+    pub(crate) fn vp_prototype(&self, table: SymId) -> Option<Flip> {
+        let K::Dict(d) = self.ws.vars.get(&intern(".Q.vp"))? else { return None };
+        match ops::dict_lookup(d, &K::Sym(table)).ok()? {
+            K::Table(f) => Some((*f).clone()),
+            K::KeyedTable(kt) => Some(kt.unkey()),
+            _ => None,
+        }
+    }
+
+    /// `.Q.MAP[]`: memory-map and retain column files across all mounted partitioned tables.
+    pub(crate) fn map_partitions(&mut self) -> KResult<K> {
+        self.ws.writable()?;
+        for pt in self.ws.partitioned.values() {
+            storage::map_partitioned_table(pt)?;
+        }
+        Ok(K::Null)
+    }
+
+    /// `.Q.bv[]` and `` .Q.bv[`] ``: populate `.Q.vp` with empty schema prototypes for partitioned tables whose older
+    /// partitions lack columns (and, with `` ` ``, add virtual slices for partitions lacking the table directory itself).
+    pub(crate) fn build_virtual(&mut self, arg: &K) -> KResult<K> {
+        let allow_missing_tables = match arg {
+            K::Null => false,
+            K::Sym(s) if s.is_null() => true,
+            _ => return Err(KError::ty(".Q.bv takes :: or `")),
+        };
+        self.ws.writable()?;
+        if allow_missing_tables {
+            if let Some(root) = self.ws.partitioned.values().next().map(|t| t.root.clone()) {
+                let all_parts = storage::partition_dirs(self.ws, &root)?;
+                let any_hidden = self.ws.partitioned.values().any(|t| !t.hidden.is_empty());
+                let shown_vals: Vec<K> = match any_hidden.then(|| self.partition_values(None, false)).flatten() {
+                    Some(K::Vector(v)) => (0..v.len()).map(|i| v.get_atom(i)).collect(),
+                    _ => vec![],
+                };
+                for pt in self.ws.partitioned.values_mut() {
+                    for (_, _, pval, pdir) in &all_parts {
+                        if !pt.slices.iter().chain(&pt.hidden).any(|s| s.part_val == *pval) {
+                            let slice = PartitionSlice::new(pval.clone(), pdir.join(resolve(pt.name)));
+                            if !any_hidden || shown_vals.iter().any(|v| v.k_cmp(pval).is_eq()) {
+                                pt.slices.push(slice);
+                                pt.slices.sort_by(|a, b| a.part_val.k_cmp(&b.part_val));
+                            } else {
+                                pt.hidden.push(slice);
+                                pt.hidden.sort_by(|a, b| a.part_val.k_cmp(&b.part_val));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut names_sorted: Vec<SymId> = self.ws.partitioned.keys().copied().collect();
+        names_sorted.sort_by_key(|&n| resolve(n));
+        let mut vp_names = Vec::new();
+        let mut vp_tables = Vec::new();
+        for tname in names_sorted {
+            let pt = &self.ws.partitioned[&tname];
+            let on_disk = pt.cols.get(1..).unwrap_or_default();
+            let mut missing = allow_missing_tables;
+            if !missing {
+                for s in pt.slices.iter().chain(&pt.hidden) {
+                    let d_path = s.path.join(".d");
+                    if !d_path.exists() {
+                        missing = true;
+                        break;
+                    }
+                    if let Ok(K::Vector(ColVec::Sym(_, cols))) = storage::read_flat_k(&d_path) {
+                        if on_disk.iter().any(|c| !cols.contains(c)) {
+                            missing = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if missing {
+                let proto = storage::partitioned_schema_flip(pt, None, false)?;
+                vp_names.push(tname);
+                vp_tables.push(K::Table(Arc::new(proto)));
+            }
+        }
+        let vp_dict = K::Dict(Arc::new(Dict { keys: Box::new(symbols(vp_names)), vals: Box::new(general(vp_tables)) }));
+        self.set_globals(vec![(intern(".Q.vp"), Some(vp_dict))])?;
+        Ok(K::Null)
     }
 
     /// `.Q.chk dir`: give each partition the tables that the last one has and it lacks, empty. For each partition, the
@@ -239,8 +347,8 @@ impl Engine<'_> {
         for table in &tables {
             let mut each = vec![0i64; shown.len()];
             for (n, rows) in each.iter_mut().enumerate() {
-                if let (Some(slice), Some(&column)) = (table.slices.iter().find(|s| s.part_val == shown.get_atom(n)), table.cols.get(1)) {
-                    *rows = storage::read_flat_k(&slice.path.join(resolve(column)))?.count() as i64;
+                if let Some(slice) = table.slices.iter().find(|s| s.part_val == shown.get_atom(n)) {
+                    *rows = storage::slice_row_count(table, slice)? as i64;
                 }
             }
             counts.push(K::Vector(ColVec::Long(Attr::None, Arc::new(each))));

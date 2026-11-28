@@ -143,12 +143,13 @@ system "ls data"                    / or \ls data
 
 ## Concurrency
 
-Statements that only read run side by side, each on the data as it was when it started, and a change does not wait for
-them. A statement that changes anything runs alone. So does one that may: it assigns a name, calls a function or a view,
-applies a number (a connection handle) or `neg h` to something, or uses a verb such as `insert`, `upsert`, `set`, `get`, `value`,
-`eval`, `system`, `show` or `hopen`. A script runs beside others only if all its statements do. A change made
-while a read is running first copies the list of global variables, which takes time in proportion to their number (about
-0.01 ms with 1,000 and 3 ms with 100,000).
+Statements that only read (including calls to functions and views that only read, and functional IPC requests for them)
+run side by side, each on the data as it was when it started, and a change does not wait for them. A statement that
+changes anything runs alone. So does one that may: it assigns a global name, applies a number (a connection handle) or
+`neg h` to something, or uses a verb with effects such as `insert`, `upsert`, `set`, `get`, `value`, `eval`, `system`,
+`show` or `hopen`. A script runs beside others only if all its statements do. A change made while a read is running
+first copies the list of global variables, which takes time in proportion to their number (about 0.01 ms with 1,000 and
+3 ms with 100,000).
 
 Work on 100,000 items or more (comparisons, arithmetic, `like`, `where`, sums, `min`, `max`, `avg`, grouping with few
 groups, and `by` queries that go group by group) is shared among threads. kixDB's programs use one for each processor

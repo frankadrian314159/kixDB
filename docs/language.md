@@ -101,7 +101,7 @@ Unlike kdb+, which holds positions in the domain:
 | strings, casts | `string upper lower trim ltrim rtrim ss ssr vs sv $ md5` |
 | system | `get set value parse eval attr system show getenv setenv ltime gtime -8! -9! -11!` ([logs](storage.md#logs)) |
 | files, handles | `hopen hclose hcount hsym hdel key read0 read1 save load rsave rload csv 0: 1: -25! -30! -1 -2 1 2` ([storage.md](storage.md#files-and-tables-on-disk), [ipc.md](ipc.md#sending-to-clients)) |
-| iterators | `each peach over scan prior` (`peach` runs as `each`) |
+| iterators | `each peach over scan prior` (`peach` runs pure functions across threads) |
 
 `.z.p .z.P .z.d .z.D .z.t .z.T .z.n .z.N .z.z .z.Z` give the time and date; `.z.u .z.i .z.o .z.K .z.k .z.h .z.c .z.l
 .z.q .z.r` the user and process (`.z.K` is 4.1 and `.z.k` the date that kdb+ 4.1 was released); `.z.x .z.X .z.f` the command line (`.z.x`: the arguments after `--`; passwords show as
@@ -186,7 +186,7 @@ digit, unlike kdb+.
 | text and dates | `.Q.f .Q.fmt .Q.id .Q.dd .Q.s .Q.s1 .Q.addmonths` |
 | encoding | `.Q.btoa .Q.atob .Q.sha1 .Q.gz .Q.j10 .Q.x10 .Q.j12 .Q.x12 .Q.addr` |
 | tables | `.Q.ff .Q.fk .Q.ft .Q.ind .Q.V` |
-| databases ([storage.md](storage.md#partitioned-databases-and-column-attributes)) | `.Q.en .Q.ens .Q.dpft .Q.dpfts .Q.dpt .Q.dpts .Q.hdpf .Q.par .Q.chk .Q.view .Q.cn .Q.pn .Q.pv .Q.PV .Q.pd .Q.PD .Q.P .Q.pf .Q.pt .Q.MAP` |
+| databases ([storage.md](storage.md#partitioned-databases-and-column-attributes)) | `.Q.en .Q.ens .Q.dpft .Q.dpfts .Q.dpt .Q.dpts .Q.hdpf .Q.par .Q.chk .Q.bv .Q.vp .Q.qp .Q.view .Q.cn .Q.pn .Q.pv .Q.PV .Q.pd .Q.PD .Q.P .Q.pf .Q.pt .Q.MAP` |
 | files | `.Q.fs .Q.fsn` |
 | functions | `.Q.fc .Q.fu .Q.ts .Q.trp .Q.trpd .Q.sbt .Q.bt .Q.v` |
 | command line, memory | `.Q.opt .Q.def .Q.x .Q.gc .Q.w` |
@@ -197,7 +197,7 @@ digit, unlike kdb+.
 A variable assigned one of these names takes its place. Where they differ from kdb+:
 
 * A backtrace (`.Q.bt`, and what `.Q.trp` gives its handler) lists the source of the functions that were running,
-  without marking where in each. `.Q.fc` applies its function once, on one thread.
+  without marking where in each. `.Q.fc` splits a vector across threads when its function only reads.
 * Memory is freed as values are dropped, but the allocator keeps it for later values; `.Q.gc` asks it to give it back to
   the system, and returns 0, as how much it gave back is not measured. `.Q.w` gives nulls for what is not measured.
 * `.j.j` writes floats to `\P` digits, a keyed table as the array of its rows, and a function as its source.
@@ -213,7 +213,7 @@ A variable assigned one of these names takes its place. Where they differ from k
 * `.z.e .z.ex .z.ey .z.m .z.M .z.zd`.
 * Reading binary records with `1:`, and compressed files.
 * Reading logs that kdb+ wrote: kixdb's [logs](storage.md#logs) are its own.
-* The rest of the `.Q` namespace: `.Q.qp`, `.Q.bv` and `.Q.vp`, `.Q.hg` and `.Q.hp` (HTTP), `.Q.host`, `.Q.K`, and
+* The rest of the `.Q` namespace: `.Q.hg` and `.Q.hp` (HTTP), `.Q.host`, `.Q.K`, and
   kdb+ internals (`.Q.ipc`, `.Q.prf0`, `.Q.rp`, `.Q.m`).
 * The parts of `.h` that serve web pages (`.h.he .h.hn .h.hp .h.hy .h.ka .h.jx .h.val .h.HOME .h.ht .h.fram .h.logo`):
   kixdb has no web server.

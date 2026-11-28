@@ -221,6 +221,9 @@ pub fn apply_record(ws: &mut Workspace, rec: &WalRecord) -> KResult<()> {
         match op {
             LogOp::SetVar { name, val } => {
                 ws.views.remove(name);
+                if ws.splayed.contains(name) {
+                    ws.splayed.remove(name);
+                }
                 let mut val = val.clone();
                 val.pack();
                 ws.vars.insert(*name, val);
@@ -228,9 +231,15 @@ pub fn apply_record(ws: &mut Workspace, rec: &WalRecord) -> KResult<()> {
             LogOp::DropVar { name } => {
                 ws.vars.remove(name);
                 ws.views.remove(name);
+                if ws.splayed.contains(name) {
+                    ws.splayed.remove(name);
+                }
             }
             LogOp::SetView { def } => {
                 ws.vars.remove(&def.name);
+                if ws.splayed.contains(&def.name) {
+                    ws.splayed.remove(&def.name);
+                }
                 ws.views.insert(def.name, def.clone());
             }
             LogOp::SetDist { table, mode } => {
@@ -275,6 +284,7 @@ pub fn install_snapshot_into(ws: &mut Workspace, snap: SnapshotData) {
     ws.unlogged.clear();
     ws.views.clear();
     ws.dist.clear();
+    ws.splayed.clear();
     for (k, mut v) in snap.vars {
         v.pack();
         ws.vars.insert(k, v);

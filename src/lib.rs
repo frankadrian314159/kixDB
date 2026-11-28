@@ -19,6 +19,7 @@ pub mod index;
 pub mod inspect;
 pub mod ipc;
 pub mod lexer;
+pub mod mmap;
 pub mod parser;
 pub mod persist;
 pub mod storage;
@@ -383,6 +384,16 @@ impl Connection {
             K::Vector(ColVec::General(_, items)) if !items.is_empty() => {
                 if let Some(res) = self.interceptor.as_mut().and_then(|i| i.eval_message(msg)) {
                     return res;
+                }
+                let copy = {
+                    let ws = self.server.shared.ws.read().unwrap_or_else(|e| e.into_inner());
+                    engine::pure::message_reads_only(&ws, &self.session.current_ns, msg).then(|| ws.snapshot())
+                };
+                if let Some(mut copy) = copy {
+                    let result = Engine::new(&mut copy, &mut self.session).eval_message(msg);
+                    if !matches!(&result, Err(e) if e.signal == "snapshot") {
+                        return result;
+                    }
                 }
                 let mut ws = self.server.shared.ws.write().unwrap_or_else(|e| e.into_inner());
                 Engine::new(&mut ws, &mut self.session).eval_message(msg)
