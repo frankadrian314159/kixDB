@@ -1473,6 +1473,10 @@ fn gather_spans_col(parts: &[Flip], ci: usize, spans: &[(u32, u32, u32)], target
             atoms.push(cv.get_atom(i));
         }
     }
+    // a general list in any part stays one, even if the rows taken are all of one type
+    if parts.iter().any(|p| matches!(p.vals[ci], ColVec::General(..))) {
+        return ColVec::General(Attr::None, Arc::new(atoms));
+    }
     ColVec::from_atoms(atoms)
 }
 

@@ -324,7 +324,7 @@ impl KeyColAcc {
             Self::Char(v) => ColVec::Char(Attr::None, Arc::new(v)),
             Self::Sym(v) => ColVec::Sym(Attr::None, Arc::new(v)),
             Self::Strings(v) => ColVec::of_strings(Attr::None, v),
-            Self::General(v) => ColVec::from_atoms(v),
+            Self::General(v) => ColVec::General(Attr::None, Arc::new(v)),
         }
     }
 }

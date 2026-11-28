@@ -656,11 +656,6 @@ fn distinct_rows_are_dropped_on_the_shards() {
         // (the last two filters leave most shards, or all, without rows)
         for filter in ["", " where v > 1", " where id < 1", " where id < 0"] {
             for column in ["s", "v", "f", "d", "flag", "name", "g", "sorted", "2#'name", "v * 10", "count each name", "first each name"] {
-                // (a mixed column whose rows here share a type arrives from a shard as a column of that type, however
-                // it is asked for)
-                if column == "g" && filter == " where id < 1" {
-                    continue;
-                }
                 p.plan(&format!("distinct exec {column} from {table}{filter}"), pushed);
                 p.plan(&format!("exec distinct {column} from {table}{filter}"), pushed);
                 p.plan(&format!("select distinct c: {column} from {table}{filter}"), pushed);
@@ -668,9 +663,6 @@ fn distinct_rows_are_dropped_on_the_shards() {
                 p.check(&format!("meta select distinct c: {column} from {table}{filter}"));
             }
             for columns in ["s, v", "s, f, d", "name, g", "s, c: v, d", "s, s", "sorted, flag"] {
-                if columns == "name, g" && filter == " where id < 1" {
-                    continue;
-                }
                 p.plan(&format!("select distinct {columns} from {table}{filter}"), pushed);
                 p.plan(&format!("distinct select {columns} from {table}{filter}"), pushed);
             }
@@ -703,4 +695,31 @@ fn distinct_rows_are_dropped_on_the_shards() {
     p.check("exec distinct sum v from t");
     p.check("distinct exec distinct s from t");
     p.check("exec distinct nosuch from t");
+}
+
+#[test]
+fn general_columns_stay_general_where_rows_share_a_type() {
+    let mut p = Pair::new(3);
+    for statement in [
+        ".kix.dist[`t; `sharded; `id]",
+        "t: ([] id: til 12; s: 12#`a`b; g: 12#(1; `a; \"xy\"))",
+        // (each of these rows is on a shard of its own, which so holds one type)
+        ".kix.dist[`u; `sharded; `id]",
+        "u: ([] id: 0 1; g: (1; `a))",
+    ] {
+        p.single.eval(statement).unwrap_or_else(|e| panic!("{statement}: {e}"));
+        p.session.eval(statement).unwrap_or_else(|e| panic!("{statement}: {e}"));
+    }
+    for code in [
+        "exec g from t where id < 1",
+        "select g from t where id in 0 3 6 9",
+        "exec g from `id xdesc select from t where id in 0 3",
+        "x: select from t where id in 0 3; x`g",
+        "exec g by s from t where id in 0 6",
+        "select count i by g from t where id in 0 3 6 9",
+        "select count i by g from u",
+        "exec g from u where id = 1",
+    ] {
+        p.check(code);
+    }
 }

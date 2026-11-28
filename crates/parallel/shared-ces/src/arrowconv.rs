@@ -376,13 +376,10 @@ fn arrow_column_to_colvec(
                     }
                 }
             }
-            if total_rows == 0 {
-                ColVec::General(attr, Arc::new(vec![]))
-            } else {
-                let mut cv = ColVec::from_atoms(atoms);
-                cv.set_attr_unchecked(attr);
-                cv
-            }
+            // (a general list stays one, though the items sent may all be of one type)
+            let mut cv = if tnum == 0 { ColVec::General(attr, Arc::new(atoms)) } else { ColVec::from_atoms(atoms) };
+            cv.set_attr_unchecked(attr);
+            cv
         }
     })
 }
