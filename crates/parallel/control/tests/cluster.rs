@@ -583,6 +583,7 @@ fn verbs_applied_item_by_item_run_on_the_shards() {
             ("a: (phone ,\\: \"x\"), b: (\"+\" ,/: phone), c: (name ,' phone)", "merged in order"),
             ("n: count each phone, f: first each name, u: upper each name, r: reverse peach phone", "merged in order"),
             ("n: count'[phone], m: 2 + count each name, s: `$\"-\" vs/: phone", "merged in order"),
+            ("n: count' phone, r: reverse' name", "merged in order"),
             ("n: sum count each phone, m: max count each name by grp", "two-phase"),
             ("n: sum count each phone", "two-phase"),
             ("n: count i by cc: `$2#'phone", "two-phase"),
@@ -612,13 +613,13 @@ fn verbs_applied_item_by_item_run_on_the_shards() {
             }
         }
     }
-    // TPC-H Q22's shape: no table comes to the control node
+    // TPC-H Q22's shape: folded into two-phase aggregation on the shards so no table comes to the control node
     for statement in [
         "avg_bal: exec avg bal from (select bal, cc: `$2#'phone from cust where bal > 0) where cc in `13`31",
         "select numcust: count i, total: sum bal by cc from (select bal, cc: `$2#'phone from cust where bal > avg_bal, not id in 1 2 3) where cc in `13`31",
     ] {
         let plan = p.check(statement);
-        assert!(plan.contains("merged in order") && !plan.contains("gather cust"), "{statement}: {plan}");
+        assert!(plan.contains("two-phase") && !plan.contains("gather cust"), "{statement}: {plan}");
     }
     // what needs other rows, or a function of the user's, is computed on the control node
     for columns in ["(name ,\\: phone)", "(name ,/: phone)", "{count x} each phone", "(phone ,' name 0)", "(,':) name", "count each distinct name"] {

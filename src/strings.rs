@@ -54,6 +54,30 @@ impl Strings {
         self.ends.extend(other.ends.iter().map(|end| base + end));
     }
 
+    /// Append strings from contiguous Arrow `BinaryArray` offsets and value bytes in one copy.
+    pub fn extend_arrow_binary(&mut self, offsets: &[i32], data: &[u8]) {
+        let Some((&first, rest)) = offsets.split_first() else { return };
+        let Some(&last) = rest.last() else { return };
+        let base = self.bytes.len() as u64;
+        let start = first as usize;
+        self.bytes.extend_from_slice(&data[start..last as usize]);
+        self.ends.extend(rest.iter().map(|&off| base + (off as usize - start) as u64));
+    }
+
+    /// Byte range `(start, end)` in `text()` covering rows `row_start..row_end`, plus initial offset.
+    pub fn slice_bounds(&self, row_start: usize, row_end: usize) -> (usize, usize) {
+        if row_start >= row_end {
+            return (0, 0);
+        }
+        let b0 = if row_start == 0 { 0 } else { self.ends[row_start - 1] as usize };
+        let b1 = self.ends[row_end - 1] as usize;
+        (b0, b1)
+    }
+
+    pub fn end_at(&self, i: usize) -> u64 {
+        self.ends[i]
+    }
+
     /// The strings of these lengths that `bytes` holds, one after another.
     pub fn from_parts(lengths: impl IntoIterator<Item = u32>, bytes: Vec<u8>) -> Option<Strings> {
         let mut end = 0;

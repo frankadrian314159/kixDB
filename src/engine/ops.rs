@@ -847,6 +847,13 @@ fn narrow(keys: &[u64], room: usize) -> Option<(u64, usize)> {
 
 /// A group number for every row: rows alike in all of `cols` share one, numbered in order of first appearance.
 pub(crate) fn group_ids(cols: &[ColVec], nrows: usize) -> Vec<usize> {
+    fn number_one<T: Hash + Eq>(ids: &mut [usize], keys: impl Iterator<Item = T>) {
+        let mut seen = HashMap::with_capacity(ids.len().min(1024));
+        for (id, key) in ids.iter_mut().zip(keys) {
+            let next = seen.len();
+            *id = *seen.entry(key).or_insert(next);
+        }
+    }
     // split the groups made so far by one more column, and count the groups there are then
     fn refine<T: Hash + Eq>(ids: &mut [usize], keys: impl Iterator<Item = T>) -> usize {
         let mut seen = HashMap::new();
@@ -871,13 +878,65 @@ pub(crate) fn group_ids(cols: &[ColVec], nrows: usize) -> Vec<usize> {
     }
     // the rows `of` alone, by the columns' keys
     let number = |keys: &[Cow<'_, [u64]>], of: Range<usize>, ids: &mut [usize]| {
-        let (mut groups, n) = (1, of.len());
-        ids.fill(0);
-        for keys in keys.iter().map(|k| &k[of.clone()]) {
-            groups = match narrow(keys, table_room(n) / groups.max(1)) {
-                Some((lo, span)) => refine_narrow(ids, keys, groups, lo, span),
-                None => refine(ids, keys.iter().copied()),
-            };
+        let n = of.len();
+        let room = table_room(n);
+        let slices: Vec<&[u64]> = keys.iter().map(|k| &k[of.clone()]).collect();
+        match slices.as_slice() {
+            [k0] => match narrow(k0, room) {
+                Some((lo, span)) => {
+                    ids.fill(0);
+                    refine_narrow(ids, k0, 1, lo, span);
+                }
+                None => number_one(ids, k0.iter().copied()),
+            },
+            [k0, k1] => {
+                if let Some((lo0, span0)) = narrow(k0, room) {
+                    if let Some((lo1, span1)) = narrow(k1, room / span0) {
+                        let (mut slots, mut count) = (vec![0usize; span0 * span1], 0);
+                        for (id, (&a, &b)) in ids.iter_mut().zip(k0.iter().zip(*k1)) {
+                            let slot = &mut slots[(a.wrapping_sub(lo0) as usize) * span1 + (b.wrapping_sub(lo1) as usize)];
+                            if *slot == 0 {
+                                count += 1;
+                                *slot = count;
+                            }
+                            *id = *slot - 1;
+                        }
+                        return;
+                    }
+                }
+                number_one(ids, k0.iter().copied().zip(k1.iter().copied()).map(|(a, b)| [a, b]));
+            }
+            [k0, k1, k2] => {
+                if let Some((lo0, span0)) = narrow(k0, room) {
+                    if let Some((lo1, span1)) = narrow(k1, room / span0) {
+                        if let Some((lo2, span2)) = narrow(k2, room / (span0 * span1)) {
+                            let (mut slots, mut count) = (vec![0usize; span0 * span1 * span2], 0);
+                            for (id, ((&a, &b), &c)) in ids.iter_mut().zip(k0.iter().zip(*k1).zip(*k2)) {
+                                let idx = ((a.wrapping_sub(lo0) as usize) * span1 + (b.wrapping_sub(lo1) as usize)) * span2
+                                    + (c.wrapping_sub(lo2) as usize);
+                                let slot = &mut slots[idx];
+                                if *slot == 0 {
+                                    count += 1;
+                                    *slot = count;
+                                }
+                                *id = *slot - 1;
+                            }
+                            return;
+                        }
+                    }
+                }
+                number_one(ids, (0..n).map(|i| [k0[i], k1[i], k2[i]]));
+            }
+            _ => {
+                let mut groups = 1;
+                ids.fill(0);
+                for k in slices {
+                    groups = match narrow(k, room / groups.max(1)) {
+                        Some((lo, span)) => refine_narrow(ids, k, groups, lo, span),
+                        None => refine(ids, k.iter().copied()),
+                    };
+                }
+            }
         }
     };
     // numbers, temporals and symbols give keys; a large input is numbered a piece at a time

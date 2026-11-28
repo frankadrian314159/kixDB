@@ -253,6 +253,11 @@ pub fn rowwise(e: &Expr, cols: &HashSet<SymId>, keys: &[SymId]) -> bool {
                 _ => false,
             }
         }
+        Expr::Juxt { func, arg } => {
+            matches!(&**func, Expr::Adverb { kind: AdverbKind::Each, func } if is_verb(func))
+                && rw(arg)
+                && uses_column(arg, cols)
+        }
         Expr::Binary { op, lhs, rhs } => match resolve(*op) {
             "each" | "peach" => is_verb(lhs) && rw(rhs) && uses_column(rhs, cols),
             "in" | "within" | "like" => rw(lhs) && is_constant(rhs, cols),
@@ -290,6 +295,9 @@ pub fn filters_rows(e: &Expr, cols: &HashSet<SymId>, keys: &[SymId]) -> bool {
         // `c ~\: "text"`, `"text" ~/: c`: a comparison for each row
         Expr::Apply { target, .. } => {
             matches!(&**target, Expr::Adverb { func, .. } if verb_name(func).is_some_and(|v| resolve(v) == "~" || is_one_of(v, &PREDICATES)))
+        }
+        Expr::Juxt { func, .. } => {
+            matches!(&**func, Expr::Adverb { kind: AdverbKind::Each, func } if verb_name(func).is_some_and(|v| matches!(resolve(v), "not" | "null")))
         }
         _ => false,
     };
@@ -681,6 +689,124 @@ impl Planner<'_> {
         }
     }
 
+    /// Fold `select / exec ... from (select <rowwise cols> from <rel> where <w1>) where <w2>` into one query over `<rel>`.
+    fn fold_from(&mut self, q: &QSql) -> Option<QSql> {
+        let Expr::Query(inner_box) = &*q.from else { return None };
+        let inner = self.fold_from(inner_box).unwrap_or_else(|| (**inner_box).clone());
+        if inner.kind != QSqlKind::Select || inner.distinct || inner.by.is_some() || inner.limit.is_some() || inner.cols.is_empty() {
+            return None;
+        }
+        let mentions_i = |e: &Expr| e.any(&mut |x| matches!(x, Expr::Var(s) if resolve(*s) == "i"));
+        if inner.where_clauses.iter().chain(inner.cols.iter().map(|c| &c.expr)).any(mentions_i) {
+            return None;
+        }
+        let rel = self.relation(&inner.from)?;
+        let base_list = if matches!(rel.expr, Expr::Var(_)) {
+            rel.cols
+        } else {
+            crate::catalog::unkey(&self.mirror.eval_expr(&inner.from).ok()?)?.0.cols
+        };
+        let base: HashSet<SymId> = base_list.into_iter().collect();
+        if !inner.cols.iter().all(|c| rowwise(&c.expr, &base, &[])) || !inner.cols.iter().any(|c| uses_column(&c.expr, &base)) {
+            return None;
+        }
+        let inner_names = resolve_col_names(&inner.cols);
+        let map: HashMap<SymId, Expr> = inner_names.iter().copied().zip(inner.cols.iter().map(|c| c.expr.clone())).collect();
+        if map.contains_key(&intern("i")) {
+            return None;
+        }
+
+        fn has_bare_i(e: &Expr) -> bool {
+            match e {
+                Expr::Query(_) => false,
+                Expr::Unary { op, arg } if resolve(*op) == "count" && matches!(&**arg, Expr::Var(s) if resolve(*s) == "i") => false,
+                Expr::Var(s) if resolve(*s) == "i" => true,
+                other => other.children().into_iter().any(has_bare_i),
+            }
+        }
+        if q.where_clauses
+            .iter()
+            .chain(q.by.iter().flatten().map(|c| &c.expr))
+            .chain(q.cols.iter().map(|c| &c.expr))
+            .any(has_bare_i)
+        {
+            return None;
+        }
+
+        fn inline(e: &Expr, map: &HashMap<SymId, Expr>, shadowed: &HashSet<SymId>, base: &HashSet<SymId>) -> Option<Expr> {
+            match e {
+                Expr::Query(_) | Expr::Lambda { .. } => Some(e.clone()),
+                Expr::Var(s) => {
+                    if shadowed.contains(s) {
+                        return Some(e.clone());
+                    }
+                    if let Some(repl) = map.get(s) {
+                        return Some(repl.clone());
+                    }
+                    (!base.contains(s)).then(|| e.clone())
+                }
+                Expr::Field(lhs, f) => {
+                    if let Expr::Var(s) = &**lhs {
+                        if !shadowed.contains(s) && !map.contains_key(s) && !base.contains(s) {
+                            return Some(e.clone());
+                        }
+                    }
+                    Some(Expr::Field(Box::new(inline(lhs, map, shadowed, base)?), *f))
+                }
+                other => {
+                    let mut out = other.clone();
+                    for c in out.children_mut() {
+                        *c = inline(c, map, shadowed, base)?;
+                    }
+                    Some(out)
+                }
+            }
+        }
+
+        let mut out = q.clone();
+        let exec_single = q.kind == QSqlKind::Exec && q.cols.len() == 1 && q.cols[0].name.is_none() && q.by.is_none();
+        if out.cols.is_empty() {
+            if out.kind != QSqlKind::Select || out.by.is_some() {
+                return None;
+            }
+            out.cols = inner_names.iter().map(|&n| ColSpec { name: Some(n), expr: Expr::Var(n) }).collect();
+        } else if !exec_single {
+            let names = resolve_col_names(&out.cols);
+            out.cols.iter_mut().zip(names).for_each(|(c, n)| c.name = Some(n));
+        }
+        let empty_shadow = HashSet::new();
+        let mut by_shadow = HashSet::new();
+        if let Some(by) = &mut out.by {
+            let names = resolve_col_names(by);
+            for (c, n) in by.iter_mut().zip(names) {
+                c.name = Some(n);
+                c.expr = inline(&c.expr, &map, &empty_shadow, &base)?;
+                if !base.contains(&n) {
+                    by_shadow.insert(n);
+                }
+            }
+        }
+        let mut where_clauses = inner.where_clauses;
+        for w in &out.where_clauses {
+            where_clauses.push(inline(w, &map, &empty_shadow, &base)?);
+        }
+        for c in &mut out.cols {
+            if let Some(by) = &out.by {
+                let conflict = by
+                    .iter()
+                    .filter_map(|b| b.name)
+                    .any(|n| base.contains(&n) && c.expr.any(&mut |x| matches!(x, Expr::Var(s) if *s == n)));
+                if conflict {
+                    return None;
+                }
+            }
+            c.expr = inline(&c.expr, &map, &by_shadow, &base)?;
+        }
+        out.from = inner.from;
+        out.where_clauses = where_clauses;
+        Some(out)
+    }
+
     /// How to push a query down, or `None` if the tables have to come to the control node.
     pub fn analyze(&mut self, q: &QSql) -> Option<Push> {
         if !matches!(q.kind, QSqlKind::Select | QSqlKind::Exec) {
@@ -690,6 +816,14 @@ impl Planner<'_> {
         if !self.names.is_pure(&original) || self.names.refs(&original).dynamic {
             return None;
         }
+        let folded;
+        let q = match self.fold_from(q) {
+            Some(f) => {
+                folded = f;
+                &folded
+            }
+            None => q,
+        };
         let mut rel = self.relation(&q.from)?;
         // the columns of a joined relation are those of the join of the empty tables
         if !matches!(rel.expr, Expr::Var(_)) {
