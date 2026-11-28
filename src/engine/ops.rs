@@ -68,6 +68,12 @@ pub fn eval_field(val: &K, field: SymId) -> KResult<K> {
 }
 
 fn try_temporal_field(val: &K, field: &str) -> Option<K> {
+    // an infinite time of one type is the infinity of any other
+    if let Some(kind) = temporal::kind_of(field).filter(|_| temporal::has_infinity(val)) {
+        let K::Vector(v) = val else { return Some(temporal::convert(val, kind)) };
+        let items = (0..v.len()).map(|i| cast_op(&K::sym(field), &v.get_atom(i))).collect::<KResult<_>>().ok()?;
+        return Some(K::Vector(ColVec::from_atoms(items)));
+    }
     let ws = i32::from(CALENDAR.get().week_start);
     let date_int = |d: i32, f: &str| -> i32 {
         let Some((y, m, dd)) = ymd_from_date(d) else { return NULL_INT };
@@ -3497,7 +3503,7 @@ fn cast_atom_by_name(tname: &str, v: &K) -> KResult<K> {
             }
         }
         "timestamp" => match v {
-            K::Date(d) => K::Timestamp(if *d == NULL_INT { NULL_LONG } else { (*d as i64) * NANOS_PER_DAY }),
+            K::Month(_) | K::Date(_) => temporal::convert(v, 12),
             other => K::Timestamp(other.as_i64()?),
         },
         "timespan" => match v {
@@ -3510,23 +3516,39 @@ fn cast_atom_by_name(tname: &str, v: &K) -> KResult<K> {
             K::Timestamp(ns) | K::Timespan(ns) => K::Time(if *ns == NULL_LONG { NULL_INT } else { (ns.rem_euclid(NANOS_PER_DAY) / NANOS_PER_MILLI) as i32 }),
             K::Second(s) => K::Time(if *s == NULL_INT { NULL_INT } else { s * 1000 }),
             K::Minute(m) => K::Time(if *m == NULL_INT { NULL_INT } else { m * 60_000 }),
-            other => {
-                let n = other.as_i64()?;
-                K::Time(if n == NULL_LONG { NULL_INT } else { n as i32 })
-            }
+            other => K::Time(int_of_long(other.as_i64()?)),
         },
         "second" => match v {
             K::Time(ms) => K::Second(if *ms == NULL_INT { NULL_INT } else { ms / 1000 }),
             K::Minute(m) => K::Second(if *m == NULL_INT { NULL_INT } else { m * 60 }),
-            other => K::Second(other.as_i64()? as i32),
+            other => K::Second(int_of_long(other.as_i64()?)),
         },
         "minute" => match v {
             K::Time(ms) => K::Minute(if *ms == NULL_INT { NULL_INT } else { ms / 60_000 }),
             K::Second(s) => K::Minute(if *s == NULL_INT { NULL_INT } else { s / 60 }),
-            other => K::Minute(other.as_i64()? as i32),
+            other => K::Minute(int_of_long(other.as_i64()?)),
         },
         _ => return Err(KError::domain(format!("unsupported cast target `{tname}"))),
     })
+}
+
+/// A long as the int of a time: its null stays one.
+fn int_of_long(n: i64) -> i32 {
+    if n == NULL_LONG { NULL_INT } else { n as i32 }
+}
+
+/// A point in time written with its date (`2026-01-01 12:00`, `20260101-12:00`, `-0Wz`) as the type `kind`.
+fn parse_point(t: &str, kind: i16) -> K {
+    let compact = |d: &&str| d.bytes().all(|b| b.is_ascii_digit()) && matches!(t.as_bytes().get(8), None | Some(b'-' | b'T' | b'D' | b' '));
+    let norm = match t.get(..8).filter(compact) {
+        Some(d) => format!("{}.{}.{}D{}", &d[..4], &d[4..6], &d[6..], t.get(9..).unwrap_or("")),
+        None if t.starts_with('-') => t.to_string(),
+        None => t.replace('-', ".").replace(['T', ' '], "D"),
+    };
+    match crate::lexer::parse_scalar_token(&norm) {
+        Ok((k @ (K::Timestamp(_) | K::Date(_) | K::Datetime(_)), None)) => temporal::convert(&k, kind),
+        _ => temporal::convert(&K::Timestamp(NULL_LONG), kind),
+    }
 }
 
 pub fn parse_atom_from_str(type_ch: char, s: &str) -> K {
@@ -3571,12 +3593,18 @@ pub fn parse_atom_from_str(type_ch: char, s: &str) -> K {
             }
             K::Month(NULL_INT)
         }
-        'p' => {
-            let norm = t.replace('-', ".").replace(['T', ' '], "D");
-            if let Ok((K::Timestamp(ns), None)) = crate::lexer::parse_scalar_token(&norm) {
-                return K::Timestamp(ns);
+        'p' => parse_point(t, 12),
+        'z' => parse_point(t, 15),
+        'n' => {
+            // (hours, minutes, seconds and a fraction may be written as digits alone)
+            let text = match t.len() >= 6 && t.bytes().all(|b| b.is_ascii_digit()) {
+                true => format!("{}:{}:{}.{}", &t[..2], &t[2..4], &t[4..6], &t[6..]),
+                false => t.to_string(),
+            };
+            match crate::lexer::parse_scalar_token(&text) {
+                Ok((k @ (K::Timespan(_) | K::Time(_) | K::Second(_) | K::Minute(_)), None)) => temporal::convert(&k, 16),
+                _ => K::Timespan(NULL_LONG),
             }
-            K::Timestamp(NULL_LONG)
         }
         't' => {
             if let Ok((k, None)) = crate::lexer::parse_scalar_token(t) {

@@ -619,13 +619,6 @@ impl ColBuilder {
                 v.push(n);
             }
             Self::Long('j', v) => v.push(s.trim().trim_end_matches('j').parse().unwrap_or(NULL_LONG)),
-            Self::Long('n', v) => {
-                let n = match crate::lexer::parse_scalar_token(s.trim()) {
-                    Ok((K::Timespan(ns), None)) => ns,
-                    _ => NULL_LONG,
-                };
-                v.push(n);
-            }
             Self::Long(kind, v) => {
                 let n = match crate::engine::ops::parse_atom_from_str(*kind, s) {
                     K::Timestamp(n) | K::Timespan(n) | K::Long(n) => n,
@@ -635,9 +628,9 @@ impl ColBuilder {
             }
             Self::Real(v) => v.push(s.trim().trim_end_matches('e').parse().unwrap_or(f32::NAN)),
             Self::Float('f', v) => v.push(s.trim().trim_end_matches('f').parse().unwrap_or(f64::NAN)),
-            Self::Float(_, v) => {
-                let f = match crate::lexer::parse_scalar_token(s.trim()) {
-                    Ok((K::Datetime(dt), None)) => dt,
+            Self::Float(kind, v) => {
+                let f = match crate::engine::ops::parse_atom_from_str(*kind, s) {
+                    K::Datetime(dt) => dt,
                     _ => f64::NAN,
                 };
                 v.push(f);

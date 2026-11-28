@@ -16,8 +16,9 @@ pub fn nanos(k: &K) -> Option<i64> {
     Some(match k {
         K::Month(INF_INT) | K::Date(INF_INT) | K::Minute(INF_INT) | K::Second(INF_INT) | K::Time(INF_INT) => INF_LONG,
         K::Month(NINF_INT) | K::Date(NINF_INT) | K::Minute(NINF_INT) | K::Second(NINF_INT) | K::Time(NINF_INT) => NINF_LONG,
-        K::Month(m) => i64::from(date_from_ymd(2000 + m.div_euclid(12), m.rem_euclid(12) as u32 + 1, 1)?).saturating_mul(NANOS_PER_DAY),
-        K::Date(d) => i64::from(*d).saturating_mul(NANOS_PER_DAY),
+        // (a date too far off for nanoseconds is an infinity)
+        K::Month(m) => i64::from(date_from_ymd(2000 + m.div_euclid(12), m.rem_euclid(12) as u32 + 1, 1)?).saturating_mul(NANOS_PER_DAY).max(NINF_LONG),
+        K::Date(d) => i64::from(*d).saturating_mul(NANOS_PER_DAY).max(NINF_LONG),
         K::Datetime(d) => ((d * NANOS_PER_DAY as f64).round() as i64).max(NINF_LONG),
         K::Minute(m) => i64::from(*m) * MINUTE,
         K::Second(s) => i64::from(*s) * NANOS_PER_SEC,
@@ -27,7 +28,32 @@ pub fn nanos(k: &K) -> Option<i64> {
     })
 }
 
-/// The value of type `kind` (not month) at `ns` nanoseconds; its null for `None`.
+/// The type of the temporal type named `name`.
+pub fn kind_of(name: &str) -> Option<i16> {
+    let names = ["timestamp", "month", "date", "datetime", "timespan", "minute", "second", "time"];
+    names.iter().position(|&n| n == name).map(|i| 12 + i as i16)
+}
+
+/// Whether a temporal infinity is `k` or one of its items.
+pub fn has_infinity(k: &K) -> bool {
+    let int = |x: &i32| *x == INF_INT || *x == NINF_INT;
+    let long = |x: &i64| *x == INF_LONG || *x == NINF_LONG;
+    match k {
+        K::Month(x) | K::Date(x) | K::Minute(x) | K::Second(x) | K::Time(x) => int(x),
+        K::Timestamp(x) | K::Timespan(x) => long(x),
+        K::Datetime(x) => x.is_infinite(),
+        K::Vector(v) => match v {
+            ColVec::Month(_, xs) | ColVec::Date(_, xs) | ColVec::Minute(_, xs) | ColVec::Second(_, xs) | ColVec::Time(_, xs) => xs.iter().any(int),
+            ColVec::Timestamp(_, xs) | ColVec::Timespan(_, xs) => xs.iter().any(long),
+            ColVec::Datetime(_, xs) => xs.iter().any(|x| x.is_infinite()),
+            ColVec::General(_, xs) => xs.iter().any(has_infinity),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// The value of type `kind` at `ns` nanoseconds (for a month, only a null or an infinity); its null for `None`.
 fn at(ns: Option<i64>, kind: i16) -> K {
     let int = |unit: i64| {
         ns.map_or(NULL_INT, |n| match n {
@@ -39,9 +65,11 @@ fn at(ns: Option<i64>, kind: i16) -> K {
     let days = |n| match n {
         INF_LONG => f64::INFINITY,
         NINF_LONG => f64::NEG_INFINITY,
-        n => n as f64 / NANOS_PER_DAY as f64,
+        // (whole days and the rest apart, which gives the number a datetime literal does)
+        n => n.div_euclid(NANOS_PER_DAY) as f64 + n.rem_euclid(NANOS_PER_DAY) as f64 / NANOS_PER_DAY as f64,
     };
     match kind {
+        13 => K::Month(int(1)),
         14 => K::Date(int(NANOS_PER_DAY)),
         15 => K::Datetime(ns.map_or(f64::NAN, days)),
         17 => K::Minute(int(MINUTE)),

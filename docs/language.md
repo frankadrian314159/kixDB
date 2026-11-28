@@ -14,7 +14,11 @@ Integer arithmetic and aggregates wrap on overflow.
   down and `mod` takes the divisor's sign. Floats compare as equal within a relative difference of 2^-43.
 * Month, date, datetime and timestamp compare in the finer of two types, as do minute, second, time and timespan. A list
   such as `12:34 01:02:03` takes the finer type, or the type a letter after its last item names (`u v t n`). A date plus a
-  timespan is a timestamp. An infinity stays one when it is converted to the finer type.
+  timespan is a timestamp.
+* A temporal null or infinity cast or converted to another temporal type is that type's null or infinity, and a date too
+  far off for a timestamp is an infinite one. Casting a number's infinity keeps the number (`` `int$0Wh `` is `32767i`).
+* `"P"$`, `"Z"$` and `"N"$` read the forms q writes, a date with `-` or without separators (`20191122-11:11`), and for
+  a timespan digits alone (`hhmmss` and a fraction).
 * In a timestamp, timespan or datetime an hour may stand alone: `2026.01.01D12`, `0D0`, `2026.01.01T9`.
 * A symbol compares only with a symbol (`'type`). Writing a value of another type into a simple list, or adding one with
   `,:`, is `'type`; a general list whose items come to share a type becomes simple. One exception: longs that fit are

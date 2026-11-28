@@ -159,6 +159,7 @@ pub fn q_literal_for_column(text: &str, type_char: char) -> KResult<String> {
             'p' => "0Np".into(),
             'm' => "0Nm".into(),
             'd' => "0Nd".into(),
+            'z' => "0Nz".into(),
             'n' => "0Nn".into(),
             'u' => "0Nu".into(),
             'v' => "0Nv".into(),
