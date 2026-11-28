@@ -276,6 +276,48 @@ impl ShardClient {
         .await
     }
 
+    /// Stream table/keyed-table Arrow `RecordBatch`es from the shard as `(Flip, key_count)` chunks as they arrive.
+    pub async fn stream_flips(&self, ticket: Ticket, tx: tokio::sync::mpsc::Sender<(kixdb::Flip, usize)>) -> KResult<()> {
+        let term = self.term.load(Ordering::SeqCst);
+        let limit = self.limit();
+        let deadline = Instant::now().checked_add(limit);
+        let (mut stream, first) = self
+            .on_leader(true, limit, |ch| {
+                let ticket = ticket.clone();
+                async move {
+                    let mut stream = client(ch, term).do_get(ticket).await.map_err(status_of)?;
+                    let first = stream.try_next().await.map_err(status_of)?;
+                    Ok((stream, first))
+                }
+            })
+            .await?;
+        let schema = stream.schema().cloned().ok_or_else(|| KError::new("cluster", "the shard sent no schema"))?;
+        let mut cur = first;
+        while let Some(batch) = cur {
+            let cells = batch.num_rows() * batch.num_columns();
+            let s = schema.clone();
+            let unpacked = if cells <= UNPACK_ELSEWHERE {
+                arrowconv::batch_to_flip(&s, &batch).map_err(|e| KError::new("cluster", e))?
+            } else {
+                tokio::task::spawn_blocking(move || arrowconv::batch_to_flip(&s, &batch))
+                    .await
+                    .map_err(|e| KError::new("cluster", e.to_string()))?
+                    .map_err(|e| KError::new("cluster", e))?
+            };
+            if let Some(part) = unpacked {
+                if tx.send(part).await.is_err() {
+                    return Ok(());
+                }
+            }
+            let rem = deadline.map_or(Duration::MAX, |d| d.saturating_duration_since(Instant::now()));
+            cur = tokio::time::timeout(rem, stream.try_next())
+                .await
+                .map_err(|_| KError::new("cluster", format!("shard {}: no answer within {limit:?}", self.id)))?
+                .map_err(|e| wire::error_of(&status_of(e)))?;
+        }
+        Ok(())
+    }
+
     pub async fn load(&self, req: &LoadReq) -> KResult<()> {
         self.change(wire::ACTION_LOAD, body(req)?).await.map(|_| ())
     }

@@ -42,9 +42,8 @@ fn key_values(keys: &Flip, values: &ColVec) -> KResult<Vec<ColVec>> {
 }
 
 /// The place of each value (a row of `columns`) among the domain's `keys`, `None` for those not there.
-fn places(keys: Flip, columns: &[ColVec]) -> Vec<Option<usize>> {
-    let table = KeyedTable { keys, vals: Flip { cols: vec![], vals: vec![] } };
-    match_keys(&table, &columns.iter().collect::<Vec<_>>(), columns.first().map_or(0, ColVec::len))
+fn places(table: &KeyedTable, columns: &[ColVec]) -> Vec<Option<usize>> {
+    match_keys(table, &columns.iter().collect::<Vec<_>>(), columns.first().map_or(0, ColVec::len))
 }
 
 impl Engine<'_> {
@@ -53,14 +52,25 @@ impl Engine<'_> {
         [self.qualify(name), name].into_iter().find_map(|n| self.ws.vars.get(&n).map(|v| (n, v)))
     }
 
-    /// The columns whose values an enumeration of `tag` takes: the list itself, or the keys of the keyed table.
-    fn domain_keys(&self, tag: Tag) -> KResult<Flip> {
-        let (cols, vals) = match self.domain(tag.domain) {
-            Some((_, K::KeyedTable(t))) if tag.source == Source::Keys => (t.keys.cols.clone(), t.keys.vals.clone()),
-            Some((_, K::Vector(v))) if tag.source == Source::List => (vec![tag.domain], vec![v.clone()]),
-            _ => return Err(KError::new("cast", format!("`{} is not there to take values from", resolve(tag.domain)))),
-        };
-        Ok(Flip { cols, vals: vals.iter().map(|c| c.plain().clone()).collect() })
+    /// The keyed-table view whose keys an enumeration of `tag` takes (borrowing `KeyedTable` directly when its keys are plain).
+    fn domain_table(&self, tag: Tag) -> KResult<std::borrow::Cow<'_, KeyedTable>> {
+        match self.domain(tag.domain) {
+            Some((_, K::KeyedTable(t))) if tag.source == Source::Keys => {
+                if t.keys.vals.iter().all(|c| !matches!(c, ColVec::Enum(..))) {
+                    return Ok(std::borrow::Cow::Borrowed(t));
+                }
+                let keys = Flip {
+                    cols: t.keys.cols.clone(),
+                    vals: t.keys.vals.iter().map(|c| c.plain().clone()).collect(),
+                };
+                Ok(std::borrow::Cow::Owned(KeyedTable::from_flips(keys, Flip { cols: vec![], vals: vec![] })))
+            }
+            Some((_, K::Vector(v))) if tag.source == Source::List => {
+                let keys = Flip { cols: vec![tag.domain], vals: vec![v.plain().clone()] };
+                Ok(std::borrow::Cow::Owned(KeyedTable::from_flips(keys, Flip { cols: vec![], vals: vec![] })))
+            }
+            _ => Err(KError::new("cast", format!("`{} is not there to take values from", resolve(tag.domain)))),
+        }
     }
 
     /// `x` (an atom, a list, or one enumerated already) as an enumeration of `tag`: `'cast` for a value that the domain
@@ -70,17 +80,17 @@ impl Engine<'_> {
             return Ok(x.clone());
         }
         // row numbers need no looking up
-        let keys = match tag.source {
+        let dom = match tag.source {
             Source::Rows => None,
-            _ => Some(self.domain_keys(tag)?),
+            _ => Some(self.domain_table(tag)?),
         };
-        let (list, atom) = as_list(keys.as_ref().map_or(1, Flip::ncols), &x.plain());
-        let columns = match keys {
+        let (list, atom) = as_list(dom.as_ref().map_or(1, |t| t.keys.ncols()), &x.plain());
+        let columns = match dom {
             None => vec![long_column(list.as_i64_vec().ok_or_else(|| KError::ty("a linked column takes row numbers"))?)],
-            Some(keys) => {
-                let columns = key_values(&keys, &list)?;
+            Some(dom) => {
+                let columns = key_values(&dom.keys, &list)?;
                 let missing = |r: usize| columns.iter().any(|c| !c.get_atom(r).is_null());
-                if places(keys, &columns).iter().enumerate().any(|(r, at)| at.is_none() && missing(r)) {
+                if places(&dom, &columns).iter().enumerate().any(|(r, at)| at.is_none() && missing(r)) {
                     return Err(KError::new("cast", format!("not values of `{}", resolve(tag.domain))));
                 }
                 columns
@@ -121,10 +131,10 @@ impl Engine<'_> {
             let (list, atom) = as_list(1, &x.plain());
             return Ok((list.as_i64_vec().ok_or_else(|| KError::ty("a linked column takes row numbers"))?, atom));
         }
-        let keys = self.domain_keys(tag)?;
-        let (list, atom) = as_list(keys.ncols(), &x.plain());
-        let columns = key_values(&keys, &list)?;
-        Ok((places(keys, &columns).into_iter().map(|at| at.map_or(-1, |r| r as i64)).collect(), atom))
+        let dom = self.domain_table(tag)?;
+        let (list, atom) = as_list(dom.keys.ncols(), &x.plain());
+        let columns = key_values(&dom.keys, &list)?;
+        Ok((places(&dom, &columns).into_iter().map(|at| at.map_or(-1, |r| r as i64)).collect(), atom))
     }
 
     /// `x.column`: the column of the table that a foreign key or link refers to, at the rows it refers to.
@@ -157,7 +167,7 @@ impl Engine<'_> {
             K::Table(t) => K::Table(Arc::new(self.enumerate_rows(table, (**t).clone())?)),
             K::KeyedTable(t) => {
                 let (keys, vals) = (self.enumerate_rows(table, t.keys.clone())?, self.enumerate_rows(table, t.vals.clone())?);
-                K::KeyedTable(Arc::new(KeyedTable { keys, vals }))
+                K::KeyedTable(Arc::new(KeyedTable::from_flips(keys, vals)))
             }
             K::Dict(d) => {
                 let (K::Vector(ColVec::Sym(_, names)), mut values) = (&*d.keys, Vec::new()) else { return Ok(more.clone()) };

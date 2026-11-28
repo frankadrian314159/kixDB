@@ -56,7 +56,7 @@ pub fn rekey(flip: Flip, nkeys: usize) -> K {
     }
     let keys = Flip { cols: flip.cols[..nkeys].to_vec(), vals: flip.vals[..nkeys].to_vec() };
     let vals = Flip { cols: flip.cols[nkeys..].to_vec(), vals: flip.vals[nkeys..].to_vec() };
-    K::KeyedTable(Arc::new(KeyedTable { keys, vals }))
+    K::KeyedTable(Arc::new(KeyedTable::from_flips(keys, vals)))
 }
 
 /// A table or keyed table as `(columns, number of key columns)`.
@@ -104,20 +104,21 @@ pub fn schema_of(flip: &Flip) -> Flip {
     empty
 }
 
-fn is_table(v: &K) -> bool {
+pub fn is_table(v: &K) -> bool {
     matches!(v, K::Table(_) | K::KeyedTable(_))
 }
 
 /// A variable that holds a distributed table. (One named like a built-in verb stays on the control node: the name means
 /// the verb.)
-fn is_distributed(ws: &Workspace, name: SymId) -> bool {
+pub fn is_distributed(ws: &Workspace, name: SymId) -> bool {
     ws.vars.get(&name).is_some_and(is_table) && !is_builtin_verb(resolve(name))
 }
 
-/// Names as one session sees them (`ns` is its current namespace).
+/// Names as one session sees them (`ns` is its current namespace; `local` names tables still staged on the mirror).
 pub struct Names<'a> {
     pub mirror: &'a Server,
     pub ns: String,
+    pub local: &'a [SymId],
 }
 
 /// What an expression refers to.
@@ -135,6 +136,23 @@ impl Refs {
 }
 
 impl Names<'_> {
+    fn is_dist(&self, ws: &Workspace, name: SymId) -> bool {
+        !self.local.contains(&name) && is_distributed(ws, name)
+    }
+
+    pub fn qualify(&self, name: SymId) -> SymId {
+        let s = resolve(name);
+        if !s.starts_with('.') && self.ns != "." && !self.ns.is_empty() {
+            intern(&format!("{}.{s}", self.ns))
+        } else {
+            name
+        }
+    }
+
+    pub fn is_dist_exact(&self, qname: SymId) -> bool {
+        self.mirror.read_workspace(|ws| self.is_dist(ws, qname))
+    }
+
     /// The full name of a global that `name` means here, if one satisfies `want`.
     fn find(&self, ws: &Workspace, name: SymId, want: impl Fn(&Workspace, SymId) -> bool) -> Option<SymId> {
         let s = resolve(name);
@@ -150,7 +168,7 @@ impl Names<'_> {
     /// The distributed table `name` means here.
     pub fn table(&self, name: SymId) -> Option<Table> {
         self.mirror.read_workspace(|ws| {
-            let name = self.find(ws, name, is_distributed)?;
+            let name = self.find(ws, name, |ws, n| self.is_dist(ws, n))?;
             let (schema, nkeys) = unkey(&ws.vars[&name])?;
             let mode = ws.dist.get(&name).cloned().unwrap_or(DistMode::Replicated);
             Some(Table { name, schema, nkeys, mode })
@@ -194,14 +212,14 @@ impl Names<'_> {
     }
 
     pub fn all_tables(&self) -> Vec<SymId> {
-        self.mirror.read_workspace(|ws| ws.vars.keys().copied().filter(|&n| is_distributed(ws, n)).collect())
+        self.mirror.read_workspace(|ws| ws.vars.keys().copied().filter(|&n| self.is_dist(ws, n)).collect())
     }
 
-    /// The value of a global variable that is not a table or view.
+    /// The value of a global variable that is not a distributed table or view.
     pub fn global(&self, name: SymId) -> Option<K> {
         self.mirror.read_workspace(|ws| {
             let name = self.find(ws, name, |ws, n| ws.vars.contains_key(&n))?;
-            ws.vars.get(&name).filter(|v| !is_table(v)).cloned()
+            ws.vars.get(&name).filter(|v| !is_table(v) || self.local.contains(&name)).cloned()
         })
     }
 

@@ -1,13 +1,13 @@
 //! Running a pushed-down query: move the tables it needs, send the shards their part, put their answers together.
 use crate::catalog::{rekey, unkey};
 use crate::client::ticket;
-use crate::merge::Aggs;
+use crate::merge::{Aggs, Merger};
 use crate::plan::{Kind, Move, Push, Rel, DRIVER};
 use crate::Inner;
 use futures::future::try_join_all;
 use kix_shared_ces::wire::{ord_var, LoadMode, LoadReq, MutateReq, ShuffleReq, Work, ORD_COL};
 use kixdb::ast::{ColSpec, Expr, QSql, QSqlKind};
-use kixdb::engine::ops::{distinct_op, group_rows, sort_order, sublist_op};
+use kixdb::engine::ops::{distinct_op, merge_sorted_flips, sublist_op};
 use kixdb::engine::qsql::{exec_by_result, resolve_col_names};
 use kixdb::parser::parse_script;
 use kixdb::sym::{intern, resolve, SymId};
@@ -46,46 +46,40 @@ fn source(rel: &Rel, with_ordinals: bool) -> Expr {
     e
 }
 
-/// The rows of several shards' tables, one after the other (an empty table contributes nothing, not even its types).
-pub fn concat(parts: Vec<Flip>) -> KResult<Flip> {
-    let mut full = parts.iter().filter(|p| p.nrows() > 0).cloned();
-    let Some(mut acc) = full.next() else {
-        return parts.into_iter().next().ok_or_else(|| KError::new("cluster", "no shard answered"));
-    };
-    for next in full {
-        if next.cols != acc.cols {
-            return Err(KError::new("mismatch", "the shards returned different columns"));
-        }
-        for (a, b) in acc.vals.iter_mut().zip(&next.vals) {
-            *a = a.concat(b);
-        }
-    }
-    Ok(acc)
+/// Put rows that carry ordinals back in order via `O(N log k)` k-way merge and remove the ordinal column.
+pub fn in_order(parts: Vec<Flip>) -> KResult<Flip> {
+    in_order_limit(parts, None)
 }
 
-/// Put rows that carry ordinals back in order and remove the ordinal column.
-pub fn in_order(parts: Vec<Flip>) -> KResult<Flip> {
-    Ok(with_ordinals(parts)?.0)
+/// `in_order`, stopping early after `limit` rows when given.
+pub fn in_order_limit(parts: Vec<Flip>, limit: Option<usize>) -> KResult<Flip> {
+    let at = ord_col_idx(&parts)?;
+    let mut out = merge_sorted_flips(parts, &[(at, false)], limit)?;
+    out.cols.remove(at);
+    out.vals.remove(at);
+    Ok(out)
 }
 
 /// Rows that carry ordinals, in order, without the ordinal column, and their ordinals.
 pub fn with_ordinals(parts: Vec<Flip>) -> KResult<(Flip, Vec<i64>)> {
-    let all = concat(parts)?;
-    let at = all.col_idx(intern(ORD_COL)).ok_or_else(|| KError::new("cluster", "a shard returned no row ordinals"))?;
-    let ords = match &all.vals[at] {
-        ColVec::Long(_, v) => v.clone(),
-        _ => Arc::new(vec![]),
-    };
-    let (mut out, ords) = if ords.windows(2).all(|w| w[0] <= w[1]) {
-        (all, (*ords).clone())
-    } else {
-        let mut idx: Vec<usize> = (0..all.nrows()).collect();
-        idx.sort_by_key(|&r| ords[r]);
-        (all.gather(&idx), idx.iter().map(|&r| ords[r]).collect())
-    };
+    let at = ord_col_idx(&parts)?;
+    let mut out = merge_sorted_flips(parts, &[(at, false)], None)?;
     out.cols.remove(at);
-    out.vals.remove(at);
+    let ords = match out.vals.remove(at) {
+        ColVec::Long(_, v) => Arc::unwrap_or_clone(v),
+        _ => vec![],
+    };
     Ok((out, ords))
+}
+
+fn ord_col_idx(parts: &[Flip]) -> KResult<usize> {
+    parts
+        .iter()
+        .find(|p| p.nrows() > 0)
+        .or_else(|| parts.first())
+        .ok_or_else(|| KError::new("cluster", "no shard answered"))?
+        .col_idx(intern(ORD_COL))
+        .ok_or_else(|| KError::new("cluster", "a shard returned no row ordinals"))
 }
 
 fn flip_of(k: K) -> KResult<(Flip, usize)> {
@@ -100,11 +94,47 @@ fn dict(keys: K, vals: K) -> K {
     K::Dict(Arc::new(Dict { keys: Box::new(keys), vals: Box::new(vals) }))
 }
 
+fn wrap_sort_stages(mut expr: Expr, stages: &[(Vec<SymId>, bool)], top_k: Option<usize>) -> Expr {
+    for (cols, desc) in stages.iter().rev() {
+        let lhs = Expr::Lit(K::Vector(ColVec::Sym(Attr::None, Arc::new(cols.clone()))));
+        let op = intern(if *desc { "xdesc" } else { "xasc" });
+        expr = Expr::Binary { op, lhs: Box::new(lhs), rhs: Box::new(expr) };
+    }
+    if let Some(k) = top_k {
+        expr = Expr::Binary {
+            op: intern("sublist"),
+            lhs: Box::new(Expr::Lit(K::Long(k as i64))),
+            rhs: Box::new(expr),
+        };
+    }
+    expr
+}
+
 impl Inner {
     /// Evaluate the same work on every shard.
     pub(crate) fn all(&self, work: Work) -> KResult<Vec<K>> {
         let (ticket, shards) = (ticket(work)?, self.shards());
         self.wait(try_join_all(shards.iter().map(|s| s.run(ticket.clone()))))
+    }
+
+    /// Stream `(Flip, key_count)` batches from all shards concurrently as they arrive.
+    pub(crate) fn stream_all_flips(&self, work: Work, mut on_part: impl FnMut(Flip, usize) -> KResult<()>) -> KResult<()> {
+        let (ticket, shards) = (ticket(work)?, self.shards());
+        self.wait(async {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(shards.len().max(1) * 2);
+            let producers = async {
+                let res = try_join_all(shards.iter().map(|s| s.stream_flips(ticket.clone(), tx.clone()))).await;
+                drop(tx);
+                res
+            };
+            let consumer = async {
+                while let Some((part, nkeys)) = rx.recv().await {
+                    on_part(part, nkeys)?;
+                }
+                Ok::<(), KError>(())
+            };
+            tokio::try_join!(producers, consumer).map(|_| ())
+        })
     }
 
     pub(crate) fn one(&self, shard: usize, e: Expr) -> KResult<K> {
@@ -155,18 +185,119 @@ impl Inner {
         self.mutate_all(&MutateReq { table: temp, query }).map(|_| ())
     }
 
-    /// Run `push`; `mirror` evaluates what the control node computes itself.
-    pub(crate) fn run_push(&self, mirror: &mut Connection, push: &Push) -> KResult<K> {
-        let result = push.rel.moves.iter().try_for_each(|m| self.move_table(m)).and_then(|_| self.run_kind(mirror, push));
+    fn with_moves<R>(&self, moves: &[Move], f: impl FnOnce() -> KResult<R>) -> KResult<R> {
+        let result = moves.iter().try_for_each(|m| self.move_table(m)).and_then(|_| f());
         // temporary tables go whether or not the query worked
         let none = K::Null;
-        for m in &push.rel.moves {
+        for m in moves {
             let dropped = self.load_all(&LoadReq::new(resolve(m.temp), LoadMode::Drop, &none, None));
             if result.is_ok() {
                 dropped?;
             }
         }
         result
+    }
+
+    /// Run `push`; `mirror` evaluates what the control node computes itself.
+    pub(crate) fn run_push(&self, mirror: &mut Connection, push: &Push) -> KResult<K> {
+        self.with_moves(&push.rel.moves, || self.run_kind(mirror, push))
+    }
+
+    /// Push `stages` (`xasc`/`xdesc`) and optional `top_k` (`sublist`) down to the shards and merge via `O(N log k)` k-way merge.
+    pub(crate) fn run_sorted_push(&self, push: &Push, stages: &[(Vec<SymId>, bool)], top_k: Option<usize>) -> KResult<K> {
+        self.with_moves(&push.rel.moves, || {
+            let q = &push.query;
+            match &push.kind {
+                Kind::Replicated => {
+                    let mut sent = q.clone();
+                    *sent.from = source(&push.rel, false);
+                    self.one(0, wrap_sort_stages(Expr::Query(Box::new(sent)), stages, top_k))
+                }
+                Kind::Route(shard) => {
+                    let mut sent = q.clone();
+                    *sent.from = source(&push.rel, false);
+                    self.one(*shard, wrap_sort_stages(Expr::Query(Box::new(sent)), stages, top_k))
+                }
+                Kind::Ordered | Kind::ByKey => {
+                    let is_ordered = matches!(push.kind, Kind::Ordered);
+                    let mut sent = q.clone();
+                    *sent.from = source(&push.rel, is_ordered);
+                    sent.kind = QSqlKind::Select;
+                    sent.limit = None;
+                    if is_ordered && !sent.cols.is_empty() {
+                        sent.cols.push(ColSpec { name: Some(intern(ORD_COL)), expr: Expr::Var(intern(ORD_COL)) });
+                    }
+                    let mut base = Expr::Query(Box::new(sent));
+                    if is_ordered {
+                        base = Expr::Binary {
+                            op: intern("xasc"),
+                            lhs: Box::new(Expr::Lit(K::Sym(intern(ORD_COL)))),
+                            rhs: Box::new(base),
+                        };
+                    }
+                    let shard_expr = wrap_sort_stages(base, stages, top_k);
+                    let answers = self.all(Work::Eval(Box::new(shard_expr)))?;
+                    let flips = answers.into_iter().map(flip_of).collect::<KResult<Vec<_>>>()?;
+                    let nkeys = if is_ordered {
+                        if q.cols.is_empty() { push.rel.nkeys } else { 0 }
+                    } else {
+                        flips[0].1
+                    };
+                    let parts: Vec<Flip> = flips.into_iter().map(|f| f.0).collect();
+                    let ref_flip = parts.iter().find(|p| p.nrows() > 0).unwrap_or(&parts[0]);
+
+                    let mut specs_idx: Vec<(usize, bool)> = Vec::new();
+                    let mut first_asc_sym: Option<SymId> = None;
+                    let mut saw_nonempty = false;
+                    for (cols, desc) in stages {
+                        if cols.is_empty() {
+                            continue;
+                        }
+                        for (j, &s) in cols.iter().enumerate() {
+                            let ci = ref_flip.col_idx(s).ok_or_else(|| KError::value(resolve(s)))?;
+                            if !saw_nonempty && j == 0 && !*desc {
+                                first_asc_sym = Some(s);
+                            }
+                            if !specs_idx.iter().any(|&(c, _)| c == ci) {
+                                specs_idx.push((ci, *desc));
+                            }
+                        }
+                        saw_nonempty = true;
+                    }
+                    if is_ordered {
+                        let ord_ci = ref_flip
+                            .col_idx(intern(ORD_COL))
+                            .ok_or_else(|| KError::new("cluster", "a shard returned no row ordinals"))?;
+                        specs_idx.push((ord_ci, false));
+                        let mut merged = merge_sorted_flips(parts, &specs_idx, top_k)?;
+                        merged.cols.remove(ord_ci);
+                        merged.vals.remove(ord_ci);
+                        if top_k.is_none() {
+                            if let Some(ci) = first_asc_sym.and_then(|s| merged.col_idx(s)) {
+                                merged.vals[ci].set_attr_unchecked(Attr::Sorted);
+                            }
+                        }
+                        Ok(rekey(merged, nkeys))
+                    } else {
+                        for ki in 0..nkeys {
+                            if !specs_idx.iter().any(|&(c, _)| c == ki) {
+                                specs_idx.push((ki, false));
+                            }
+                        }
+                        let mut merged = merge_sorted_flips(parts, &specs_idx, top_k)?;
+                        if top_k.is_none() {
+                            if let Some(ci) = first_asc_sym.and_then(|s| merged.col_idx(s)) {
+                                merged.vals[ci].set_attr_unchecked(Attr::Sorted);
+                            } else if !saw_nonempty && nkeys == 1 {
+                                merged.vals[0].set_attr_unchecked(Attr::Sorted);
+                            }
+                        }
+                        Ok(rekey(merged, nkeys))
+                    }
+                }
+                Kind::TwoPhase(_) => unreachable!(),
+            }
+        })
     }
 
     fn run_kind(&self, mirror: &mut Connection, push: &Push) -> KResult<K> {
@@ -178,12 +309,17 @@ impl Inner {
         };
         // the query as one shard answers it whole
         let whole = || {
-            with(&|s| {
+            let sent = with(&|s| {
                 *s.from = source(&push.rel, false);
                 if push.exec_single {
                     s.cols[0].name = None;
                 }
-            })
+            });
+            // (`exec` takes no notice of the mark)
+            match q.distinct && q.kind == QSqlKind::Exec {
+                true => Expr::Unary { op: intern("distinct"), arg: Box::new(sent) },
+                false => sent,
+            }
         };
         match &push.kind {
             Kind::Replicated => self.one(0, whole()),
@@ -193,18 +329,30 @@ impl Inner {
                 s.kind = QSqlKind::Select;
                 s.limit = None;
             })),
-            Kind::Ordered => self.ordered(push, with(&|s| {
-                *s.from = source(&push.rel, true);
-                s.kind = QSqlKind::Select;
-                if !s.cols.is_empty() {
-                    s.cols.push(ColSpec { name: Some(intern(ORD_COL)), expr: Expr::Var(intern(ORD_COL)) });
-                }
-                // `distinct` applies to all rows together; a limit taken of each shard's rows still holds the answer
-                if s.distinct {
-                    s.distinct = false;
-                    s.limit = None;
-                }
-            })),
+            Kind::Ordered => {
+                let ord = intern(ORD_COL);
+                let sent = with(&|s| {
+                    *s.from = source(&push.rel, true);
+                    s.kind = QSqlKind::Select;
+                    if !s.cols.is_empty() {
+                        s.cols.push(ColSpec { name: Some(ord), expr: Expr::Var(ord) });
+                    }
+                    // `distinct` applies to all rows together; a limit taken of each shard's rows still holds the answer
+                    if s.distinct {
+                        s.distinct = false;
+                        s.limit = None;
+                    }
+                });
+                // each shard sends only the first of its own equal rows, compared without their ordinals
+                let sent = match q.distinct && !q.cols.is_empty() {
+                    true => Expr::Apply {
+                        target: Box::new(Expr::Var(intern(".kix.firsts"))),
+                        args: vec![Some(sent), Some(Expr::Lit(K::Sym(ord)))],
+                    },
+                    false => sent,
+                };
+                self.ordered(push, sent)
+            }
             Kind::TwoPhase(aggs) => self.two_phase(mirror, push, aggs, with(&|s| {
                 *s.from = source(&push.rel, false);
                 s.kind = QSqlKind::Select;
@@ -221,12 +369,20 @@ impl Inner {
         }
     }
 
+    fn pos_limit(&self, push: &Push) -> Option<usize> {
+        match push.query.limit.as_deref() {
+            Some(Expr::Lit(n)) => n.as_i64().ok().filter(|&m| m >= 0).map(|m| m as usize),
+            _ => None,
+        }
+    }
+
     fn by_key(&self, push: &Push, sent: Expr) -> KResult<K> {
         let answers = self.all(Work::Eval(Box::new(sent)))?;
         let flips = answers.into_iter().map(flip_of).collect::<KResult<Vec<_>>>()?;
         let nkeys = flips[0].1;
-        let all = concat(flips.into_iter().map(|f| f.0).collect())?;
-        let mut sorted = all.gather(&sort_order(&all.vals[..nkeys], all.nrows()));
+        let specs: Vec<(usize, bool)> = (0..nkeys).map(|i| (i, false)).collect();
+        let limit = (push.query.kind != QSqlKind::Exec).then(|| self.pos_limit(push)).flatten();
+        let mut sorted = merge_sorted_flips(flips.into_iter().map(|f| f.0).collect(), &specs, limit)?;
         if nkeys == 1 {
             sorted.vals[0].set_attr_unchecked(Attr::Sorted);
         }
@@ -243,11 +399,13 @@ impl Inner {
     fn ordered(&self, push: &Push, sent: Expr) -> KResult<K> {
         let answers = self.all(Work::Eval(Box::new(sent)))?;
         let flips = answers.into_iter().map(|k| flip_of(k).map(|f| f.0)).collect::<KResult<Vec<_>>>()?;
-        let rows = in_order(flips)?;
         let q = &push.query;
+        let limit = (!q.distinct && q.kind != QSqlKind::Exec).then(|| self.pos_limit(push)).flatten();
+        let rows = in_order_limit(flips, limit)?;
         if q.kind == QSqlKind::Exec {
             return Ok(if push.exec_single {
-                K::Vector(rows.vals[0].clone())
+                let values = K::Vector(rows.vals[0].clone());
+                if q.distinct { distinct_op(&values)? } else { values }
             } else {
                 dict(names(&rows), K::Vector(ColVec::from_atoms(rows.vals.into_iter().map(K::Vector).collect())))
             });
@@ -264,28 +422,15 @@ impl Inner {
     }
 
     fn two_phase(&self, mirror: &mut Connection, push: &Push, aggs: &Aggs, sent: Expr) -> KResult<K> {
-        let answers = self.all(Work::Eval(Box::new(sent)))?;
-        let flips = answers.into_iter().map(flip_of).collect::<KResult<Vec<_>>>()?;
-        let nkeys = flips[0].1;
-        let empty_keys = Flip { cols: flips[0].0.cols[..nkeys].to_vec(), vals: flips[0].0.vals[..nkeys].to_vec() };
-        let all = concat(flips.into_iter().map(|f| f.0).collect())?;
-        // no group anywhere: the answer has the shape the query has on the empty tables
-        if all.nrows() == 0 {
-            return mirror.eval_expr(&push.original);
-        }
-        // the rows of each group, the groups in key order
-        let (first_rows, mut groups) = group_rows(&all.vals[..nkeys], all.nrows());
-        let first_keys: Vec<ColVec> = all.vals[..nkeys].iter().map(|c| c.gather(&first_rows)).collect();
-        let order = sort_order(&first_keys, first_rows.len());
-        let groups: Vec<Vec<usize>> = order.iter().map(|&g| std::mem::take(&mut groups[g])).collect();
-        let merged = (0..aggs.leaf_count())
-            .map(|leaf| aggs.merge(leaf, &all.vals[nkeys..], &groups))
-            .collect::<KResult<Vec<_>>>()?;
         let grouped = push.query.by.is_some();
-        let leaves: Vec<K> = merged
-            .into_iter()
-            .map(|mut v| if grouped { K::Vector(ColVec::from_atoms(v)) } else { v.pop().unwrap_or(K::Null) })
-            .collect();
+        let mut merger = Merger::new(aggs);
+        self.stream_all_flips(Work::Eval(Box::new(sent)), |part, nkeys| merger.push(part, nkeys))?;
+        let Some((keys, leaves)) = merger.finish(grouped) else {
+            // no group anywhere: the answer has the shape the query has on the empty tables
+            return mirror.eval_expr(&push.original);
+        };
+        let nkeys = keys.ncols();
+        let ngroups = keys.nrows();
         let mut values = Vec::with_capacity(aggs.trees.len());
         for t in &aggs.trees {
             values.push(mirror.eval_expr(&aggs.rebuild(t, &leaves))?);
@@ -302,10 +447,6 @@ impl Inner {
             let cols = values.into_iter().map(|v| ColVec::from_atoms(vec![v])).collect();
             return self.limit(push, K::Table(Arc::new(Flip::new(val_names, cols)?)));
         }
-        let mut keys = Flip { cols: empty_keys.cols, vals: first_keys.iter().map(|c| c.gather(&order)).collect() };
-        if nkeys == 1 {
-            keys.vals[0].set_attr_unchecked(Attr::Sorted);
-        }
         for n in &mut val_names {
             if keys.cols.contains(n) {
                 *n = intern(&format!("{}_1", resolve(*n)));
@@ -315,12 +456,12 @@ impl Inner {
             .into_iter()
             .map(|v| match v {
                 K::Vector(cv) => cv,
-                atom => ColVec::repeat(atom, order.len()),
+                atom => ColVec::repeat(atom, ngroups),
             })
             .collect();
         let vals = Flip::new(val_names, cols)?;
         if push.query.kind == QSqlKind::Exec {
-            return Ok(exec_by_result(&KeyedTable { keys, vals }));
+            return Ok(exec_by_result(&KeyedTable::from_flips(keys, vals)));
         }
         let mut cols = keys.cols;
         cols.extend(vals.cols);

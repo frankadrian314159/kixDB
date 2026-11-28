@@ -536,3 +536,232 @@ fn a_join_that_overwrites_the_distribution_column_is_not_pushed_down() {
     p.check("select from trade lj inst where sector = `tech");
     p.check("select sum size by sector from ej[`sym; trade; 0 ! inst]");
 }
+
+#[test]
+fn streamed_two_phase_and_k_way_sorted_merges_match_one_engine() {
+    let mut p = market(3);
+    // Multi-batch (>8,192 groups per shard) two-phase aggregation across 1, 2, and string keys
+    p.check(".kix.dist[`big; `sharded; `sid]");
+    p.check(
+        "big: ([] sid: til 30000; g1: (til 30000) mod 20000; g2: `a`b`c`d ((til 30000) mod 4); \
+         v: 1.5 * 1 + (til 30000) mod 97; w: 1 + (til 30000) mod 13; tag: string (til 30000) mod 500)",
+    );
+    p.plan(
+        "select s: sum w, vf: sum v, a: avg v, dv: dev v, sv: svar v, wv: w wavg v, mn: min v, mx: max g2, n: count i by g1 from big",
+        "two-phase",
+    );
+    p.plan("select sum w, avg v, min sid, max sid by g1, g2 from big where w > 3", "two-phase");
+    p.plan("select sum w, avg v by tag from big", "two-phase");
+
+    // K-way sorted merge and pushed-down top-K (`sublist` + `xasc`/`xdesc`) on Ordered and ByKey queries
+    p.plan("`price xasc trade", "k-way sorted merge");
+    p.plan("`size xdesc `price xasc trade", "k-way sorted merge");
+    p.plan("15 sublist `price xdesc `time xasc select sym, time, price, size from trade where size > 20", "k-way sorted merge");
+    p.plan("5 sublist `s xdesc select s: sum size, hi: max price by sym from trade", "k-way sorted merge");
+    p.plan("5 sublist `s xdesc 0! select s: sum size by sym from trade", "k-way sorted merge");
+    p.plan("25 sublist `v xdesc `sid xasc big", "k-way sorted merge");
+}
+
+#[test]
+fn verbs_applied_item_by_item_run_on_the_shards() {
+    let mut p = Pair::new(3);
+    for statement in [
+        ".kix.dist[`cust; `sharded; `id]",
+        "n: 60",
+        "cust: ([] id: til n; grp: `a`b`c (til n) mod 3; name: n#(\"ann\";\"bo\";\"carla\";\"\"); \
+         phone: (n#(\"13\";\"31\";\"23\";\"99\")) ,' \"-555-\" ,/: string til n; bal: -50 + (37 * til n) mod 101)",
+        ".kix.dist[`none; `sharded; `id]",
+        "none: 0 # cust",
+    ] {
+        p.single.eval(statement).unwrap_or_else(|e| panic!("{statement}: {e}"));
+        p.session.eval(statement).unwrap_or_else(|e| panic!("{statement}: {e}"));
+    }
+    for table in ["cust", "none"] {
+        for (columns, how) in [
+            ("cc: `$2#'phone", "merged in order"),
+            ("a: 2#'phone, b: 2_'phone, c: -3#'phone", "merged in order"),
+            ("a: (phone ,\\: \"x\"), b: (\"+\" ,/: phone), c: (name ,' phone)", "merged in order"),
+            ("n: count each phone, f: first each name, u: upper each name, r: reverse peach phone", "merged in order"),
+            ("n: count'[phone], m: 2 + count each name, s: `$\"-\" vs/: phone", "merged in order"),
+            ("n: count' phone, r: reverse' name", "merged in order"),
+            ("n: sum count each phone, m: max count each name by grp", "two-phase"),
+            ("n: sum count each phone", "two-phase"),
+            ("n: count i by cc: `$2#'phone", "two-phase"),
+            ("n: count each phone by id", "grouped by"),
+            ("f: first each phone, g: upper first each name", "merged in order"),
+            ("n: count i by f: first each phone", "two-phase"),
+            ("m: max first each phone by grp", "two-phase"),
+            ("distinct f: 2#'phone", "merged in order"),
+        ] {
+            p.plan(&format!("select {columns} from {table}"), how);
+        }
+        p.plan(&format!("exec `$2#'phone from {table}"), "merged in order");
+        // (the first clause leaves most shards, or all, without rows for those that follow)
+        for first in ["bal > -100", "id < 1", "id < 0"] {
+            for then in [
+                "(`$2#'phone) in `13`31",
+                "(`$2#'phone) like \"1*\"",
+                "0 < count each phone",
+                "(5 xbar count each phone) within 5 10",
+                "\"1\" = first each phone",
+                "\"13\" ~/: 2#'phone",
+                "name ~\\: \"ann\"",
+                "\"5\" in/: phone",
+            ] {
+                p.plan(&format!("select id, cc: 2#'phone from {table} where {first}, {then}"), "merged in order");
+                p.check(&format!("select n: sum count each phone, hi: max count each name from {table} where {first}, {then}"));
+            }
+        }
+    }
+    // TPC-H Q22's shape: folded into two-phase aggregation on the shards so no table comes to the control node
+    for statement in [
+        "avg_bal: exec avg bal from (select bal, cc: `$2#'phone from cust where bal > 0) where cc in `13`31",
+        "select numcust: count i, total: sum bal by cc from (select bal, cc: `$2#'phone from cust where bal > avg_bal, not id in 1 2 3) where cc in `13`31",
+    ] {
+        let plan = p.check(statement);
+        assert!(plan.contains("two-phase") && !plan.contains("gather cust"), "{statement}: {plan}");
+    }
+    // what needs other rows, or a function of the user's, is computed on the control node
+    for columns in ["(name ,\\: phone)", "(name ,/: phone)", "{count x} each phone", "(phone ,' name 0)", "(,':) name", "count each distinct name"] {
+        p.plan(&format!("select {columns} from cust"), "gather cust");
+    }
+    // changes: rows are chosen on the shards, new columns are made here, so that every shard gets their types
+    p.plan("delete from `cust where \"99\" ~/: 2#'phone", "update / delete run on every shard");
+    p.check("update len: count each phone from `cust where id < 1");
+    p.check("update len: count each phone from `cust");
+    p.check("update bal: 0 from `cust where name ~\\: \"bo\"");
+    p.check("`cust insert (100; `a; \"zed\"; \"13-000\"; 5; 6)");
+    p.check("cust");
+}
+
+#[test]
+fn distinct_rows_are_dropped_on_the_shards() {
+    let mut p = Pair::new(3);
+    for statement in [
+        ".kix.dist[`t; `sharded; `id]",
+        "n: 90",
+        "t: ([] id: til n; s: `c`a`b`a (til n) mod 4; v: n#3 1 2 3 1; f: n#0n 1.5 -0.0 0.0 2.5; d: 2026.01.01 + (til n) mod 3; \
+         flag: n#10b; name: n#(\"bo\";\"ann\";\"\";\"x\"); g: n#(1; `a; \"xy\"; 1 2; ()); sorted: `s#(til n) div 30)",
+        ".kix.dist[`none; `sharded; `id]",
+        "none: 0 # t",
+        ".kix.dist[`kt; `sharded; `id]",
+        "kt: ([id: til 20] s: 20#`b`a)",
+        ".kix.dist[`inst; `replicated]",
+        "inst: ([] s: `c`a`b`a; w: 1 2 3 2)",
+    ] {
+        p.single.eval(statement).unwrap_or_else(|e| panic!("{statement}: {e}"));
+        p.session.eval(statement).unwrap_or_else(|e| panic!("{statement}: {e}"));
+    }
+    let pushed = "distinct rows merged in order";
+    for table in ["t", "none"] {
+        // (the last two filters leave most shards, or all, without rows)
+        for filter in ["", " where v > 1", " where id < 1", " where id < 0"] {
+            for column in ["s", "v", "f", "d", "flag", "name", "g", "sorted", "2#'name", "v * 10", "count each name", "first each name"] {
+                p.plan(&format!("distinct exec {column} from {table}{filter}"), pushed);
+                p.plan(&format!("exec distinct {column} from {table}{filter}"), pushed);
+                p.plan(&format!("select distinct c: {column} from {table}{filter}"), pushed);
+                p.check(&format!("attr distinct exec {column} from {table}{filter}"));
+                p.check(&format!("meta select distinct c: {column} from {table}{filter}"));
+            }
+            for columns in ["s, v", "s, f, d", "name, g", "s, c: v, d", "s, s", "sorted, flag"] {
+                p.plan(&format!("select distinct {columns} from {table}{filter}"), pushed);
+                p.plan(&format!("distinct select {columns} from {table}{filter}"), pushed);
+            }
+        }
+    }
+    p.plan("select[3] distinct s from t", pushed);
+    p.plan("select[-2] distinct s, v from t", pushed);
+    p.plan("select distinct from t where v > 1", "merged in order");
+    p.plan("select distinct s from t where v = (max; v) fby id", pushed);
+    p.plan("distinct exec s from kt", pushed);
+    p.plan("select distinct s from kt", pushed);
+    p.check("distinct select from kt");
+    p.check("select distinct from kt");
+    // one shard answers whole
+    p.plan("distinct exec s from t where id = 7", "route");
+    p.plan("exec distinct s from t where id = 7", "route");
+    p.plan("exec distinct s from inst", "replicated");
+    p.plan("distinct select s, w from inst", "replicated");
+    // as part of a larger statement
+    p.plan("x: distinct exec s from t; count x", "control");
+    p.plan("count distinct exec s from t", pushed);
+    p.plan("select from inst where s in distinct exec s from t", "replicated");
+    p.plan("select id from t where s in exec distinct s from t where v > 2", "merged in order");
+    // what is not the distinct rows of one query is done as before
+    p.check("distinct exec s, v from t");
+    p.check("exec distinct s, v from t");
+    p.check("distinct select[3] s from t");
+    p.check("exec distinct s by v from t");
+    p.check("distinct select s by v from t");
+    p.check("exec distinct sum v from t");
+    p.check("distinct exec distinct s from t");
+    p.check("exec distinct nosuch from t");
+}
+
+#[test]
+fn general_columns_stay_general_where_rows_share_a_type() {
+    let mut p = Pair::new(3);
+    for statement in [
+        ".kix.dist[`t; `sharded; `id]",
+        "t: ([] id: til 12; s: 12#`a`b; g: 12#(1; `a; \"xy\"))",
+        // (each of these rows is on a shard of its own, which so holds one type)
+        ".kix.dist[`u; `sharded; `id]",
+        "u: ([] id: 0 1; g: (1; `a))",
+    ] {
+        p.single.eval(statement).unwrap_or_else(|e| panic!("{statement}: {e}"));
+        p.session.eval(statement).unwrap_or_else(|e| panic!("{statement}: {e}"));
+    }
+    for code in [
+        "exec g from t where id < 1",
+        "select g from t where id in 0 3 6 9",
+        "exec g from `id xdesc select from t where id in 0 3",
+        "x: select from t where id in 0 3; x`g",
+        "exec g by s from t where id in 0 6",
+        "select count i by g from t where id in 0 3 6 9",
+        "select count i by g from u",
+        "exec g from u where id = 1",
+    ] {
+        p.check(code);
+    }
+}
+
+#[test]
+fn rows_of_one_type_can_be_added_to_mixed_columns() {
+    let mut p = Pair::new(3);
+    for code in [
+        ".kix.dist[`u; `sharded; `id]",
+        // (two shards hold one type each, and one holds no row)
+        "u: ([] id: 0 1; g: (1; `a))",
+        "`u insert (0; 2)",
+        "`u insert (0; `b)",
+        "`u insert (3 4 5; 6 7 8)",
+        "`u insert (3 4 5; `c`d`e)",
+        "u,: ([] id: 6 7; g: 1 2)",
+        "u",
+        "delete from `u where id > 1",
+        "`u insert (2; 9)",
+        "`u insert (2; `f)",
+        "u",
+        ".kix.dist[`kt; `sharded; `id]",
+        "kt: ([id: 0 1] g: (1; `a))",
+        "`kt upsert (0; 2)",
+        "`kt upsert (0; `b)",
+        "`kt upsert (3 4 5; 6 7 8)",
+        "`kt upsert (3 4 5; `c`d`e)",
+        "kt",
+        ".kix.dist[`st; `sharded; `id]",
+        "st: ([] id: 0 1; g: (\"ab\"; \"cd\"))",
+        "`st insert (3 4 5; 6 7 8)",
+        "`st insert (3 4 5; `c`d`e)",
+        "st",
+        // an empty column takes the type of what is added
+        ".kix.dist[`e; `sharded; `id]",
+        "e: ([] id: `long$(); g: ())",
+        "`e insert (0 1; 2 3)",
+        "`e insert (2; `a)",
+        "meta e",
+        "e",
+    ] {
+        p.check(code);
+    }
+}

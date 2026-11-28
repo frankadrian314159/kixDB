@@ -177,12 +177,22 @@ fn write_tag(buf: &mut Vec<u8>, type_num: i8, tag: &Tag) {
     write_nul_str(buf, resolve(tag.domain));
 }
 
+#[cfg(target_endian = "little")]
+fn extend_pod_le<T: Copy>(buf: &mut Vec<u8>, xs: &[T]) {
+    let byte_len = std::mem::size_of_val(xs);
+    // SAFETY: Only called for plain primitive numbers (`i16`, `i32`, `i64`, `f32`, `f64`) with no padding,
+    // whose in-memory layout on little-endian targets matches kdb+ little-endian wire bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(xs.as_ptr().cast::<u8>(), byte_len) };
+    buf.extend_from_slice(bytes);
+}
+
 fn write_colvec(buf: &mut Vec<u8>, cv: &ColVec, stored: bool) {
     if let ColVec::Strings(attr, s) = cv {
         // type 21: the attribute, the count, each length and then the text; otherwise a general list of strings
         buf.extend_from_slice(&[if stored { 21 } else { 0 }, attr.ipc_byte()]);
         buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
         if stored {
+            buf.reserve(s.len().saturating_mul(4).saturating_add(s.text().len()));
             s.lengths().for_each(|n| buf.extend_from_slice(&n.to_le_bytes()));
             buf.extend_from_slice(s.text());
         } else {
@@ -208,19 +218,18 @@ fn write_colvec(buf: &mut Vec<u8>, cv: &ColVec, stored: bool) {
             }
         }
         ColVec::Bool(_, xs) => {
-            for &b in xs.iter() {
-                buf.push(u8::from(b));
-            }
+            buf.extend(xs.iter().map(u8::from));
         }
         ColVec::Guid(_, xs) => {
-            for g in xs.iter() {
-                buf.extend_from_slice(g);
-            }
+            buf.extend_from_slice(xs.as_flattened());
         }
         ColVec::Byte(_, xs) | ColVec::Char(_, xs) => {
             buf.extend_from_slice(xs);
         }
         ColVec::Short(_, xs) => {
+            #[cfg(target_endian = "little")]
+            extend_pod_le(buf, xs);
+            #[cfg(not(target_endian = "little"))]
             for &v in xs.iter() {
                 buf.extend_from_slice(&v.to_le_bytes());
             }
@@ -231,21 +240,33 @@ fn write_colvec(buf: &mut Vec<u8>, cv: &ColVec, stored: bool) {
         | ColVec::Minute(_, xs)
         | ColVec::Second(_, xs)
         | ColVec::Time(_, xs) => {
+            #[cfg(target_endian = "little")]
+            extend_pod_le(buf, xs);
+            #[cfg(not(target_endian = "little"))]
             for &v in xs.iter() {
                 buf.extend_from_slice(&v.to_le_bytes());
             }
         }
         ColVec::Long(_, xs) | ColVec::Timestamp(_, xs) | ColVec::Timespan(_, xs) => {
+            #[cfg(target_endian = "little")]
+            extend_pod_le(buf, xs);
+            #[cfg(not(target_endian = "little"))]
             for &v in xs.iter() {
                 buf.extend_from_slice(&v.to_le_bytes());
             }
         }
         ColVec::Real(_, xs) => {
+            #[cfg(target_endian = "little")]
+            extend_pod_le(buf, xs);
+            #[cfg(not(target_endian = "little"))]
             for &v in xs.iter() {
                 buf.extend_from_slice(&v.to_le_bytes());
             }
         }
         ColVec::Float(_, xs) | ColVec::Datetime(_, xs) => {
+            #[cfg(target_endian = "little")]
+            extend_pod_le(buf, xs);
+            #[cfg(not(target_endian = "little"))]
             for &v in xs.iter() {
                 buf.extend_from_slice(&v.to_le_bytes());
             }
@@ -264,12 +285,43 @@ pub fn decode_k_payload(data: &[u8], start: usize) -> KResult<(K, usize)> {
     decode_k_endian(data, start, true)
 }
 
+fn read_pod_vec<T: Copy>(
+    data: &[u8],
+    p: &mut usize,
+    n: usize,
+    err_msg: &'static str,
+    swap: bool,
+    swap_elem: fn(T) -> T,
+) -> KResult<Vec<T>> {
+    let byte_len = n.checked_mul(std::mem::size_of::<T>()).ok_or_else(|| KError::ipc(err_msg))?;
+    let end = p.checked_add(byte_len).ok_or_else(|| KError::ipc(err_msg))?;
+    let slice = data.get(*p..end).ok_or_else(|| KError::ipc(err_msg))?;
+    *p = end;
+    let mut xs: Vec<T> = Vec::with_capacity(n);
+    if byte_len > 0 {
+        // SAFETY: `slice` has `byte_len = n * size_of::<T>()` initialized bytes, `xs` has capacity `n`,
+        // and `T` is a plain byte-valid primitive (`u32`, `i16`, `i32`, `i64`, `f32`, `f64`, `[u8; 16]`).
+        // `copy_nonoverlapping` on `u8` handles arbitrary byte offsets `p` without alignment requirements.
+        unsafe {
+            std::ptr::copy_nonoverlapping(slice.as_ptr(), xs.as_mut_ptr().cast::<u8>(), byte_len);
+            xs.set_len(n);
+        }
+        if swap {
+            for v in &mut xs {
+                *v = swap_elem(*v);
+            }
+        }
+    }
+    Ok(xs)
+}
+
 fn decode_k_endian(data: &[u8], mut p: usize, le: bool) -> KResult<(K, usize)> {
     if p >= data.len() {
         return Err(KError::ipc("truncated IPC payload"));
     }
     let tag_byte = data[p] as i8;
     p += 1;
+    let swap = le != cfg!(target_endian = "little");
 
     let read_i16 = |b: &[u8], o: usize| -> KResult<i16> {
         let arr: [u8; 2] = b.get(o..o + 2).ok_or_else(|| KError::ipc("truncated i16"))?.try_into().unwrap();
@@ -340,11 +392,14 @@ fn decode_k_endian(data: &[u8], mut p: usize, le: bool) -> KResult<(K, usize)> {
         21 => {
             let attr = Attr::from_ipc_byte(*data.get(p).ok_or_else(|| KError::ipc("truncated vec attr"))?);
             let n = read_u32(data, p + 1)? as usize;
-            let text = p + 5 + n.saturating_mul(4);
-            let lengths = (0..n).map(|i| read_u32(data, p + 5 + i * 4)).collect::<KResult<Vec<u32>>>();
-            let lengths = lengths.map_err(|_| KError::ipc("truncated strings"))?;
-            let end = text + lengths.iter().map(|&len| len as usize).sum::<usize>();
-            let bytes = data.get(text..end).ok_or_else(|| KError::ipc("truncated strings"))?.to_vec();
+            p += 5;
+            let lengths = read_pod_vec::<u32>(data, &mut p, n, "truncated strings", swap, u32::swap_bytes)?;
+            let total = lengths
+                .iter()
+                .try_fold(0usize, |acc, &len| acc.checked_add(len as usize))
+                .ok_or_else(|| KError::ipc("bad strings"))?;
+            let end = p.checked_add(total).ok_or_else(|| KError::ipc("truncated strings"))?;
+            let bytes = data.get(p..end).ok_or_else(|| KError::ipc("truncated strings"))?.to_vec();
             let strings = crate::strings::Strings::from_parts(lengths, bytes).ok_or_else(|| KError::ipc("bad strings"))?;
             Ok((K::Vector(ColVec::of_strings(attr, strings)), end))
         }
@@ -355,7 +410,7 @@ fn decode_k_endian(data: &[u8], mut p: usize, le: bool) -> KResult<(K, usize)> {
             p += 5;
             let cv = match tag_byte {
                 0 => {
-                    let mut xs = Vec::with_capacity(n);
+                    let mut xs = Vec::with_capacity(n.min(data.len().saturating_sub(p)));
                     for _ in 0..n {
                         let (item, next) = decode_k_endian(data, p, le)?;
                         xs.push(item);
@@ -364,38 +419,27 @@ fn decode_k_endian(data: &[u8], mut p: usize, le: bool) -> KResult<(K, usize)> {
                     ColVec::General(attr, Arc::new(xs))
                 }
                 1 => {
-                    let slice = data.get(p..p + n).ok_or_else(|| KError::ipc("truncated bool vec"))?;
-                    p += n;
-                    ColVec::Bool(attr, Arc::new(slice.iter().map(|&b| b != 0).collect()))
+                    let end = p.checked_add(n).ok_or_else(|| KError::ipc("truncated bool vec"))?;
+                    let slice = data.get(p..end).ok_or_else(|| KError::ipc("truncated bool vec"))?;
+                    p = end;
+                    ColVec::Bool(attr, Arc::new(crate::bools::Bools::from_fn(n, |i| slice[i] != 0)))
                 }
                 2 => {
-                    let mut xs = Vec::with_capacity(n);
-                    for _ in 0..n {
-                        let g: [u8; 16] = data.get(p..p + 16).ok_or_else(|| KError::ipc("truncated guid vec"))?.try_into().unwrap();
-                        xs.push(g);
-                        p += 16;
-                    }
+                    let xs = read_pod_vec::<[u8; 16]>(data, &mut p, n, "truncated guid vec", false, |x| x)?;
                     ColVec::Guid(attr, Arc::new(xs))
                 }
                 4 => {
-                    let slice = data.get(p..p + n).ok_or_else(|| KError::ipc("truncated byte vec"))?;
-                    p += n;
+                    let end = p.checked_add(n).ok_or_else(|| KError::ipc("truncated byte vec"))?;
+                    let slice = data.get(p..end).ok_or_else(|| KError::ipc("truncated byte vec"))?;
+                    p = end;
                     ColVec::Byte(attr, Arc::new(slice.to_vec()))
                 }
                 5 => {
-                    let mut xs = Vec::with_capacity(n);
-                    for _ in 0..n {
-                        xs.push(read_i16(data, p)?);
-                        p += 2;
-                    }
+                    let xs = read_pod_vec::<i16>(data, &mut p, n, "truncated i16", swap, i16::swap_bytes)?;
                     ColVec::Short(attr, Arc::new(xs))
                 }
                 6 | 13 | 14 | 17 | 18 | 19 => {
-                    let mut xs = Vec::with_capacity(n);
-                    for _ in 0..n {
-                        xs.push(read_i32(data, p)?);
-                        p += 4;
-                    }
+                    let xs = read_pod_vec::<i32>(data, &mut p, n, "truncated i32", swap, i32::swap_bytes)?;
                     match tag_byte {
                         6 => ColVec::Int(attr, Arc::new(xs)),
                         13 => ColVec::Month(attr, Arc::new(xs)),
@@ -406,11 +450,7 @@ fn decode_k_endian(data: &[u8], mut p: usize, le: bool) -> KResult<(K, usize)> {
                     }
                 }
                 7 | 12 | 16 => {
-                    let mut xs = Vec::with_capacity(n);
-                    for _ in 0..n {
-                        xs.push(read_i64(data, p)?);
-                        p += 8;
-                    }
+                    let xs = read_pod_vec::<i64>(data, &mut p, n, "truncated i64", swap, i64::swap_bytes)?;
                     match tag_byte {
                         7 => ColVec::Long(attr, Arc::new(xs)),
                         12 => ColVec::Timestamp(attr, Arc::new(xs)),
@@ -418,19 +458,11 @@ fn decode_k_endian(data: &[u8], mut p: usize, le: bool) -> KResult<(K, usize)> {
                     }
                 }
                 8 => {
-                    let mut xs = Vec::with_capacity(n);
-                    for _ in 0..n {
-                        xs.push(read_f32(data, p)?);
-                        p += 4;
-                    }
+                    let xs = read_pod_vec::<f32>(data, &mut p, n, "truncated f32", swap, |v| f32::from_bits(v.to_bits().swap_bytes()))?;
                     ColVec::Real(attr, Arc::new(xs))
                 }
                 9 | 15 => {
-                    let mut xs = Vec::with_capacity(n);
-                    for _ in 0..n {
-                        xs.push(read_f64(data, p)?);
-                        p += 8;
-                    }
+                    let xs = read_pod_vec::<f64>(data, &mut p, n, "truncated f64", swap, |v| f64::from_bits(v.to_bits().swap_bytes()))?;
                     if tag_byte == 9 {
                         ColVec::Float(attr, Arc::new(xs))
                     } else {
@@ -438,12 +470,13 @@ fn decode_k_endian(data: &[u8], mut p: usize, le: bool) -> KResult<(K, usize)> {
                     }
                 }
                 10 => {
-                    let slice = data.get(p..p + n).ok_or_else(|| KError::ipc("truncated char vec"))?;
-                    p += n;
+                    let end = p.checked_add(n).ok_or_else(|| KError::ipc("truncated char vec"))?;
+                    let slice = data.get(p..end).ok_or_else(|| KError::ipc("truncated char vec"))?;
+                    p = end;
                     ColVec::Char(attr, Arc::new(slice.to_vec()))
                 }
                 11 => {
-                    let mut xs = Vec::with_capacity(n);
+                    let mut xs = Vec::with_capacity(n.min(data.len().saturating_sub(p)));
                     for _ in 0..n {
                         let (s, next) = read_nul_str(data, p)?;
                         xs.push(intern(&s));
@@ -1186,5 +1219,20 @@ mod tests {
         // random bytes do not compress
         let noise: Vec<u8> = (0..5000).map(|_| rand() as u8).collect();
         assert!(compress_kdb(&noise).is_none());
+    }
+
+    #[test]
+    fn pod_vectors_decode_unaligned_both_endians_and_reject_huge_truncated_len() {
+        let mut be = vec![0xff, 7, 0]; // 1-byte pad -> unaligned start=1, tag=7 (long vec), attr=0
+        be.extend_from_slice(&2u32.to_be_bytes());
+        be.extend_from_slice(&42i64.to_be_bytes());
+        be.extend_from_slice(&(-99i64).to_be_bytes());
+        let (k, end) = decode_k_endian(&be, 1, false).unwrap();
+        assert_eq!(end, be.len());
+        assert_eq!(k, K::Vector(ColVec::Long(Attr::None, Arc::new(vec![42, -99]))));
+
+        let mut bad = vec![7, 0];
+        bad.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_k_payload(&bad, 0).is_err());
     }
 }

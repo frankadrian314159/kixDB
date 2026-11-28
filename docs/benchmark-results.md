@@ -1,5 +1,62 @@
 # Benchmark results: scale factor 0.3
 
+## `distinct` on the shards
+
+Measured 2026-11-27 **on battery**, where the machine is about half as fast: the build with [row-wise
+verbs](#row-wise-verbs-on-the-shards) and then with this change as well, one run each, six shards in one process. Each
+shard now sends only its distinct rows, where it used to send every row (and for `exec distinct c` the control node
+gathered the table). Milliseconds:
+
+| Statement (TPC-H tables) | Distinct values | Before | now |
+| --- | --- | ---: | ---: |
+| `distinct exec o_custkey from orders` | many | 40 | 17 |
+| `select distinct l_returnflag, l_linestatus from lineitem` | a few | 88 | 9 |
+| `exec distinct l_suppkey from lineitem` | some thousands | 85 | 9 |
+| `distinct select l_orderkey from lineitem` | many | 118 | 63 |
+| `distinct exec o_orderkey from orders` | **every row** | 42 | 47 |
+
+Where every value is already distinct the shards' work is wasted. TPC-H Q22 went from 58 to 39 ms. The query totals
+changed little (TPC-H 0.66 to 0.68 s, TPC-DS 0.53 to 0.48 s).
+
+## Row-wise verbs on the shards
+
+Measured 2026-11-27 **on battery**, where the machine is about half as fast: commit `2e6f1ef` and the change below, run
+back to back, one run each, TPC-H on six shards in one process. Built-in verbs applied item by item, such as
+`` `$2#'c_phone ``, now run on the shards ([plan.rs](../crates/parallel/control/src/plan.rs)), so TPC-H Q22 no longer
+gathers `customer`. **It is no faster:** 56 ms before, 58 ms now, against 8 ms on the single node. In a separate run of
+its three statements, most of the time went elsewhere:
+
+| Q22 statement | ms |
+| --- | ---: |
+| average balance over a subquery | 23 |
+| `distinct exec o_custkey from orders`, which brings every order's key to the control node | 42 |
+| the final grouped query | 5 |
+
+## Converting columns to and from Arrow
+
+Measured 2026-11-27 **on battery**, where the machine is about half as fast: commit `a34cdb4` and the change below, run
+back to back, one run each (the mean of 40 conversions). Numeric and temporal columns are now copied between the engine
+and Arrow as blocks ([arrowconv.rs](../crates/parallel/shared-ces/src/arrowconv.rs)) instead of an item at a time, and a
+validity bitmap is built only for a column of a batch that has nulls. Milliseconds for 600,000 rows of a `long`, a
+`float`, a `date` and a `real` column, in batches of 65,536 rows:
+
+| | `a34cdb4` | now |
+| --- | ---: | ---: |
+| to Arrow, no nulls | 11.3 | 6.0 |
+| from Arrow, no nulls | 10.2 | 4.0 |
+| to Arrow, 1% nulls | 16.8 | 8.0 |
+| from Arrow, 1% nulls | 11.0 | 7.7 |
+
+Byte, char and GUID columns, which each item used to be packed for on its own in kdb+ IPC form, are copied as blocks
+too. Milliseconds for 600,000 rows of one column (on battery, one run each, the mean of 10 conversions):
+
+| | before | now |
+| --- | ---: | ---: |
+| to Arrow, `char` / `byte` / `guid` | 74 / 70 / 87 | 1.9 / 0.4 / 3.5 |
+| from Arrow, `char` / `byte` / `guid` | 39 / 35 / 34 | 1.7 / 0.2 / 2.5 |
+
+Only the conversion was timed, not whole cluster queries.
+
 ## Finding items with `?`
 
 Measured 2026-11-26 **on battery**, where the machine is about half as fast: commit `d507205` and the change below, run
@@ -701,7 +758,7 @@ From the profile of the join change; the filtering change was not profiled on th
 * **Assigned tables travel twice.** A table assigned to a variable in a multi-statement query is sent to the shards, and
   later statements fetch it back (DS Q22 and Q36).
 * **TPC-H Q22** is slower on the cluster than on the single node: `` `$2#'c_phone `` is not pushed down, so `customer`
-  is gathered.
+  is gathered. (It is pushed down [since](#row-wise-verbs-on-the-shards), which did not make Q22 faster.)
 
 ## Recommended next steps
 
@@ -709,7 +766,13 @@ None of the gains has been measured.
 
 1. Profile aggregation, now the largest part of TPC-DS and close to `where` on TPC-H.
 2. Profile the control node's merging by key and ordering of rows.
-3. Keep intermediate tables on the control node. This changes where assigned tables live, so it needs a design decision.
+
+(A third step, having the shards do `distinct` themselves, has been [carried out](#distinct-on-the-shards).)
+
+Keeping intermediate tables on the control node was considered and **decided against** on 2026-11-27: assigned tables
+stay on the shards. The statements after the main aggregation took about 41 ms in TPC-DS Q22 and 12 ms in Q36 on six
+shards (one run, on battery), their own computation included, so the saving would be less, and it would change where
+assigned tables live.
 
 ## Cost of TLS between nodes
 

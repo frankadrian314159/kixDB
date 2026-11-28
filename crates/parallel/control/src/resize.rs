@@ -178,7 +178,7 @@ impl Inner {
                 ordered.push(t);
             }
         }
-        let names = Names { mirror: &self.mirror, ns: ".".into() };
+        let names = Names { mirror: &self.mirror, ns: ".".into(), local: &[] };
         let (mut seen, mut ordered) = (BTreeSet::new(), vec![]);
         names.all_tables().into_iter().filter_map(|n| names.table(n)).for_each(|t| add(&names, t, &mut seen, &mut ordered));
         ordered.sort_by_key(|t| t.mode != DistMode::Replicated);

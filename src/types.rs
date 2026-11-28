@@ -3,10 +3,9 @@
 use crate::ast::Expr;
 use crate::error::{KError, KResult};
 use crate::sym::{intern, resolve, SymId};
-use chrono::{Datelike, NaiveDate};
+use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 
@@ -60,8 +59,17 @@ pub fn ymd_from_date(days: i32) -> Option<(i32, u32, u32)> {
     if days == NULL_INT || days == INF_INT || days == NINF_INT {
         return None;
     }
-    let d = kdb_epoch().checked_add_signed(chrono::Duration::days(days as i64))?;
-    Some((d.year(), d.month(), d.day()))
+    // Branchless civil-from-days shifted to 0000-03-01 (2000-01-01 = day 730_425).
+    let z = (days as i64) + 730_425;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    Some(((y + i64::from(m <= 2)) as i32, m, d))
 }
 
 pub fn format_date(days: i32) -> String {
@@ -292,7 +300,7 @@ pub struct Tag {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ColVec {
     General(Attr, Arc<Vec<K>>),
-    Bool(Attr, Arc<Vec<bool>>),
+    Bool(Attr, Arc<crate::bools::Bools>),
     Guid(Attr, Arc<Vec<[u8; 16]>>),
     Byte(Attr, #[serde(with = "crate::bytes")] Arc<Vec<u8>>),
     Short(Attr, Arc<Vec<i16>>),
@@ -439,34 +447,71 @@ impl ColVec {
 
     /// Apply and validate a kdb+ attribute (`` `s# ``, `` `u# ``, `` `p# ``, `` `g# ``).
     pub fn with_attr(&self, na: Attr) -> KResult<ColVec> {
+        use foldhash::{HashSet as FastSet, HashSetExt};
         match na {
             Attr::None | Attr::Grouped => {}
             Attr::Sorted => {
-                for i in 1..self.len() {
-                    if self.get_atom(i - 1).k_cmp(&self.get_atom(i)) == std::cmp::Ordering::Greater {
-                        return Err(KError::new("s-fail", "vector is not sorted ascending"));
+                let sorted = match self.plain() {
+                    ColVec::Long(_, xs) | ColVec::Timestamp(_, xs) | ColVec::Timespan(_, xs) => xs.windows(2).all(|w| w[0] <= w[1]),
+                    ColVec::Int(_, xs)
+                    | ColVec::Month(_, xs)
+                    | ColVec::Date(_, xs)
+                    | ColVec::Minute(_, xs)
+                    | ColVec::Second(_, xs)
+                    | ColVec::Time(_, xs) => xs.windows(2).all(|w| w[0] <= w[1]),
+                    ColVec::Short(_, xs) => xs.windows(2).all(|w| w[0] <= w[1]),
+                    ColVec::Byte(_, xs) | ColVec::Char(_, xs) => xs.windows(2).all(|w| w[0] <= w[1]),
+                    ColVec::Bool(_, xs) => xs.is_sorted(),
+                    ColVec::Sym(_, xs) => xs.windows(2).all(|w| w[0] <= w[1]),
+                    ColVec::Float(_, xs) | ColVec::Datetime(_, xs) => {
+                        xs.windows(2).all(|w| w[0].is_nan() || (!w[1].is_nan() && w[0] <= w[1]))
                     }
+                    _ => (1..self.len()).all(|i| self.get_atom(i - 1).k_cmp(&self.get_atom(i)) != std::cmp::Ordering::Greater),
+                };
+                if !sorted {
+                    return Err(KError::new("s-fail", "vector is not sorted ascending"));
                 }
             }
             Attr::Unique => {
-                let mut seen = HashSet::with_capacity(self.len());
-                for i in 0..self.len() {
-                    let key = self.get_atom(i).hash_key();
-                    if !seen.insert(key) {
-                        return Err(KError::new("u-fail", "vector contains duplicate elements"));
+                if let Some(bits) = self.key_bits() {
+                    let mut seen = FastSet::with_capacity(bits.len());
+                    for &b in bits.iter() {
+                        if !seen.insert(b) {
+                            return Err(KError::new("u-fail", "vector contains duplicate elements"));
+                        }
+                    }
+                } else {
+                    let mut seen = FastSet::with_capacity(self.len());
+                    for i in 0..self.len() {
+                        if !seen.insert(self.get_atom(i).hash_key()) {
+                            return Err(KError::new("u-fail", "vector contains duplicate elements"));
+                        }
                     }
                 }
             }
             Attr::Parted => {
-                let mut seen = HashSet::new();
-                let mut prev: Option<Vec<u8>> = None;
-                for i in 0..self.len() {
-                    let key = self.get_atom(i).hash_key();
-                    if prev.as_ref() != Some(&key) {
-                        if !seen.insert(key.clone()) {
-                            return Err(KError::new("u-fail", "vector values are not contiguous for `p#"));
+                if let Some(bits) = self.key_bits() {
+                    let mut seen = FastSet::new();
+                    let mut prev: Option<u64> = None;
+                    for &b in bits.iter() {
+                        if prev != Some(b) {
+                            if !seen.insert(b) {
+                                return Err(KError::new("u-fail", "vector values are not contiguous for `p#"));
+                            }
+                            prev = Some(b);
                         }
-                        prev = Some(key);
+                    }
+                } else {
+                    let mut seen = FastSet::new();
+                    let mut prev: Option<Vec<u8>> = None;
+                    for i in 0..self.len() {
+                        let key = self.get_atom(i).hash_key();
+                        if prev.as_ref() != Some(&key) {
+                            if !seen.insert(key.clone()) {
+                                return Err(KError::new("u-fail", "vector values are not contiguous for `p#"));
+                            }
+                            prev = Some(key);
+                        }
                     }
                 }
             }
@@ -597,7 +642,7 @@ impl ColVec {
     pub fn empty_of_type_char(ch: char) -> Option<ColVec> {
         Some(match ch {
             ' ' | '*' => ColVec::General(Attr::None, Arc::new(vec![])),
-            'b' => ColVec::Bool(Attr::None, Arc::new(vec![])),
+            'b' => ColVec::Bool(Attr::None, Arc::new(crate::bools::Bools::new())),
             'g' => ColVec::Guid(Attr::None, Arc::new(vec![])),
             'x' => ColVec::Byte(Attr::None, Arc::new(vec![])),
             'h' => ColVec::Short(Attr::None, Arc::new(vec![])),
@@ -625,7 +670,7 @@ impl ColVec {
         }
         match self {
             ColVec::General(_, v) => v[idx].clone(),
-            ColVec::Bool(_, v) => K::Bool(v[idx]),
+            ColVec::Bool(_, v) => K::Bool(v.get(idx)),
             ColVec::Guid(_, v) => K::Guid(v[idx]),
             ColVec::Byte(_, v) => K::Byte(v[idx]),
             ColVec::Short(_, v) => K::Short(v[idx]),
@@ -681,7 +726,9 @@ impl ColVec {
                 Some(K::Vector(first)) => K::Vector(first.take(0)),
                 _ => K::Null,
             }),
-            ColVec::Bool(_, v) => pick!(Bool, v, false),
+            ColVec::Bool(_, v) => {
+                ColVec::Bool(Attr::None, Arc::new(crate::engine::par::map_bools(indices, |&i| i < v.len() && v.get(i))))
+            }
             ColVec::Guid(_, v) => pick!(Guid, v, NULL_GUID),
             ColVec::Byte(_, v) => pick!(Byte, v, 0),
             ColVec::Short(_, v) => pick!(Short, v, NULL_SHORT),
@@ -724,7 +771,10 @@ impl ColVec {
                 Some(K::Vector(first)) => K::Vector(first.take(0)),
                 _ => K::Null,
             }),
-            ColVec::Bool(_, v) => pick!(Bool, v, false),
+            ColVec::Bool(_, v) => ColVec::Bool(
+                Attr::None,
+                Arc::new(crate::engine::par::map_bools(indices, |&i| i >= 0 && (i as usize) < v.len() && v.get(i as usize))),
+            ),
             ColVec::Guid(_, v) => pick!(Guid, v, NULL_GUID),
             ColVec::Byte(_, v) => pick!(Byte, v, 0),
             ColVec::Short(_, v) => pick!(Short, v, NULL_SHORT),
@@ -769,6 +819,14 @@ impl ColVec {
             // kdb+: taking from an empty vector fills with typed nulls
             return self.gather(&vec![usize::MAX; un]);
         }
+        if let ColVec::Bool(_, v) = self {
+            if n > 0 && un <= len {
+                return ColVec::Bool(Attr::None, Arc::new(v.slice(0, un)));
+            }
+            if n < 0 && un <= len {
+                return ColVec::Bool(Attr::None, Arc::new(v.slice(len - un, un)));
+            }
+        }
         let mut idx = Vec::with_capacity(un);
         if n > 0 {
             for i in 0..un {
@@ -793,6 +851,11 @@ impl ColVec {
         if un >= len {
             return self.gather(&[]);
         }
+        if let ColVec::Bool(attr, v) = self {
+            let start = if n > 0 { un } else { 0 };
+            let kept = if *attr == Attr::Sorted { Attr::Sorted } else { Attr::None };
+            return ColVec::Bool(kept, Arc::new(v.slice(start, len - un)));
+        }
         let range: Vec<usize> = if n > 0 { (un..len).collect() } else { (0..len - un).collect() };
         let mut out = self.gather(&range);
         if self.attr() == Attr::Sorted {
@@ -808,6 +871,9 @@ impl ColVec {
 
     /// `n` copies of an atom as a vector (of the atom's type even when `n` is 0).
     pub fn repeat(atom: K, n: usize) -> ColVec {
+        if let K::Bool(b) = atom {
+            return ColVec::Bool(Attr::None, Arc::new(crate::bools::Bools::repeat(b, n)));
+        }
         if n == 0 {
             return ColVec::from_atoms(vec![atom]).take(0);
         }
@@ -819,7 +885,7 @@ impl ColVec {
                 }
             };
         }
-        of!(Bool Guid Byte Short Int Long Real Float Char Sym Timestamp Month Date Datetime Timespan Minute Second Time)
+        of!(Guid Byte Short Int Long Real Float Char Sym Timestamp Month Date Datetime Timespan Minute Second Time)
     }
 
     /// The first row that holds `atom`, as `hash_key`s have it (so all NaNs are one value, as are both zeros).
@@ -827,6 +893,7 @@ impl ColVec {
         macro_rules! on {
             ($($same:ident)*; $($float:ident)*) => {
                 match (self, atom) {
+                    (ColVec::Bool(_, v), K::Bool(x)) => v.first_pos(*x),
                     $((ColVec::$same(_, v), K::$same(x)) => v.iter().position(|y| y == x),)*
                     $((ColVec::$float(_, v), K::$float(x)) => v.iter().position(|y| y == x || y.is_nan() && x.is_nan()),)*
                     (ColVec::Strings(_, v), K::Vector(ColVec::Char(_, x))) => v.iter().position(|y| y == x.as_slice()),
@@ -840,7 +907,7 @@ impl ColVec {
                 }
             };
         }
-        on!(Bool Guid Byte Short Int Long Char Sym Timestamp Month Date Timespan Minute Second Time; Real Float Datetime)
+        on!(Guid Byte Short Int Long Char Sym Timestamp Month Date Timespan Minute Second Time; Real Float Datetime)
     }
 
     /// Normalize a general list of uniform atoms into a typed vector (kdb+'s auto-collapse rule).
@@ -858,7 +925,14 @@ impl ColVec {
         let t0 = items[0].type_num();
         if t0 < 0 && items.iter().all(|x| x.type_num() == t0) {
             match t0 {
-                -1 => return ColVec::Bool(Attr::None, Arc::new(items.into_iter().map(|k| if let K::Bool(v) = k { v } else { unreachable!() }).collect())),
+                -1 => {
+                    return ColVec::Bool(
+                        Attr::None,
+                        Arc::new(crate::bools::Bools::from_fn(items.len(), |i| {
+                            if let K::Bool(v) = items[i] { v } else { unreachable!() }
+                        })),
+                    );
+                }
                 -2 => return ColVec::Guid(Attr::None, Arc::new(items.into_iter().map(|k| if let K::Guid(v) = k { v } else { unreachable!() }).collect())),
                 -4 => return ColVec::Byte(Attr::None, Arc::new(items.into_iter().map(|k| if let K::Byte(v) = k { v } else { unreachable!() }).collect())),
                 -5 => return ColVec::Short(Attr::None, Arc::new(items.into_iter().map(|k| if let K::Short(v) = k { v } else { unreachable!() }).collect())),
@@ -903,7 +977,11 @@ impl ColVec {
                 out.extend_from(b);
                 ColVec::of_strings(Attr::None, out)
             }
-            (ColVec::Bool(_, a), ColVec::Bool(_, b)) => cat!(Bool, a, b),
+            (ColVec::Bool(_, a), ColVec::Bool(_, b)) => {
+                let mut out = (**a).clone();
+                out.extend_from(b);
+                ColVec::Bool(Attr::None, Arc::new(out))
+            }
             (ColVec::Guid(_, a), ColVec::Guid(_, b)) => cat!(Guid, a, b),
             (ColVec::Byte(_, a), ColVec::Byte(_, b)) => cat!(Byte, a, b),
             (ColVec::Short(_, a), ColVec::Short(_, b)) => cat!(Short, a, b),
@@ -936,6 +1014,24 @@ impl ColVec {
         }
     }
 
+    /// The same items as a list of mixed values, unless they are a list of values already.
+    pub fn into_list(self) -> ColVec {
+        if self.is_list() {
+            return self;
+        }
+        ColVec::General(Attr::None, Arc::new((0..self.len()).map(|i| self.get_atom(i)).collect()))
+    }
+
+    /// `concat` for the rows of a table: a list column stays one as it grows, though its items may then share a type.
+    /// (An empty one takes the type of typed items.)
+    pub fn grow(&self, other: &ColVec) -> ColVec {
+        let joined = self.concat(other);
+        match self.is_list() && (!self.is_empty() || matches!(other, ColVec::General(..))) {
+            true => joined.into_list(),
+            false => joined,
+        }
+    }
+
     /// Strict typed append for table `insert`/`upsert` (coerces int->long/float where safe, errors on incompatible types).
     pub fn append_strict(&self, other: &ColVec) -> KResult<ColVec> {
         // an enumeration takes only its own: the engine enumerates new values, checking them, before it adds them
@@ -951,7 +1047,7 @@ impl ColVec {
             if matches!(self, ColVec::General(_, _)) && self.is_empty() && !matches!(other, ColVec::General(_, _)) {
                 return Ok(other.clone());
             }
-            let mut joined = self.concat(other);
+            let mut joined = self.grow(other);
             if self.attr() == Attr::Grouped {
                 joined.set_attr_unchecked(Attr::Grouped);
             }
@@ -1005,7 +1101,7 @@ impl ColVec {
         }
         match (self, val) {
             (ColVec::General(_, v), x) => Arc::make_mut(v)[idx] = x,
-            (ColVec::Bool(_, v), K::Bool(b)) => Arc::make_mut(v)[idx] = b,
+            (ColVec::Bool(_, v), K::Bool(b)) => Arc::make_mut(v).set(idx, b),
             (ColVec::Guid(_, v), K::Guid(x)) => Arc::make_mut(v)[idx] = x,
             (ColVec::Byte(_, v), K::Byte(x)) => Arc::make_mut(v)[idx] = x,
             (ColVec::Short(_, v), K::Short(x)) => Arc::make_mut(v)[idx] = x,
@@ -1043,7 +1139,7 @@ impl ColVec {
             return Some(Cow::Borrowed(unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u64>(), v.len()) }));
         }
         Some(Cow::Owned(match self {
-            ColVec::Bool(_, v) => par(v, |&x| u64::from(x)),
+            ColVec::Bool(_, v) => (0..v.len()).map(|i| u64::from(v.get(i))).collect(),
             ColVec::Byte(_, v) | ColVec::Char(_, v) => par(v, |&x| u64::from(x)),
             ColVec::Short(_, v) => par(v, |&x| x as u64),
             ColVec::Int(_, v)
@@ -1076,7 +1172,7 @@ impl ColVec {
 
     pub fn as_f64_vec(&self) -> Option<Vec<f64>> {
         match self {
-            ColVec::Bool(_, v) => Some(v.iter().map(|&b| if b { 1.0 } else { 0.0 }).collect()),
+            ColVec::Bool(_, v) => Some(v.iter().map(|b| if b { 1.0 } else { 0.0 }).collect()),
             ColVec::Byte(_, v) => Some(v.iter().map(|&x| x as f64).collect()),
             ColVec::Short(_, v) => Some(v.iter().map(|&x| if x == NULL_SHORT { f64::NAN } else { x as f64 }).collect()),
             ColVec::Int(_, v)
@@ -1097,7 +1193,7 @@ impl ColVec {
 
     pub fn as_i64_vec(&self) -> Option<Vec<i64>> {
         match self {
-            ColVec::Bool(_, v) => Some(v.iter().map(|&b| i64::from(b)).collect()),
+            ColVec::Bool(_, v) => Some(v.iter().map(i64::from).collect()),
             ColVec::Byte(_, v) => Some(v.iter().map(|&x| x as i64).collect()),
             ColVec::Short(_, v) => Some(v.iter().map(|&x| if x == NULL_SHORT { NULL_LONG } else { x as i64 }).collect()),
             ColVec::Int(_, v)
@@ -1125,7 +1221,8 @@ impl ColVec {
         let n = self.len();
         match self {
             ColVec::General(_, v) => v.iter().map(|k| k.approx_bytes()).sum::<usize>() + n * std::mem::size_of::<K>(),
-            ColVec::Bool(_, _) | ColVec::Byte(_, _) | ColVec::Char(_, _) => n,
+            ColVec::Bool(_, v) => v.bytes_held(),
+            ColVec::Byte(_, _) | ColVec::Char(_, _) => n,
             ColVec::Short(_, _) => n * 2,
             ColVec::Int(_, _)
             | ColVec::Real(_, _)
@@ -1250,14 +1347,24 @@ impl Flip {
 pub struct KeyedTable {
     pub keys: Flip,
     pub vals: Flip,
+    #[serde(skip, default)]
+    pub key_index: crate::index::KeySlot,
 }
 
 impl KeyedTable {
+    pub fn from_flips(keys: Flip, vals: Flip) -> Self {
+        Self {
+            keys,
+            vals,
+            key_index: crate::index::KeySlot::default(),
+        }
+    }
+
     pub fn new(keys: Flip, vals: Flip) -> KResult<Self> {
         if !keys.cols.is_empty() && !vals.cols.is_empty() && keys.nrows() != vals.nrows() {
             return Err(KError::length("keyed table key and value row counts differ"));
         }
-        Ok(Self { keys, vals })
+        Ok(Self::from_flips(keys, vals))
     }
 
     pub fn nrows(&self) -> usize {
@@ -1287,7 +1394,7 @@ impl KeyedTable {
         }
         let keys = Flip { cols: f.cols[..nkeys].to_vec(), vals: f.vals[..nkeys].to_vec() };
         let vals = Flip { cols: f.cols[nkeys..].to_vec(), vals: f.vals[nkeys..].to_vec() };
-        Ok(K::KeyedTable(Arc::new(KeyedTable { keys, vals })))
+        Ok(K::KeyedTable(Arc::new(KeyedTable::from_flips(keys, vals))))
     }
 
     pub fn from_flip_key_names(f: &Flip, key_names: &[SymId]) -> KResult<K> {
@@ -1309,10 +1416,10 @@ impl KeyedTable {
                 vvals.push(v.clone());
             }
         }
-        Ok(K::KeyedTable(Arc::new(KeyedTable {
-            keys: Flip { cols: kcols, vals: kvals },
-            vals: Flip { cols: vcols, vals: vvals },
-        })))
+        Ok(K::KeyedTable(Arc::new(KeyedTable::from_flips(
+            Flip { cols: kcols, vals: kvals },
+            Flip { cols: vcols, vals: vvals },
+        ))))
     }
 }
 
@@ -1489,7 +1596,15 @@ impl K {
             K::Enum(_, v) => (**v).clone(),
             K::Vector(c) => K::Vector(column(c)),
             K::Table(t) if deep => K::Table(Arc::new(flip(t))),
-            K::KeyedTable(t) if deep => K::KeyedTable(Arc::new(KeyedTable { keys: flip(&t.keys), vals: flip(&t.vals) })),
+            K::KeyedTable(t) if deep => K::KeyedTable(Arc::new(KeyedTable {
+                keys: flip(&t.keys),
+                vals: flip(&t.vals),
+                key_index: if t.keys.vals.iter().any(|c| matches!(c, ColVec::Enum(..) | ColVec::General(..))) {
+                    Default::default()
+                } else {
+                    t.key_index.clone()
+                },
+            })),
             K::Dict(d) if deep => K::Dict(Arc::new(Dict { keys: Box::new(d.keys.stripped(true)), vals: Box::new(d.vals.stripped(true)) })),
             other => other.clone(),
         }
@@ -1688,6 +1803,27 @@ impl K {
         }
     }
 
+    /// 64-bit canonical key for fixed-width atoms, matching `ColVec::key_bits` elementwise.
+    pub fn atom_key_bits(&self) -> Option<u64> {
+        match self {
+            K::Bool(x) => Some(u64::from(*x)),
+            K::Byte(x) | K::Char(x) => Some(u64::from(*x)),
+            K::Short(x) => Some(*x as u64),
+            K::Int(x) | K::Month(x) | K::Date(x) | K::Minute(x) | K::Second(x) | K::Time(x) => Some(*x as u64),
+            K::Long(x) | K::Timestamp(x) | K::Timespan(x) => Some(*x as u64),
+            K::Real(x) => {
+                let v = f64::from(*x);
+                Some(if v.is_nan() { f64::NAN.to_bits() } else if v == 0.0 { 0 } else { v.to_bits() })
+            }
+            K::Float(x) | K::Datetime(x) => {
+                Some(if x.is_nan() { f64::NAN.to_bits() } else if *x == 0.0 { 0 } else { x.to_bits() })
+            }
+            K::Sym(s) => Some(u64::from(s.0)),
+            K::Enum(_, v) => v.atom_key_bits(),
+            _ => None,
+        }
+    }
+
     /// Canonical byte key for hashing/grouping/distinct (`NaN` canonicalized so nulls group together).
     pub fn hash_key(&self) -> Vec<u8> {
         if let K::Enum(_, v) = self {
@@ -1848,7 +1984,7 @@ fn format_float_q(v: f64) -> String {
 /// A datetime (days since 2000.01.01), to the millisecond.
 pub fn format_datetime(days: f64) -> String {
     if !days.is_finite() {
-        return format!("{}z", &crate::display::float(days).replace('n', "N"));
+        return format!("{}z", &crate::display::float(days).replace('n', "N").replace('w', "W"));
     }
     let ms = (days * 86_400_000.0).round() as i64;
     format!("{}T{}", format_date(ms.div_euclid(86_400_000) as i32), format_time(ms.rem_euclid(86_400_000) as i32))
@@ -1907,7 +2043,7 @@ fn format_vector_q(v: &ColVec) -> String {
             if xs.is_empty() {
                 format!("{pfx}`boolean$()")
             } else {
-                let bits: String = xs.iter().map(|&b| if b { '1' } else { '0' }).collect();
+                let bits: String = xs.iter().map(|b| if b { '1' } else { '0' }).collect();
                 format!("{pfx}{enlist}{bits}b")
             }
         }

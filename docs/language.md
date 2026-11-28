@@ -5,7 +5,8 @@ Expressions evaluate right to left with no operator precedence: `2 * 3 + 4` is `
 ## Values
 
 Atoms and typed vectors of boolean, guid, byte, short, int, long, real, float, char, symbol, timestamp, month, date,
-datetime, timespan, minute, second and time, with typed nulls and infinities (`0N`, `0W`, `0n`, `0w`); general lists;
+datetime, timespan, minute, second and time, with typed nulls and infinities (`0N`, `0W`, `0n`, `0w`, and the same
+followed by a type's letter: `0Wh`, `0Np`, `-0Wz`); general lists;
 enumerations ([below](#enumerations-foreign-keys-and-linked-columns)); dictionaries; tables and keyed tables; functions. Vectors carry the attributes `` `s# `` `` `u# `` `` `p# `` `` `g# ``.
 Integer arithmetic and aggregates wrap on overflow.
 
@@ -14,9 +15,16 @@ Integer arithmetic and aggregates wrap on overflow.
 * Month, date, datetime and timestamp compare in the finer of two types, as do minute, second, time and timespan. A list
   such as `12:34 01:02:03` takes the finer type, or the type a letter after its last item names (`u v t n`). A date plus a
   timespan is a timestamp.
+* A temporal null or infinity cast or converted to another temporal type is that type's null or infinity, and a date too
+  far off for a timestamp is an infinite one. Casting a number's infinity keeps the number (`` `int$0Wh `` is `32767i`).
+* `"P"$`, `"Z"$` and `"N"$` read the forms q writes, a date with `-` or without separators (`20191122-11:11`), and for
+  a timespan digits alone (`hhmmss` and a fraction).
+* In a timestamp, timespan or datetime an hour may stand alone: `2026.01.01D12`, `0D0`, `2026.01.01T9`.
 * A symbol compares only with a symbol (`'type`). Writing a value of another type into a simple list, or adding one with
   `,:`, is `'type`; a general list whose items come to share a type becomes simple. One exception: longs that fit are
   taken into an `int` column of a table by `insert`, `upsert` and `t,:row` (`update` still wants ints).
+* A table's column that is a general list stays one as `insert`, `upsert` or `,` add rows to the table, even if its
+  items then all share a type; an empty one takes the type of what is added.
 * Verbs applied to two dictionaries work key by key over the keys of both; a value only one has is kept, and compared
   with a null by comparisons. `d _ key` and `keys _ d` drop entries.
 * Casting a float to a whole number rounds it. A type can be given by number (`7h$x`), and `"ijf"$x` casts item by item.

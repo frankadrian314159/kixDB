@@ -314,8 +314,15 @@ s4`): `ca.key` stays off the nodes.
 | route | leading row-by-row `where` clauses fix every distribution column to values on one shard | that shard runs the whole query, including `deltas`, `mavg`, `first` and so on |
 | grouped by the distribution columns | `by` includes each one that the filters do not fix to a single value | each group lies on one shard: results are concatenated |
 | rows merged in order | row-by-row filters and columns | shard results are merged by ordinal |
+| distinct rows merged in order | the same under `distinct`: `select distinct ...`, `distinct select ...`, `distinct exec c from t`, `exec distinct c from t` | each shard sends the first of its equal rows; the merged rows' repeats are dropped |
 | two-phase aggregation | `sum count min max prd avg wavg wsum var svar dev sdev`, and arithmetic on them | shards compute partial states, the control node merges them |
 | gather | everything else | the tables named are copied to the control node and the statement runs there |
+
+**Row by row** means that a row of the result depends on that row alone: arithmetic and other item-by-item verbs, casts,
+`fby` over groups that a shard holds whole, and a built-in verb applied item by item, as in `` `$2#'phone ``,
+`count each name`, `x f'y` (what is not a column must then be an atom), `col f\:y` and `y f/:col`. A filter that is
+itself such an application must apply a comparison (`name ~\: "bo"`). The table is gathered for a function of your own
+applied this way, and for an `update` that sets a column this way.
 
 For a gathered query over one sharded table, leading row-by-row filters run on the shards and only the columns used are
 copied. A statement that calls `value`, `get`, `system` or similar may name tables at run time, so every table is
@@ -474,7 +481,7 @@ shards must match.
 
 * **Upgrade the control nodes and all shards together:** the messages between them change from version to version.
   (Since [columns of strings](storage.md#columns-of-strings) are sent and saved packed, an earlier version cannot read
-  what a later one wrote.)
+  what a later one wrote. Query results carry byte, char and GUID columns differently from earlier versions too.)
 * **Every node is trusted fully.** A certificate of the cluster's authority gives full access to every shard, and
   certificates cannot be revoked one by one (see [Security](#security)).
 * **A single control node is a single point of failure** ([several](#several-control-nodes) are not), and gathering

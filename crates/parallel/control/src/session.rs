@@ -4,15 +4,15 @@
 //! on the control node from pushed parts). Otherwise it takes the cluster to itself: inserts, upserts, updates and
 //! deletes are split over the shards where that is exact, and everything else runs on the mirror engine over the tables
 //! it names, gathered from the shards; tables that changed are distributed again.
-use crate::catalog::{column_type, rekey, schema_of, unkey, with_attrs, Names, Table};
+use crate::catalog::{column_type, is_distributed, is_table, rekey, schema_of, unkey, with_attrs, Names, Table};
 use crate::exec::{augmented, in_order};
-use crate::plan::{has_query, is_constant, rowwise, scan_filters, Layout, Planner, Push};
+use crate::plan::{distinct_query, has_adverb, has_query, is_constant, rowwise, scan_filters, Kind, Layout, Planner, Push};
 use crate::Inner;
 use kix_shared_ces::wire::{ForwardReply, ForwardReq, Forwarded, LoadMode, LoadReq, MemberReq, MutateReq, TxnOp, Work, ORD_COL};
 use kixdb::ast::{ColSpec, Expr, QSql, QSqlKind};
 use kixdb::engine::qsql::resolve_col_names;
 use kixdb::engine::{changes, DistMode, Workspace};
-use kixdb::ipc::{decode_k_payload, encode_k_payload};
+use kixdb::ipc::{decode_k_payload, encode_k_payload, encode_k_stored};
 use kixdb::persist::LogOp;
 use kixdb::parser::parse_script;
 use kixdb::sym::{intern, resolve, SymId};
@@ -33,6 +33,12 @@ pub struct ClusterSession {
     refused: bool,
     /// While a statement runs on a private copy of the mirror: the copy as the mirror last took it.
     before: Option<Workspace>,
+    /// Tables created or replaced locally during a multi-statement script, distributed together when flushed.
+    staged: Vec<SymId>,
+    /// Which `staged` tables were already distributed on the shards before this script replaced them.
+    staged_was_dist: BTreeSet<SymId>,
+    /// Exact row counts of tables queued by `distribute` for the next `commit`.
+    counted_loads: Vec<(SymId, usize)>,
 }
 
 fn cluster_error(message: impl Into<String>) -> KError {
@@ -106,7 +112,17 @@ struct Mutation {
 impl ClusterSession {
     pub(crate) fn new(inner: Arc<Inner>) -> ClusterSession {
         let conn = inner.mirror.connect_internal();
-        ClusterSession { inner, conn, plan: vec![], changes: vec![], refused: false, before: None }
+        ClusterSession {
+            inner,
+            conn,
+            plan: vec![],
+            changes: vec![],
+            refused: false,
+            before: None,
+            staged: vec![],
+            staged_was_dist: BTreeSet::new(),
+            counted_loads: vec![],
+        }
     }
 
     /// How the statements of the last request ran.
@@ -116,11 +132,11 @@ impl ClusterSession {
 
     /// Run `code` here, under a permit of the master's, if another node of this node's group is the master and every
     /// statement reads tables and changes nothing. `None`: it is to be run some other way.
-    fn read_here(&mut self, code: &str) -> Option<KResult<K>> {
+    fn read_here(&mut self, code: &str, cached: &mut Option<KResult<Vec<Expr>>>) -> Option<KResult<K>> {
         if self.inner.is_master() {
             return None;
         }
-        let statements = parse_script(code).ok()?;
+        let statements = cached.get_or_insert_with(|| parse_script(code)).as_ref().ok()?.clone();
         let names = self.names();
         if statements.is_empty() || !statements.iter().all(|e| !names.refs(e).none() && names.is_pure(e)) {
             return None;
@@ -142,8 +158,8 @@ impl ClusterSession {
     }
 
     /// The answer to `code` if this node does not run it as master: read here, or given by the master.
-    fn elsewhere(&mut self, code: &str) -> Option<KResult<K>> {
-        self.read_here(code).or_else(|| {
+    fn elsewhere(&mut self, code: &str, cached: &mut Option<KResult<Vec<Expr>>>) -> Option<KResult<K>> {
+        self.read_here(code, cached).or_else(|| {
             self.plan.clear();
             self.passed_on(|| Forwarded::Eval(code.to_string()))
         })
@@ -175,16 +191,16 @@ impl ClusterSession {
     /// Run `q` source (or a cluster command) and return the value of the last statement.
     pub fn eval(&mut self, code: &str) -> KResult<K> {
         self.plan.clear();
-        if let Some(r) = self.elsewhere(code) {
+        let mut cached = None;
+        if let Some(r) = self.elsewhere(code, &mut cached) {
             return r;
         }
         if let Some(r) = self.command(code) {
             return r;
         }
+        let statements = cached.unwrap_or_else(|| parse_script(code))?;
         let mut last = K::Null;
-        for s in parse_script(code)? {
-            last = self.statement(&s)?;
-        }
+        self.run_script(&statements, |_, v| last = v)?;
         Ok(last)
     }
 
@@ -195,22 +211,21 @@ impl ClusterSession {
             Some(rs) => Event::Rows(rs),
             None => Event::Value(v),
         };
+        let mut cached = None;
         // (a node that is not the master gives the value of the last statement)
-        if let Some(r) = self.elsewhere(code).or_else(|| self.command(code)) {
+        if let Some(r) = self.elsewhere(code, &mut cached).or_else(|| self.command(code)) {
             return BatchResult { events: vec![r.map(show).unwrap_or_else(Event::Error)] };
         }
         let mut events = vec![];
-        match parse_script(code) {
+        match cached.unwrap_or_else(|| parse_script(code)) {
             Ok(statements) => {
-                for s in statements {
-                    match self.statement(&s) {
-                        Ok(v) if matches!(v, K::Null) || matches!(s, Expr::Assign { .. }) => {}
-                        Ok(v) => events.push(show(v)),
-                        Err(e) => {
-                            events.push(Event::Error(e));
-                            break;
-                        }
+                let res = self.run_script(&statements, |s, v| {
+                    if !matches!(v, K::Null) && !matches!(s, Expr::Assign { .. }) {
+                        events.push(show(v));
                     }
+                });
+                if let Err(e) = res {
+                    events.push(Event::Error(e));
                 }
             }
             Err(e) => events.push(Event::Error(e)),
@@ -235,7 +250,7 @@ impl ClusterSession {
                 "control node: schema only".into()
             } else if self.counted(e).is_some() {
                 "scatter-gather: row counts summed".into()
-            } else if let Some(push) = self.analyze(e) {
+            } else if let Some(push) = self.analyze_read(e) {
                 push.describe()
             } else if self.as_insert(e).is_some() {
                 "rows split over the shards".into()
@@ -252,7 +267,7 @@ impl ClusterSession {
     }
 
     fn names(&self) -> Names<'_> {
-        Names { mirror: self.conn.server(), ns: self.conn.current_namespace() }
+        Names { mirror: self.conn.server(), ns: self.conn.current_namespace(), local: &self.staged }
     }
 
     fn note(&mut self, how: impl Into<String>) {
@@ -351,20 +366,178 @@ impl ClusterSession {
     // ----- Statements ---------------------------------------------------------
 
     fn statement(&mut self, e: &Expr) -> KResult<K> {
+        let mut out = K::Null;
+        self.run_script(std::slice::from_ref(e), |_, v| out = v)?;
+        Ok(out)
+    }
+
+    /// Run `statements` in order: leading pure distributed reads share the read gate, and once a statement writes (or reads
+    /// local state), the remaining statements share one private copy, keeping intermediate tables in memory until needed on
+    /// the shards or at the end of the batch.
+    fn run_script(&mut self, statements: &[Expr], mut on_ok: impl FnMut(&Expr, K)) -> KResult<()> {
+        if statements.is_empty() {
+            return Ok(());
+        }
         let inner = self.inner.clone();
         inner.settle()?;
-        {
-            let _shared = inner.gate.read().unwrap_or_else(|e| e.into_inner());
-            if let Some(v) = self.read(e)? {
-                return Ok(v);
+        let mut idx = 0;
+        while idx < statements.len() {
+            let s = &statements[idx];
+            let v = {
+                let _shared = inner.gate.read().unwrap_or_else(|e| e.into_inner());
+                self.read(s)?
+            };
+            match v {
+                Some(v) => {
+                    on_ok(s, v);
+                    idx += 1;
+                }
+                None => break,
             }
         }
+        if idx >= statements.len() {
+            return Ok(());
+        }
         let _alone = inner.gate.write().unwrap_or_else(|e| e.into_inner());
-        let result = self.on_a_copy(e);
+        let copy = inner.mirror.private_copy();
+        self.before = Some(copy.read_workspace(Workspace::snapshot));
+        let mirror = self.conn.retarget(copy);
+        self.refused = false;
+        self.staged.clear();
+        self.staged_was_dist.clear();
+
+        let result = self.run_in_copy(&statements[idx..], &mut on_ok);
+        let flushed = self.flush_staged();
+        let kept = if self.refused { Ok(()) } else { self.publish(&[]) };
+        self.conn.retarget(mirror);
+        self.before = None;
+        self.staged.clear();
+        self.staged_was_dist.clear();
         let saved = inner.save_state();
-        let v = result?;
-        saved?;
-        Ok(v)
+        result?;
+        flushed?;
+        kept?;
+        saved
+    }
+
+    fn run_in_copy(&mut self, statements: &[Expr], on_ok: &mut dyn FnMut(&Expr, K)) -> KResult<()> {
+        let is_dist_call = |e: &Expr| matches!(e, Expr::Apply { target, .. } if matches!(&**target, Expr::Var(f) if resolve(*f) == ".kix.dist"));
+        for (i, s) in statements.iter().enumerate() {
+            let has_more = i + 1 < statements.len();
+            let pure_local = !matches!(s, Expr::SysCmd { .. }) && !is_dist_call(s) && self.names().refs(s).none();
+            if !self.staged.is_empty() && !pure_local {
+                self.flush_staged()?;
+                self.publish(&[])?;
+            }
+            let v = if pure_local && (!self.staged.is_empty() || has_more) {
+                if self.staged.is_empty() {
+                    self.publish(&[])?;
+                }
+                let dist_before: HashSet<SymId> = self.names().all_tables().into_iter().collect();
+                self.note("control");
+                let res = self.conn.eval_expr(s);
+                let local_tables: Vec<SymId> = self.conn.server().read_workspace(|ws| {
+                    ws.vars
+                        .keys()
+                        .copied()
+                        .filter(|&n| is_distributed(ws, n) && !dist_before.contains(&n))
+                        .collect()
+                });
+                for n in local_tables {
+                    if !self.staged.contains(&n) {
+                        self.staged.push(n);
+                    }
+                }
+                res?
+            } else if let Some(v) = self.try_assign_pure(s, has_more)? {
+                v
+            } else {
+                if i > 0 {
+                    self.publish(&[])?;
+                }
+                let res = self.exclusive(s)?;
+                if has_more {
+                    self.publish(&[])?;
+                }
+                res
+            };
+            on_ok(s, v);
+        }
+        Ok(())
+    }
+
+    /// Fast path for `name: <pure distributed read>`, staging intermediate tables when `has_more` is true.
+    fn try_assign_pure(&mut self, e: &Expr, has_more: bool) -> KResult<Option<K>> {
+        let Expr::Assign { name, global: false, op: None, val } = e else { return Ok(None) };
+        if !self.names().is_pure(val) {
+            return Ok(None);
+        }
+        let Some(v) = self.read(val)? else { return Ok(None) };
+        let qname = self.names().qualify(*name);
+        let was_dist = self.names().is_dist_exact(qname);
+        if is_table(&v) && !kixdb::parser::is_builtin_verb(resolve(qname)) {
+            if has_more {
+                if self.staged.is_empty() {
+                    self.publish(&[])?;
+                }
+                let assign = Expr::Assign { name: *name, global: false, op: None, val: Box::new(Expr::Lit(v)) };
+                self.note("control");
+                let out = self.conn.eval_expr(&assign)?;
+                if was_dist {
+                    self.staged_was_dist.insert(qname);
+                }
+                if !self.staged.contains(&qname) {
+                    self.staged.push(qname);
+                }
+                return Ok(Some(out));
+            }
+            self.publish(&[])?;
+            let assign = Expr::Assign { name: *name, global: false, op: None, val: Box::new(Expr::Lit(v.clone())) };
+            self.note("control");
+            let out = self.conn.eval_expr(&assign)?;
+            let done = self.distribute(qname, &v, None).and_then(|_| self.commit(false, |_, _| Ok(())).map(|_| ()));
+            self.unless_refused(done)?;
+            return Ok(Some(out));
+        }
+        if !was_dist {
+            let assign = Expr::Assign { name: *name, global: false, op: None, val: Box::new(Expr::Lit(v)) };
+            self.note("control");
+            let out = self.conn.eval_expr(&assign)?;
+            self.staged.retain(|&n| n != qname);
+            return Ok(Some(out));
+        }
+        self.publish(&[])?;
+        let assign = Expr::Assign { name: *name, global: false, op: None, val: Box::new(Expr::Lit(v)) };
+        self.on_mirror(&assign).map(Some)
+    }
+
+    fn flush_staged(&mut self) -> KResult<()> {
+        if self.staged.is_empty() {
+            return Ok(());
+        }
+        let staged = std::mem::take(&mut self.staged);
+        let was_dist = std::mem::take(&mut self.staged_was_dist);
+        let mut first_error = None;
+        for name in staged {
+            let val = self.conn.server().read_workspace(|ws| ws.vars.get(&name).cloned());
+            let done = match val {
+                Some(v) if is_table(&v) && !kixdb::parser::is_builtin_verb(resolve(name)) => self.distribute(name, &v, None),
+                _ if was_dist.contains(&name) => {
+                    let drop = LoadReq::new(resolve(name), LoadMode::Drop, &K::Null, None);
+                    self.changes.extend((0..self.inner.shards().len()).map(|s| (s, TxnOp::Load(drop.clone()))));
+                    Ok(())
+                }
+                _ => Ok(()),
+            };
+            if let Err(e) = done {
+                first_error.get_or_insert(e);
+            }
+        }
+        let done = match first_error {
+            Some(e) => Err(e),
+            None => self.commit(false, |_, _| Ok(())).map(|_| ()),
+        };
+        self.unless_refused(done)
     }
 
     /// The value of a read of distributed tables that needs no table brought to the control node.
@@ -381,7 +554,7 @@ impl ClusterSession {
             self.note(format!("scatter-gather: count of {}", t.name));
             return Ok(Some(K::Long(self.inner.count(&t)? as i64)));
         }
-        if let Some(mut push) = self.analyze(e) {
+        if let Some(mut push) = self.analyze_read(e) {
             self.note(push.describe());
             let q = &mut push.query;
             for x in q.where_clauses.iter_mut().chain(q.cols.iter_mut().map(|c| &mut c.expr)).chain(q.by.iter_mut().flatten().map(|c| &mut c.expr)) {
@@ -417,6 +590,9 @@ impl ClusterSession {
         if let Expr::Query(q) = e {
             return self.query_over_read(e, q);
         }
+        if let Some(v) = self.read_sorted(e)? {
+            return Ok(Some(v));
+        }
         let verb = match e {
             Expr::Unary { .. } | Expr::Binary { .. } | Expr::Field(..) => true,
             // a built-in verb or the indexing of a table; a user function could do anything
@@ -445,6 +621,78 @@ impl ClusterSession {
             return Ok(None);
         }
         self.conn.eval_expr(&local).map(Some)
+    }
+
+    /// Push `[N sublist] `c1 xdesc `c2 xasc [0!] <Ordered | ByKey | Replicated | Route query>` to the shards and merge via k-way merge.
+    fn read_sorted(&mut self, e: &Expr) -> KResult<Option<K>> {
+        if !self.names().is_pure(e) {
+            return Ok(None);
+        }
+        let mut cur = e;
+        let mut top_k: Option<usize> = None;
+        if let Expr::Binary { op, lhs, rhs } = cur {
+            if resolve(*op) == "sublist" && self.names().refs(lhs).none() {
+                if let Ok(K::Long(n)) = self.conn.eval_expr(lhs) {
+                    if n >= 0 {
+                        top_k = Some(n as usize);
+                        cur = rhs;
+                    }
+                } else if let Ok(K::Int(n)) = self.conn.eval_expr(lhs) {
+                    if n >= 0 {
+                        top_k = Some(n as usize);
+                        cur = rhs;
+                    }
+                }
+            }
+        }
+        let mut stages: Vec<(Vec<SymId>, bool)> = Vec::new();
+        while let Expr::Binary { op, lhs, rhs } = cur {
+            let op_s = resolve(*op);
+            if !matches!(op_s, "xasc" | "xdesc") || !self.names().refs(lhs).none() {
+                break;
+            }
+            let cols = match self.conn.eval_expr(lhs) {
+                Ok(K::Sym(s)) => if s.is_null() { vec![] } else { vec![s] },
+                Ok(K::Vector(ColVec::Sym(_, xs))) => (*xs).clone(),
+                Ok(K::Vector(ColVec::General(_, xs))) if xs.is_empty() => vec![],
+                _ => return Ok(None),
+            };
+            if cols.contains(&intern(ORD_COL)) {
+                return Ok(None);
+            }
+            stages.push((cols, op_s == "xdesc"));
+            cur = rhs;
+        }
+        if stages.is_empty() {
+            return Ok(None);
+        }
+        let mut unkey_result = false;
+        if let Expr::Binary { op, lhs, rhs } = cur {
+            if resolve(*op) == "!" && matches!(&**lhs, Expr::Lit(K::Long(0) | K::Int(0))) {
+                unkey_result = true;
+                cur = rhs;
+            }
+        }
+        let Some(mut push) = self.analyze(cur) else { return Ok(None) };
+        if push.query.kind != QSqlKind::Select
+            || push.query.distinct
+            || push.query.limit.is_some()
+            || matches!(push.kind, Kind::TwoPhase(_))
+        {
+            return Ok(None);
+        }
+        let q = &mut push.query;
+        for x in q.where_clauses.iter_mut().chain(q.cols.iter_mut().map(|c| &mut c.expr)).chain(q.by.iter_mut().flatten().map(|c| &mut c.expr)) {
+            self.fill(x)?;
+        }
+        self.note(format!("{}; k-way sorted merge", push.describe()));
+        let mut res = self.inner.run_sorted_push(&push, &stages, top_k)?;
+        if unkey_result {
+            if let K::KeyedTable(kt) = res {
+                res = K::Table(Arc::new(kt.unkey()));
+            }
+        }
+        Ok(Some(res))
     }
 
     /// A query whose source is itself a read (`select ... from select ... from t`) and that mentions no other table:
@@ -481,7 +729,7 @@ impl ClusterSession {
         let next_temp = || inner.next_temp.fetch_add(1, Ordering::SeqCst);
         let slots = inner.slots();
         f(&mut Planner {
-            names: Names { mirror: &mirror, ns },
+            names: Names { mirror: &mirror, ns, local: &self.staged },
             mirror: &mut self.conn,
             slots: &slots,
             broadcast_limit: inner.broadcast_limit.load(Ordering::SeqCst),
@@ -495,19 +743,10 @@ impl ClusterSession {
         self.with_planner(|p| p.analyze(&q))
     }
 
-    /// Run `e` against a private copy of the mirror, then make in the mirror what changed there, unless the shards did
-    /// not take a change. (So nothing is written there that is only held for the statement, such as a gathered table.)
-    fn on_a_copy(&mut self, e: &Expr) -> KResult<K> {
-        let copy = self.inner.mirror.private_copy();
-        self.before = Some(copy.read_workspace(Workspace::snapshot));
-        let mirror = self.conn.retarget(copy);
-        self.refused = false;
-        let result = self.exclusive(e);
-        let kept = if self.refused { Ok(()) } else { self.publish(&[]) };
-        self.conn.retarget(mirror);
-        self.before = None;
-        kept?;
-        result
+    /// How to push a read down. `distinct` of a query's rows is pushed as a query marked so, for each shard to drop its
+    /// own repeats.
+    fn analyze_read(&mut self, e: &Expr) -> Option<Push> {
+        distinct_query(e).and_then(|q| self.analyze(&q)).or_else(|| self.analyze(e))
     }
 
     /// Write to the mirror what has changed in the private copy since it was last written, and remove `drop`.
@@ -541,13 +780,8 @@ impl ClusterSession {
             return self.mutate(m);
         }
         // `x: select ...` reads on the shards, then assigns on the control node
-        if let Expr::Assign { name, global: false, op: None, val } = e {
-            if self.names().is_pure(val) {
-                if let Some(v) = self.read(val)? {
-                    let assign = Expr::Assign { name: *name, global: false, op: None, val: Box::new(Expr::Lit(v)) };
-                    return self.on_mirror(&assign);
-                }
-            }
+        if let Some(v) = self.try_assign_pure(e, false)? {
+            return Ok(v);
         }
         if let Some(v) = self.read(e)? {
             return Ok(v);
@@ -639,11 +873,21 @@ impl ClusterSession {
     /// takes over finishes it, and written to the mirror as soon as it is made.
     fn commit(&mut self, alters: bool, learned: impl FnOnce(&mut Self, &[K]) -> KResult<()>) -> KResult<Vec<K>> {
         let ops = std::mem::take(&mut self.changes);
+        let counted = std::mem::take(&mut self.counted_loads);
         let inner = self.inner.clone();
+        let store_counts = |counted: Vec<(SymId, usize)>| {
+            if !counted.is_empty() {
+                let mut rows = inner.rows.lock().unwrap_or_else(|e| e.into_inner());
+                for (name, n) in counted {
+                    rows.insert(name, n);
+                }
+            }
+        };
         let grouped = inner.group.get().is_some() && !ops.is_empty() && self.before.is_some();
         if !(grouped && (alters || !self.unpublished().is_empty())) {
             let answers = inner.commit(ops)?;
             learned(self, &answers)?;
+            store_counts(counted);
             return Ok(answers);
         }
         let (mut learned, mut noted) = (Some(learned), false);
@@ -659,7 +903,7 @@ impl ClusterSession {
                 }
             }),
         );
-        match done {
+        let out = match done {
             Ok(answers) if !noted => Ok(answers),
             done => done.and_then(|answers| self.publish(&[Inner::pending_name()]).map(|_| answers)).inspect_err(|_| {
                 // whether it was made, and written, is seen to before anything else is done
@@ -668,13 +912,18 @@ impl ClusterSession {
                     self.refused = true;
                 }
             }),
+        };
+        if out.is_ok() {
+            store_counts(counted);
         }
+        out
     }
 
     /// Note a change that the shards did not take: what the statement made on the control node is then thrown away.
     fn unless_refused(&mut self, done: KResult<()>) -> KResult<()> {
         if done.is_err() {
             self.changes.clear();
+            self.counted_loads.clear();
             self.refused = true;
         }
         done
@@ -760,6 +1009,7 @@ impl ClusterSession {
     /// Place a table's rows on the shards and keep its schema on the mirror.
     fn distribute(&mut self, name: SymId, value: &K, mode: Option<DistMode>) -> KResult<()> {
         let (flip, nkeys) = unkey(value).ok_or_else(|| KError::ty("only tables are distributed"))?;
+        let nrows = flip.nrows();
         let declared = mode.or_else(|| self.conn.server().read_workspace(|ws| ws.dist.get(&name).cloned()));
         let mode = declared.filter(|m| fits(m, &flip, nkeys)).unwrap_or_else(|| default_mode(&flip, nkeys));
         let t = Table { name, schema: schema_of(&flip), nkeys, mode: mode.clone() };
@@ -782,7 +1032,9 @@ impl ClusterSession {
             args: args.into_iter().map(|a| Some(Expr::Lit(a))).collect(),
         };
         self.conn.eval_expr(&declare)?;
-        self.conn.set_vars(vec![(name, Some(t.schema_k()))])
+        self.conn.set_vars(vec![(name, Some(t.schema_k()))])?;
+        self.counted_loads.push((name, nrows));
+        Ok(())
     }
 
     /// `.kix.dist[table; mode; col]`: declare a distribution, moving the rows of a table that exists.
@@ -863,22 +1115,42 @@ impl ClusterSession {
         let coerce = Expr::Binary { op: intern("upsert"), lhs: Box::new(Expr::Lit(empty)), rhs: Box::new(Expr::Lit(rows)) };
         let K::Table(coerced) = self.conn.eval_expr(&coerce)? else { return Err(KError::ty("rows do not form a table")) };
         // (this node has the lists that enumerations take values from; the shards check foreign keys)
-        let coerced = self.conn.enumerate_rows(&t.schema, (*coerced).clone(), true)?;
+        let mut coerced = self.conn.enumerate_rows(&t.schema, (*coerced).clone(), true)?;
+        // (a mixed column of a table that has rows stays one, even on a shard that holds none of them)
+        let typed = |&c: &usize| t.schema.vals[c].is_list() && !coerced.vals[c].is_list();
+        let mixed: Vec<usize> = (0..coerced.ncols()).filter(typed).collect();
+        if !mixed.is_empty() && self.inner.rows_of(&t)? > 0 {
+            mixed.into_iter().for_each(|c| coerced.vals[c] = coerced.vals[c].clone().into_list());
+        }
         let schema = t.schema.concat(&coerced.take(0))?;
+        let known_before = self.inner.rows.lock().unwrap_or_else(|e| e.into_inner()).get(&t.name).copied();
         let before = match verb {
-            "insert" => self.inner.rows_of(&t)? as i64,
+            "insert" => match known_before {
+                Some(n) => n as i64,
+                None => self.inner.rows_of(&t)? as i64,
+            },
             _ => 0,
         };
         let parts = self.inner.split(&t, &coerced)?;
-        let mut modes = vec![if t.nkeys > 0 { LoadMode::Upsert } else { LoadMode::Append }];
+        let primary_mode = if t.nkeys > 0 { LoadMode::Upsert } else { LoadMode::Append };
+        let table_name = resolve(t.name).to_string();
+        let encoded: Vec<(usize, Vec<u8>, Option<Vec<i64>>)> = parts
+            .into_iter()
+            .enumerate()
+            .filter(|(_, (part, _))| part.nrows() > 0)
+            .map(|(s, (part, ords))| (s, encode_k_stored(&K::Table(Arc::new(part))), ords))
+            .collect();
         if t.nkeys > 0 && verb == "insert" {
             // every shard is asked about duplicate keys before any shard changes
-            modes.insert(0, LoadMode::CheckInsert);
+            for (s, ipc_k, _) in &encoded {
+                self.changes.push((
+                    *s,
+                    TxnOp::Load(LoadReq { table: table_name.clone(), mode: LoadMode::CheckInsert, ipc_k: ipc_k.clone(), ords: None }),
+                ));
+            }
         }
-        for mode in modes {
-            let some = parts.iter().enumerate().filter(|(_, p)| p.0.nrows() > 0);
-            let load = |(s, (part, ords)): (usize, &(Flip, Option<Vec<i64>>))| (s, TxnOp::Load(LoadReq::new(resolve(t.name), mode, &K::Table(Arc::new(part.clone())), ords.clone())));
-            self.changes.extend(some.map(load));
+        for (s, ipc_k, ords) in encoded {
+            self.changes.push((s, TxnOp::Load(LoadReq { table: table_name.clone(), mode: primary_mode, ipc_k, ords })));
         }
         // (the first rows may give columns of the schema their types)
         let (name, now) = (t.name, rekey(schema, t.nkeys));
@@ -890,6 +1162,10 @@ impl ClusterSession {
         if verb == "insert" {
             // (an insert that is made adds every row)
             self.inner.rows.lock().unwrap_or_else(|e| e.into_inner()).insert(t.name, before as usize + coerced.nrows());
+        } else if verb == "upsert" && t.nkeys == 0 {
+            if let Some(n) = known_before {
+                self.inner.rows.lock().unwrap_or_else(|e| e.into_inner()).insert(t.name, n + coerced.nrows());
+            }
         }
         self.note(format!("{verb}: {} row(s) split over the shards", coerced.nrows()));
         Ok(match verb {
@@ -947,7 +1223,9 @@ impl ClusterSession {
                 for (c, name) in query.cols.iter_mut().zip(names) {
                     c.name = Some(name);
                     let Some(s) = self.with_planner(|p| p.substitute(&c.expr, &cols)) else { return Ok(None) };
-                    let each_row = grouped_by_key || rowwise(&s, &cols, &keys) || (is_constant(&s, &cols) && matches!(s, Expr::Lit(ref k) if k.is_atom()));
+                    // (a verb applied item by item gives a shard without rows a column of no type, so such a column is made here)
+                    let by_row = rowwise(&s, &cols, &keys) && !has_adverb(&s);
+                    let each_row = grouped_by_key || by_row || (is_constant(&s, &cols) && matches!(s, Expr::Lit(ref k) if k.is_atom()));
                     // shards whose rows do not match must end up with columns of the same type as the others
                     let same_type = match t.schema.col(name) {
                         Some(old) => old.type_num() == 0 || column_type(&mut self.conn, &t.schema, &s) == Some(old.type_num()),
@@ -1021,9 +1299,9 @@ impl ClusterSession {
             }
             "l" => {
                 let mut last = K::Null;
-                for s in parse_script(&std::fs::read_to_string(arg)?)? {
-                    last = self.exclusive(&s)?;
-                }
+                let statements = parse_script(&std::fs::read_to_string(arg)?)?;
+                self.run_in_copy(&statements, &mut |_, v| last = v)?;
+                self.flush_staged()?;
                 Ok(last)
             }
             "t" | "ts" => {
@@ -1035,9 +1313,8 @@ impl ClusterSession {
                 let t0 = Instant::now();
                 let mut bytes = 0;
                 for _ in 0..count {
-                    for s in &statements {
-                        bytes = self.exclusive(s)?.approx_bytes();
-                    }
+                    self.run_in_copy(&statements, &mut |_, v| bytes = v.approx_bytes())?;
+                    self.flush_staged()?;
                 }
                 let ms = t0.elapsed().as_millis() as i64;
                 Ok(match cmd {

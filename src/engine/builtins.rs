@@ -113,6 +113,7 @@ fn zone(x: &K, to_local: bool) -> KResult<K> {
 /// values', and of a table, column by column.
 fn truth(x: &K, all: bool) -> KResult<K> {
     match x {
+        K::Vector(ColVec::Bool(_, bs)) => Ok(K::Bool(if all { bs.all() } else { bs.any() })),
         K::Dict(d) => truth(&d.vals, all),
         K::KeyedTable(t) => truth(&K::Table(Arc::new(t.vals.clone())), all),
         K::Table(t) => {

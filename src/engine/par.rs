@@ -1,8 +1,9 @@
 //! Work over large vectors split across threads. Results are the same however many threads there are: pieces have fixed
 //! sizes and are put together in order. (A sum of many floating point numbers may differ in its last digits from the
 //! sum added one after another.)
-use rayon::prelude::*;
+use crate::bools::Bools;
 use foldhash::{HashMap, HashMapExt};
+use rayon::prelude::*;
 use std::ops::Range;
 
 /// Inputs shorter than this are not worth handing to other threads.
@@ -46,6 +47,35 @@ pub fn map2<A: Sync, B: Sync, T: Send>(x: &[A], y: &[B], f: impl Fn(&A, &B) -> T
     }
 }
 
+/// Bit-packed `Bools` from `f` over `items`, without allocating an intermediate `Vec<bool>`.
+pub fn map_bools<A: Sync>(items: &[A], f: impl Fn(&A) -> bool + Sync) -> Bools {
+    match split(items.len()) {
+        false => Bools::from_fn(items.len(), |i| f(&items[i])),
+        true => {
+            let words: Vec<u64> = items
+                .par_chunks(PIECE)
+                .flat_map_iter(|chunk| Bools::from_fn(chunk.len(), |i| f(&chunk[i])).into_words())
+                .collect();
+            Bools::from_words(items.len(), words)
+        }
+    }
+}
+
+/// Bit-packed `Bools` from `f` over equal-length `x` and `y`.
+pub fn map2_bools<A: Sync, B: Sync>(x: &[A], y: &[B], f: impl Fn(&A, &B) -> bool + Sync) -> Bools {
+    match split(x.len()) {
+        false => Bools::from_fn(x.len(), |i| f(&x[i], &y[i])),
+        true => {
+            let words: Vec<u64> = x
+                .par_chunks(PIECE)
+                .zip(y.par_chunks(PIECE))
+                .flat_map_iter(|(cx, cy)| Bools::from_fn(cx.len(), |i| f(&cx[i], &cy[i])).into_words())
+                .collect();
+            Bools::from_words(x.len(), words)
+        }
+    }
+}
+
 /// `piece` of consecutive pieces of `items`, in order. (The pieces do not depend on the number of threads.)
 pub fn pieces<A: Sync, T: Send>(items: &[A], piece: impl Fn(&[A]) -> T + Sync) -> Vec<T> {
     match items.len() < PAR {
@@ -54,34 +84,53 @@ pub fn pieces<A: Sync, T: Send>(items: &[A], piece: impl Fn(&[A]) -> T + Sync) -
     }
 }
 
-/// The positions of the `true`s.
-pub fn true_rows(bs: &[bool]) -> Vec<usize> {
-    let count = |bs: &[bool]| bs.iter().map(|&b| usize::from(b)).sum::<usize>();
+/// The positions of the `true` bits in `bs`, scanned 64 bits at a time via `POPCNT` and `TZCNT`.
+pub fn true_rows(bs: &Bools) -> Vec<usize> {
+    let words = bs.words();
     if !split(bs.len()) {
-        // every position is written and then kept or not: there is no branch to mispredict
-        let count = count(bs);
-        let mut rows = vec![0; count + 1];
-        let mut next = 0;
-        for (i, &b) in bs.iter().enumerate() {
-            rows[next] = i;
-            next += usize::from(b);
+        let mut rows = Vec::with_capacity(bs.count_ones());
+        for (wi, &word) in words.iter().enumerate() {
+            let mut w = word;
+            let base = wi * 64;
+            while w != 0 {
+                rows.push(base + w.trailing_zeros() as usize);
+                w &= w - 1;
+            }
         }
-        rows.truncate(count);
         return rows;
     }
-    // each piece is given its place in the result
-    let counts: Vec<usize> = bs.par_chunks(PIECE).map(count).collect();
-    let mut rows = vec![0; counts.iter().sum()];
+    const WCHUNK: usize = PIECE / 64;
+    let counts: Vec<usize> = words
+        .par_chunks(WCHUNK)
+        .map(|ws| ws.iter().map(|w| w.count_ones() as usize).sum())
+        .collect();
+    let mut rows = vec![0usize; counts.iter().sum()];
     let mut rest = rows.as_mut_slice();
-    let places: Vec<&mut [usize]> = counts.iter().map(|&n| {
-        let (place, after) = std::mem::take(&mut rest).split_at_mut(n);
-        rest = after;
-        place
-    }).collect();
-    places.into_par_iter().zip(bs.par_chunks(PIECE)).enumerate().for_each(|(p, (place, bs))| {
-        let trues = bs.iter().enumerate().filter(|(_, &b)| b).map(|(i, _)| p * PIECE + i);
-        place.iter_mut().zip(trues).for_each(|(slot, row)| *slot = row);
-    });
+    let places: Vec<&mut [usize]> = counts
+        .iter()
+        .map(|&n| {
+            let (place, after) = std::mem::take(&mut rest).split_at_mut(n);
+            rest = after;
+            place
+        })
+        .collect();
+    places
+        .into_par_iter()
+        .zip(words.par_chunks(WCHUNK))
+        .enumerate()
+        .for_each(|(p, (place, ws))| {
+            let chunk_base = p * PIECE;
+            let mut out_i = 0;
+            for (wi, &word) in ws.iter().enumerate() {
+                let mut w = word;
+                let base = chunk_base + wi * 64;
+                while w != 0 {
+                    place[out_i] = base + w.trailing_zeros() as usize;
+                    out_i += 1;
+                    w &= w - 1;
+                }
+            }
+        });
     rows
 }
 

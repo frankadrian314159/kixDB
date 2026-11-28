@@ -57,7 +57,7 @@ fn verbs_of_one_argument() {
 #[test]
 fn verbs_of_two_arguments_adverbs_and_indexing() {
     same(&[
-        "X like \"a*\"", "X like \"*an*\"", "X like \"\"", "X = X", "X <> X", "X ~ X", "X ~ l", "l ~ X", "X ~\\: \"apple\"", "\"apple\" ~/: X", "X ,\\: \"!\"",
+        "X like \"a*\"", "X like \"*an*\"", "X like \"*ry\"", "X like \"\"", "2 #' X", "-2 #' X", "0 #' X", "10 #' X", "2 _' X", "-2 _' X", "X = X", "X <> X", "X ~ X", "X ~ l", "l ~ X", "X ~\\: \"apple\"", "\"apple\" ~/: X", "X ,\\: \"!\"",
         "\"!\" ,/: X", "X ,' X", "X in (\"apple\"; \"\")", "X in X", "X in l", "(\"apple\"; \"pear\") in X", "\"apple\" in X", "X in \"apple\"", "X ? \"cherry\"",
         "X ? \"pear\"", "X ? (\"cherry\"; \"pear\")", "l ? X", "X, X", "X, l", "l, X", "X, \"z\"", "X, enlist \"z\"", "(enlist \"z\"), X", "X, 1", "1, X", "X, `a", "X, ()",
         "(), X", "X, `a`b!1 2", "3 # X", "-2 # X", "10 # X", "0 # X", "2 _ X", "-2 _ X", "X _ 1", "1 3 sublist X", "2 sublist X", "X 2", "X 1 4", "X 10", "X[;0]", "X[0;1]",

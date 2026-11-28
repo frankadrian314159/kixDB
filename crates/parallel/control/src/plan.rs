@@ -11,6 +11,7 @@ use kixdb::engine::qsql::resolve_col_names;
 use kixdb::engine::DistMode;
 use kixdb::parser::is_builtin_verb;
 use kixdb::sym::{intern, resolve, SymId};
+use kixdb::types::AdverbKind;
 use kixdb::{ColVec, Connection, Flip, Func, K};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -116,6 +117,7 @@ impl Push {
             Kind::Replicated => "replicated: one shard".to_string(),
             Kind::Route(s) => format!("route: shard {s}"),
             Kind::ByKey => "scatter-gather: grouped by the distribution column".to_string(),
+            Kind::Ordered if self.query.distinct => "scatter-gather: each shard's distinct rows merged in order".to_string(),
             Kind::Ordered => "scatter-gather: rows merged in order".to_string(),
             Kind::TwoPhase(_) => "scatter-gather: two-phase aggregation".to_string(),
         };
@@ -145,6 +147,7 @@ const ELEMENTWISE_UNARY: [&str; 22] = [
     "signum", "null", "not", "upper", "lower", "trim", "string",
 ];
 const ELEMENTWISE_BINARY: [&str; 16] = ["+", "-", "*", "%", "=", "<>", "<", "<=", ">", ">=", "&", "|", "and", "or", "div", "mod"];
+const EACH: [&str; 2] = ["each", "peach"];
 const PREDICATES: [&str; 13] = ["=", "<>", "<", "<=", ">", ">=", "&", "|", "and", "or", "in", "within", "like"];
 
 fn is_one_of(s: SymId, set: &[&str]) -> bool {
@@ -174,6 +177,56 @@ fn one_value(q: &QSql) -> bool {
         && matches!(q.cols.as_slice(), [c] if c.name.is_none() && matches!(&c.expr, Expr::Unary { op, .. } if is_one_of(*op, &AGGREGATES)))
 }
 
+/// `distinct select ...`, `distinct exec c from t` or `exec distinct c from t` as a query marked `distinct`.
+pub fn distinct_query(e: &Expr) -> Option<Expr> {
+    let distinct = |op: &SymId| resolve(*op) == "distinct";
+    let mut q = match e {
+        Expr::Unary { op, arg } if distinct(op) => match &**arg {
+            Expr::Query(q) if !q.cols.is_empty() => (**q).clone(),
+            _ => return None,
+        },
+        Expr::Query(q) if q.kind == QSqlKind::Exec => match q.cols.as_slice() {
+            [ColSpec { name: None, expr: Expr::Unary { op, arg } }] if distinct(op) => {
+                let mut inner = (**q).clone();
+                inner.cols[0].expr = (**arg).clone();
+                inner
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+    // rows, or the values of one column; groups and limits would come before `distinct`
+    let listed = q.kind == QSqlKind::Select || q.kind == QSqlKind::Exec && matches!(q.cols.as_slice(), [c] if c.name.is_none());
+    if !listed || q.by.is_some() || q.limit.is_some() {
+        return None;
+    }
+    q.distinct = true;
+    Some(Expr::Query(Box::new(q)))
+}
+
+/// The name of a built-in verb written as one.
+fn verb_name(f: &Expr) -> Option<SymId> {
+    match f {
+        Expr::Lit(K::Func(Func::Prim(s))) => Some(*s),
+        Expr::Var(s) => is_builtin_verb(resolve(*s)).then_some(*s),
+        _ => None,
+    }
+}
+
+/// A built-in verb, perhaps with adverbs (`#`, `,\:`). (A user's function is not: the types of its results could differ
+/// from shard to shard.)
+fn is_verb(f: &Expr) -> bool {
+    match f {
+        Expr::Adverb { func, .. } => is_verb(func),
+        other => verb_name(other).is_some(),
+    }
+}
+
+/// Whether the expression applies a verb item by item (`f each x`, `x f'y`).
+pub fn has_adverb(e: &Expr) -> bool {
+    e.any(&mut |x| matches!(x, Expr::Adverb { .. }) || matches!(x, Expr::Binary { op, .. } if is_one_of(*op, &EACH)))
+}
+
 /// Whether row `r` of the result depends only on row `r` of the columns (so each shard can compute its own rows). A
 /// `fby` is allowed when its groups include all of `keys`: the distribution columns that differ between the rows.
 pub fn rowwise(e: &Expr, cols: &HashSet<SymId>, keys: &[SymId]) -> bool {
@@ -183,11 +236,30 @@ pub fn rowwise(e: &Expr, cols: &HashSet<SymId>, keys: &[SymId]) -> bool {
         Expr::Var(s) => cols.contains(s),
         Expr::Field(base, _) => matches!(&**base, Expr::Var(s) if cols.contains(s)),
         Expr::Unary { op, arg } => is_one_of(*op, &ELEMENTWISE_UNARY) && rw(arg),
-        Expr::Apply { target, args } => match (&**target, args.as_slice()) {
-            (Expr::Var(f), [Some(a)]) => is_one_of(*f, &ELEMENTWISE_UNARY) && rw(a),
-            _ => false,
-        },
+        Expr::Apply { target, args } => {
+            // applied to each row's item of a column
+            let items = |x: &Expr| rw(x) && uses_column(x, cols);
+            match (&**target, args.as_slice()) {
+                (Expr::Var(f), [Some(a)]) => is_one_of(*f, &ELEMENTWISE_UNARY) && rw(a),
+                (Expr::Adverb { kind, func }, [Some(a), rest @ ..]) if is_verb(func) => match (kind, rest) {
+                    (AdverbKind::Each, []) => items(a),
+                    // paired item by item, so what is not a column must be an atom
+                    (AdverbKind::Each, [Some(b)]) => rw(a) && rw(b) && (uses_column(a, cols) || uses_column(b, cols)),
+                    // the other argument is used whole for every row
+                    (AdverbKind::EachLeft, [Some(b)]) => items(a) && is_constant(b, cols),
+                    (AdverbKind::EachRight, [Some(b)]) => is_constant(a, cols) && items(b),
+                    _ => false,
+                },
+                _ => false,
+            }
+        }
+        Expr::Juxt { func, arg } => {
+            matches!(&**func, Expr::Adverb { kind: AdverbKind::Each, func } if is_verb(func))
+                && rw(arg)
+                && uses_column(arg, cols)
+        }
         Expr::Binary { op, lhs, rhs } => match resolve(*op) {
+            "each" | "peach" => is_verb(lhs) && rw(rhs) && uses_column(rhs, cols),
             "in" | "within" | "like" => rw(lhs) && is_constant(rhs, cols),
             "xbar" | "$" => is_constant(lhs, cols) && rw(rhs),
             "^" | "xexp" | "xlog" => rw(lhs) && rw(rhs),
@@ -220,6 +292,13 @@ pub fn filters_rows(e: &Expr, cols: &HashSet<SymId>, keys: &[SymId]) -> bool {
         Expr::Binary { op, .. } => is_one_of(*op, &PREDICATES),
         Expr::Unary { op, .. } => is_one_of(*op, &["not", "null", "~"]),
         Expr::Var(_) => true,
+        // `c ~\: "text"`, `"text" ~/: c`: a comparison for each row
+        Expr::Apply { target, .. } => {
+            matches!(&**target, Expr::Adverb { func, .. } if verb_name(func).is_some_and(|v| resolve(v) == "~" || is_one_of(v, &PREDICATES)))
+        }
+        Expr::Juxt { func, .. } => {
+            matches!(&**func, Expr::Adverb { kind: AdverbKind::Each, func } if verb_name(func).is_some_and(|v| matches!(resolve(v), "not" | "null")))
+        }
         _ => false,
     };
     predicate && rowwise(e, cols, keys)
@@ -569,7 +648,14 @@ impl Planner<'_> {
             }
             // `count i` counts rows wherever they are
             Expr::Unary { op, arg } if resolve(*op) == "count" && matches!(&**arg, Expr::Var(s) if resolve(*s) == "i") => Some(e.clone()),
-            Expr::Query(q) => self.analyze(q).map(|_| e.clone()),
+            Expr::Query(q) => {
+                let marked = distinct_query(e);
+                let q = match &marked {
+                    Some(Expr::Query(marked)) => marked,
+                    _ => q,
+                };
+                self.analyze(q).map(|_| e.clone())
+            }
             Expr::Lambda { .. } => self.closed_expr(e, &HashSet::new()).then(|| e.clone()),
             Expr::Lit(K::Func(f)) => self.closed(f).then(|| e.clone()),
             Expr::Assign { .. } | Expr::IndexAssign { .. } | Expr::SysCmd { .. } | Expr::If { .. } | Expr::Do { .. } | Expr::While { .. } | Expr::Return(_) => None,
@@ -603,6 +689,124 @@ impl Planner<'_> {
         }
     }
 
+    /// Fold `select / exec ... from (select <rowwise cols> from <rel> where <w1>) where <w2>` into one query over `<rel>`.
+    fn fold_from(&mut self, q: &QSql) -> Option<QSql> {
+        let Expr::Query(inner_box) = &*q.from else { return None };
+        let inner = self.fold_from(inner_box).unwrap_or_else(|| (**inner_box).clone());
+        if inner.kind != QSqlKind::Select || inner.distinct || inner.by.is_some() || inner.limit.is_some() || inner.cols.is_empty() {
+            return None;
+        }
+        let mentions_i = |e: &Expr| e.any(&mut |x| matches!(x, Expr::Var(s) if resolve(*s) == "i"));
+        if inner.where_clauses.iter().chain(inner.cols.iter().map(|c| &c.expr)).any(mentions_i) {
+            return None;
+        }
+        let rel = self.relation(&inner.from)?;
+        let base_list = if matches!(rel.expr, Expr::Var(_)) {
+            rel.cols
+        } else {
+            crate::catalog::unkey(&self.mirror.eval_expr(&inner.from).ok()?)?.0.cols
+        };
+        let base: HashSet<SymId> = base_list.into_iter().collect();
+        if !inner.cols.iter().all(|c| rowwise(&c.expr, &base, &[])) || !inner.cols.iter().any(|c| uses_column(&c.expr, &base)) {
+            return None;
+        }
+        let inner_names = resolve_col_names(&inner.cols);
+        let map: HashMap<SymId, Expr> = inner_names.iter().copied().zip(inner.cols.iter().map(|c| c.expr.clone())).collect();
+        if map.contains_key(&intern("i")) {
+            return None;
+        }
+
+        fn has_bare_i(e: &Expr) -> bool {
+            match e {
+                Expr::Query(_) => false,
+                Expr::Unary { op, arg } if resolve(*op) == "count" && matches!(&**arg, Expr::Var(s) if resolve(*s) == "i") => false,
+                Expr::Var(s) if resolve(*s) == "i" => true,
+                other => other.children().into_iter().any(has_bare_i),
+            }
+        }
+        if q.where_clauses
+            .iter()
+            .chain(q.by.iter().flatten().map(|c| &c.expr))
+            .chain(q.cols.iter().map(|c| &c.expr))
+            .any(has_bare_i)
+        {
+            return None;
+        }
+
+        fn inline(e: &Expr, map: &HashMap<SymId, Expr>, shadowed: &HashSet<SymId>, base: &HashSet<SymId>) -> Option<Expr> {
+            match e {
+                Expr::Query(_) | Expr::Lambda { .. } => Some(e.clone()),
+                Expr::Var(s) => {
+                    if shadowed.contains(s) {
+                        return Some(e.clone());
+                    }
+                    if let Some(repl) = map.get(s) {
+                        return Some(repl.clone());
+                    }
+                    (!base.contains(s)).then(|| e.clone())
+                }
+                Expr::Field(lhs, f) => {
+                    if let Expr::Var(s) = &**lhs {
+                        if !shadowed.contains(s) && !map.contains_key(s) && !base.contains(s) {
+                            return Some(e.clone());
+                        }
+                    }
+                    Some(Expr::Field(Box::new(inline(lhs, map, shadowed, base)?), *f))
+                }
+                other => {
+                    let mut out = other.clone();
+                    for c in out.children_mut() {
+                        *c = inline(c, map, shadowed, base)?;
+                    }
+                    Some(out)
+                }
+            }
+        }
+
+        let mut out = q.clone();
+        let exec_single = q.kind == QSqlKind::Exec && q.cols.len() == 1 && q.cols[0].name.is_none() && q.by.is_none();
+        if out.cols.is_empty() {
+            if out.kind != QSqlKind::Select || out.by.is_some() {
+                return None;
+            }
+            out.cols = inner_names.iter().map(|&n| ColSpec { name: Some(n), expr: Expr::Var(n) }).collect();
+        } else if !exec_single {
+            let names = resolve_col_names(&out.cols);
+            out.cols.iter_mut().zip(names).for_each(|(c, n)| c.name = Some(n));
+        }
+        let empty_shadow = HashSet::new();
+        let mut by_shadow = HashSet::new();
+        if let Some(by) = &mut out.by {
+            let names = resolve_col_names(by);
+            for (c, n) in by.iter_mut().zip(names) {
+                c.name = Some(n);
+                c.expr = inline(&c.expr, &map, &empty_shadow, &base)?;
+                if !base.contains(&n) {
+                    by_shadow.insert(n);
+                }
+            }
+        }
+        let mut where_clauses = inner.where_clauses;
+        for w in &out.where_clauses {
+            where_clauses.push(inline(w, &map, &empty_shadow, &base)?);
+        }
+        for c in &mut out.cols {
+            if let Some(by) = &out.by {
+                let conflict = by
+                    .iter()
+                    .filter_map(|b| b.name)
+                    .any(|n| base.contains(&n) && c.expr.any(&mut |x| matches!(x, Expr::Var(s) if *s == n)));
+                if conflict {
+                    return None;
+                }
+            }
+            c.expr = inline(&c.expr, &map, &by_shadow, &base)?;
+        }
+        out.from = inner.from;
+        out.where_clauses = where_clauses;
+        Some(out)
+    }
+
     /// How to push a query down, or `None` if the tables have to come to the control node.
     pub fn analyze(&mut self, q: &QSql) -> Option<Push> {
         if !matches!(q.kind, QSqlKind::Select | QSqlKind::Exec) {
@@ -612,6 +816,14 @@ impl Planner<'_> {
         if !self.names.is_pure(&original) || self.names.refs(&original).dynamic {
             return None;
         }
+        let folded;
+        let q = match self.fold_from(q) {
+            Some(f) => {
+                folded = f;
+                &folded
+            }
+            None => q,
+        };
         let mut rel = self.relation(&q.from)?;
         // the columns of a joined relation are those of the join of the empty tables
         if !matches!(rel.expr, Expr::Var(_)) {

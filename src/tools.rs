@@ -159,6 +159,7 @@ pub fn q_literal_for_column(text: &str, type_char: char) -> KResult<String> {
             'p' => "0Np".into(),
             'm' => "0Nm".into(),
             'd' => "0Nd".into(),
+            'z' => "0Nz".into(),
             'n' => "0Nn".into(),
             'u' => "0Nu".into(),
             'v' => "0Nv".into(),
@@ -215,53 +216,157 @@ pub fn parse_csv(text: &str) -> KResult<Vec<Vec<String>>> {
 }
 
 pub fn parse_delimited(text: &str, delim: char) -> KResult<Vec<Vec<String>>> {
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let mut rows: Vec<Vec<String>> = Vec::new();
-    let mut row: Vec<String> = Vec::new();
-    let mut field = String::new();
-    let mut quoted = false;
-    let mut chars = text.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        if quoted {
-            if c == '"' {
-                if chars.peek() == Some(&'"') {
-                    chars.next();
-                    field.push('"');
-                } else {
-                    quoted = false;
-                }
-            } else {
-                field.push(c);
-            }
-            continue;
-        }
-        if c == '"' && field.is_empty() {
-            quoted = true;
-        } else if c == delim {
-            row.push(std::mem::take(&mut field));
-        } else if c == '\r' || c == '\n' {
-            if c == '\r' && chars.peek() == Some(&'\n') {
-                chars.next();
-            }
-            row.push(std::mem::take(&mut field));
-            if !(row.len() == 1 && row[0].is_empty()) {
-                rows.push(std::mem::take(&mut row));
-            } else {
-                row.clear();
-            }
-        } else {
-            field.push(c);
-        }
-    }
-    if quoted {
-        return Err(KError::syntax("unterminated quoted CSV field"));
-    }
-    if !field.is_empty() || !row.is_empty() {
-        row.push(field);
-        rows.push(row);
-    }
+    let mut rows = Vec::new();
+    scan_delimited_rows(text, delim, |fields| {
+        rows.push(fields.iter().map(str::to_string).collect());
+        Ok(())
+    })?;
     Ok(rows)
+}
+
+pub(crate) struct RowFields<'a> {
+    text: &'a str,
+    unescaped: &'a str,
+    ranges: &'a [(usize, usize, bool)],
+}
+
+impl<'a> RowFields<'a> {
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.ranges.len()
+    }
+
+    #[inline]
+    pub(crate) fn get(&self, i: usize) -> Option<&'a str> {
+        self.ranges.get(i).map(|&(s, e, u)| if u { &self.unescaped[s..e] } else { &self.text[s..e] })
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &'a str> + '_ {
+        (0..self.len()).map(|i| self.get(i).unwrap())
+    }
+}
+
+/// Reusable zero-copy row scanner for delimited text: unquoted fields borrow straight from `text`,
+/// while quoted fields unescape into a single reused scratch buffer.
+pub(crate) struct DelimScanner {
+    ranges: Vec<(usize, usize, bool)>,
+    unescaped: String,
+}
+
+impl DelimScanner {
+    pub(crate) fn new() -> Self {
+        Self {
+            ranges: Vec::with_capacity(16),
+            unescaped: String::new(),
+        }
+    }
+
+    pub(crate) fn scan<F>(&mut self, text: &str, delim: char, mut on_row: F) -> KResult<()>
+    where
+        F: FnMut(RowFields<'_>) -> KResult<()>,
+    {
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+        let dlen = delim.len_utf8();
+        self.ranges.clear();
+        self.unescaped.clear();
+
+        let mut i = 0usize;
+        let len = text.len();
+        let bytes = text.as_bytes();
+        let mut field_start = 0usize;
+        let mut quoted = false;
+        let mut in_unescaped = false;
+        let mut unesc_start = 0usize;
+
+        let emit_row = |ranges: &mut Vec<(usize, usize, bool)>, unescaped: &mut String, on_row: &mut F| -> KResult<()> {
+            if !(ranges.len() == 1 && !ranges[0].2 && ranges[0].0 == ranges[0].1) {
+                on_row(RowFields { text, unescaped, ranges })?;
+            }
+            ranges.clear();
+            unescaped.clear();
+            Ok(())
+        };
+
+        while i < len {
+            let c = if bytes[i].is_ascii() {
+                bytes[i] as char
+            } else {
+                text[i..].chars().next().unwrap()
+            };
+            let clen = c.len_utf8();
+
+            if quoted {
+                if c == '"' {
+                    if i + 1 < len && bytes[i + 1] == b'"' {
+                        self.unescaped.push('"');
+                        i += 2;
+                    } else {
+                        quoted = false;
+                        i += 1;
+                    }
+                } else {
+                    self.unescaped.push(c);
+                    i += clen;
+                }
+                continue;
+            }
+
+            if c == '"' && !in_unescaped && i == field_start {
+                quoted = true;
+                in_unescaped = true;
+                unesc_start = self.unescaped.len();
+                i += 1;
+            } else if c == delim {
+                if in_unescaped {
+                    self.ranges.push((unesc_start, self.unescaped.len(), true));
+                } else {
+                    self.ranges.push((field_start, i, false));
+                }
+                i += dlen;
+                field_start = i;
+                in_unescaped = false;
+            } else if c == '\r' || c == '\n' {
+                if in_unescaped {
+                    self.ranges.push((unesc_start, self.unescaped.len(), true));
+                } else {
+                    self.ranges.push((field_start, i, false));
+                }
+                if c == '\r' && i + 1 < len && bytes[i + 1] == b'\n' {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                emit_row(&mut self.ranges, &mut self.unescaped, &mut on_row)?;
+                field_start = i;
+                in_unescaped = false;
+            } else {
+                if in_unescaped {
+                    self.unescaped.push(c);
+                }
+                i += clen;
+            }
+        }
+
+        if quoted {
+            return Err(KError::syntax("unterminated quoted CSV field"));
+        }
+        if in_unescaped || field_start < len || !self.ranges.is_empty() {
+            if in_unescaped {
+                self.ranges.push((unesc_start, self.unescaped.len(), true));
+            } else {
+                self.ranges.push((field_start, len, false));
+            }
+            emit_row(&mut self.ranges, &mut self.unescaped, &mut on_row)?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn scan_delimited_rows<F>(text: &str, delim: char, on_row: F) -> KResult<()>
+where
+    F: FnMut(RowFields<'_>) -> KResult<()>,
+{
+    DelimScanner::new().scan(text, delim, on_row)
 }
 
 /// Infer a kdb+ column type character (`j`, `f`, `b`, `d`, `p`, `t`, `s`, `C`) from sample strings.
@@ -326,51 +431,164 @@ pub fn delimiters_balanced(src: &str) -> bool {
 pub trait QSession {
     fn run_q(&mut self, code: &str) -> KResult<()>;
     fn describe_table(&mut self, name: &str) -> Option<TableInfo>;
+    fn upsert_batch(&mut self, table_name: &str, batch: Flip) -> KResult<()>;
 }
 
-/// Import CSV text into `table_name` (creating it with inferred types when `create_new` is true).
-pub fn import_csv<S: QSession + ?Sized>(sess: &mut S, csv_text: &str, table_name: &str, create_new: bool) -> KResult<usize> {
-    let rows = parse_csv(csv_text)?;
-    if rows.is_empty() {
-        return Ok(0);
-    }
-    let headers: Vec<String> = rows[0].iter().enumerate().map(|(i, h)| sanitize_ident(h, i)).collect();
-    let data = &rows[1..];
+fn create_empty_table<S: QSession + ?Sized>(sess: &mut S, table_name: &str, headers: &[String], tcs: &[char]) -> KResult<()> {
+    let col_defs: Vec<String> = headers
+        .iter()
+        .zip(tcs)
+        .map(|(h, &tc)| {
+            let empty = ColVec::empty_of_type_char(tc)
+                .map(|cv| format!("`{}$()", cv.type_name()))
+                .unwrap_or_else(|| "()".into());
+            format!("{h}: {empty}")
+        })
+        .collect();
+    sess.run_q(&format!("{table_name}: ([] {})", col_defs.join("; ")))
+}
 
-    let type_chars: Vec<char> = if create_new {
-        let tcs: Vec<char> = (0..headers.len())
-            .map(|ci| {
-                let col_samples: Vec<&str> = data.iter().take(500).filter_map(|r| r.get(ci).map(String::as_str)).collect();
-                infer_column_type(&col_samples)
-            })
-            .collect();
-        let col_defs: Vec<String> = headers
-            .iter()
-            .zip(&tcs)
-            .map(|(h, &tc)| {
-                let empty = ColVec::empty_of_type_char(tc)
-                    .map(|cv| format!("`{}$()", cv.type_name()))
-                    .unwrap_or_else(|| "()".into());
-                format!("{h}: {empty}")
-            })
-            .collect();
-        sess.run_q(&format!("{table_name}: ([] {})", col_defs.join("; ")))?;
-        tcs
-    } else {
-        let info = sess
-            .describe_table(table_name)
-            .ok_or_else(|| KError::value(table_name.to_string()))?;
-        info.columns.iter().map(|c| c.type_char).collect()
+fn flush_builders<S: QSession + ?Sized>(
+    sess: &mut S,
+    table_name: &str,
+    col_syms: &[crate::sym::SymId],
+    type_chars: &[char],
+    cap: usize,
+    builders: &mut Vec<crate::storage::ColBuilder>,
+) -> KResult<()> {
+    let finished = std::mem::replace(
+        builders,
+        type_chars.iter().map(|&tc| crate::storage::ColBuilder::with_capacity(tc, cap, true)).collect(),
+    );
+    let vals: Vec<ColVec> = finished.into_iter().filter_map(crate::storage::ColBuilder::finish).collect();
+    sess.upsert_batch(table_name, Flip::new(col_syms.to_vec(), vals)?)
+}
+
+/// Import CSV text into `table_name` in one columnar pass without intermediate `Vec<Vec<String>>` or `q` formatting.
+pub fn import_csv<S: QSession + ?Sized>(sess: &mut S, csv_text: &str, table_name: &str, create_new: bool) -> KResult<usize> {
+    let mut headers: Vec<String> = Vec::new();
+    let mut col_syms: Vec<crate::sym::SymId> = Vec::new();
+    let mut type_chars: Vec<char> = Vec::new();
+    let mut builders: Vec<crate::storage::ColBuilder> = Vec::new();
+    let mut sample_buf = String::new();
+    let mut sample_spans: Vec<Vec<(usize, usize)>> = Vec::new();
+    let mut sample_rows = 0usize;
+    let mut total_rows = 0usize;
+    let mut initialized = false;
+    let mut saw_header = false;
+
+    let init_schema = |sess: &mut S,
+                       headers: &[String],
+                       sample_buf: &str,
+                       sample_spans: &[Vec<(usize, usize)>]|
+     -> KResult<(Vec<char>, Vec<crate::storage::ColBuilder>)> {
+        let tcs: Vec<char> = if create_new {
+            let inferred: Vec<char> = (0..headers.len())
+                .map(|ci| {
+                    let samples: Vec<&str> = sample_spans[ci].iter().map(|&(s, e)| &sample_buf[s..e]).collect();
+                    infer_column_type(&samples)
+                })
+                .collect();
+            create_empty_table(sess, table_name, headers, &inferred)?;
+            inferred
+        } else {
+            let info = sess
+                .describe_table(table_name)
+                .ok_or_else(|| KError::value(table_name.to_string()))?;
+            info.columns.iter().map(|c| c.type_char).collect()
+        };
+        let mut bs: Vec<crate::storage::ColBuilder> =
+            tcs.iter().map(|&tc| crate::storage::ColBuilder::with_capacity(tc, 500, true)).collect();
+        if !sample_spans.is_empty() {
+            let nrows = sample_spans[0].len();
+            for r in 0..nrows {
+                for (ci, b) in bs.iter_mut().enumerate() {
+                    let (s, e) = sample_spans.get(ci).and_then(|v| v.get(r)).copied().unwrap_or((0, 0));
+                    b.push(&sample_buf[s..e]);
+                }
+            }
+        }
+        Ok((tcs, bs))
     };
 
-    for chunk in data.chunks(500) {
-        let batch_q = build_batch_insert_q(table_name, &headers, &type_chars, chunk)?;
-        sess.run_q(&batch_q)?;
+    scan_delimited_rows(csv_text, ',', |fields| {
+        if !saw_header {
+            saw_header = true;
+            headers = fields.iter().enumerate().map(|(i, h)| sanitize_ident(h, i)).collect();
+            col_syms = headers.iter().map(|h| crate::sym::intern(h)).collect();
+            sample_spans = vec![Vec::new(); headers.len()];
+            if !create_new {
+                let (tcs, bs) = init_schema(sess, &headers, "", &[])?;
+                type_chars = tcs;
+                builders = bs;
+                initialized = true;
+            }
+            return Ok(());
+        }
+        total_rows += 1;
+        if !initialized {
+            for (ci, sp) in sample_spans.iter_mut().enumerate() {
+                let cell = fields.get(ci).unwrap_or("");
+                let s = sample_buf.len();
+                sample_buf.push_str(cell);
+                sp.push((s, sample_buf.len()));
+            }
+            sample_rows += 1;
+            if sample_rows == 500 {
+                let (tcs, mut bs) = init_schema(sess, &headers, &sample_buf, &sample_spans)?;
+                sample_buf.clear();
+                sample_spans.clear();
+                flush_builders(sess, table_name, &col_syms, &tcs, 500, &mut bs)?;
+                type_chars = tcs;
+                builders = bs;
+                initialized = true;
+            }
+            return Ok(());
+        }
+        for (ci, b) in builders.iter_mut().enumerate() {
+            b.push(fields.get(ci).unwrap_or(""));
+        }
+        if total_rows % 500 == 0 {
+            flush_builders(sess, table_name, &col_syms, &type_chars, 500, &mut builders)?;
+        }
+        Ok(())
+    })?;
+
+    if !saw_header {
+        return Ok(0);
     }
-    Ok(data.len())
+    if !initialized {
+        let (tcs, mut bs) = init_schema(sess, &headers, &sample_buf, &sample_spans)?;
+        if total_rows > 0 {
+            flush_builders(sess, table_name, &col_syms, &tcs, 0, &mut bs)?;
+        }
+    } else if total_rows % 500 != 0 {
+        flush_builders(sess, table_name, &col_syms, &type_chars, 0, &mut builders)?;
+    }
+    Ok(total_rows)
 }
 
-/// Stream a delimited file of arbitrary size into `table_name` in batches without loading the file into RAM.
+/// Read one logical CSV record from `reader` into `buf` (continuing across embedded newlines inside quotes).
+fn read_csv_record(reader: &mut impl BufRead, buf: &mut String) -> std::io::Result<bool> {
+    buf.clear();
+    let mut in_quotes = false;
+    loop {
+        let start = buf.len();
+        if reader.read_line(buf)? == 0 {
+            return Ok(!buf.is_empty());
+        }
+        for &b in &buf.as_bytes()[start..] {
+            if b == b'"' {
+                in_quotes = !in_quotes;
+            }
+        }
+        if !in_quotes {
+            return Ok(true);
+        }
+    }
+}
+
+/// Stream a delimited file of arbitrary size into `table_name` in columnar batches without `Vec<Vec<String>>` or `q` formatting.
 pub fn bulk_import<S: QSession + ?Sized>(
     sess: &mut S,
     path: &std::path::Path,
@@ -384,55 +602,68 @@ pub fn bulk_import<S: QSession + ?Sized>(
 ) -> KResult<u64> {
     let file = std::fs::File::open(path)?;
     let mut reader = std::io::BufReader::new(file);
+    let mut scanner = DelimScanner::new();
     let mut line = String::new();
-
-    let first_len = reader.read_line(&mut line)?;
-    if first_len == 0 {
-        return Ok(0);
-    }
-    let first_parsed = parse_delimited(&line, delimiter)?;
-    let Some(first_row) = first_parsed.into_iter().next() else {
-        return Ok(0);
-    };
-
-    let mut pending_rows: Vec<Vec<String>> = Vec::new();
-    let headers: Vec<String> = if has_header {
-        first_row.iter().enumerate().map(|(i, h)| sanitize_ident(h, i)).collect()
-    } else {
-        let ncols = first_row.len();
-        pending_rows.push(first_row);
-        (0..ncols).map(|i| format!("c{i}")).collect()
-    };
-
     let bsize = batch_size.max(1);
-    while pending_rows.len() < bsize {
-        line.clear();
-        if reader.read_line(&mut line)? == 0 {
+
+    // Read first non-empty record
+    let mut headers: Vec<String> = Vec::new();
+    let mut sample_buf = String::new();
+    let mut sample_spans: Vec<Vec<(usize, usize)>> = Vec::new();
+    let mut sample_rows = 0usize;
+
+    loop {
+        if !read_csv_record(&mut reader, &mut line)? {
+            return Ok(0);
+        }
+        let mut got_first = false;
+        scanner.scan(&line, delimiter, |fields| {
+            got_first = true;
+            if has_header {
+                headers = fields.iter().enumerate().map(|(i, h)| sanitize_ident(h, i)).collect();
+                sample_spans = vec![Vec::new(); headers.len()];
+            } else {
+                headers = (0..fields.len()).map(|i| format!("c{i}")).collect();
+                sample_spans = vec![Vec::new(); headers.len()];
+                for (ci, sp) in sample_spans.iter_mut().enumerate() {
+                    let cell = fields.get(ci).unwrap_or("");
+                    let s = sample_buf.len();
+                    sample_buf.push_str(cell);
+                    sp.push((s, sample_buf.len()));
+                }
+                sample_rows = 1;
+            }
+            Ok(())
+        })?;
+        if got_first {
             break;
         }
-        if let Some(r) = parse_delimited(&line, delimiter)?.into_iter().next() {
-            pending_rows.push(r);
-        }
+    }
+
+    let col_syms: Vec<crate::sym::SymId> = headers.iter().map(|h| crate::sym::intern(h)).collect();
+    let sample_target = if create_new { 500 } else { 0 };
+
+    while sample_rows < sample_target && read_csv_record(&mut reader, &mut line)? {
+        scanner.scan(&line, delimiter, |fields| {
+            for (ci, sp) in sample_spans.iter_mut().enumerate() {
+                let cell = fields.get(ci).unwrap_or("");
+                let s = sample_buf.len();
+                sample_buf.push_str(cell);
+                sp.push((s, sample_buf.len()));
+            }
+            sample_rows += 1;
+            Ok(())
+        })?;
     }
 
     let type_chars: Vec<char> = if create_new {
         let tcs: Vec<char> = (0..headers.len())
             .map(|ci| {
-                let samples: Vec<&str> = pending_rows.iter().filter_map(|r| r.get(ci).map(String::as_str)).collect();
+                let samples: Vec<&str> = sample_spans[ci].iter().map(|&(s, e)| &sample_buf[s..e]).collect();
                 infer_column_type(&samples)
             })
             .collect();
-        let col_defs: Vec<String> = headers
-            .iter()
-            .zip(&tcs)
-            .map(|(h, &tc)| {
-                let empty = ColVec::empty_of_type_char(tc)
-                    .map(|cv| format!("`{}$()", cv.type_name()))
-                    .unwrap_or_else(|| "()".into());
-                format!("{h}: {empty}")
-            })
-            .collect();
-        sess.run_q(&format!("{table_name}: ([] {})", col_defs.join("; ")))?;
+        create_empty_table(sess, table_name, &headers, &tcs)?;
         tcs
     } else {
         let info = sess
@@ -442,61 +673,53 @@ pub fn bulk_import<S: QSession + ?Sized>(
     };
 
     let mut total = 0u64;
-    while !pending_rows.is_empty() {
+    let mut in_batch = 0usize;
+    let mut builders: Vec<crate::storage::ColBuilder> =
+        type_chars.iter().map(|&tc| crate::storage::ColBuilder::with_capacity(tc, bsize, true)).collect();
+    for r in 0..sample_rows {
+        for (ci, b) in builders.iter_mut().enumerate() {
+            let (s, e) = sample_spans.get(ci).and_then(|v| v.get(r)).copied().unwrap_or((0, 0));
+            b.push(&sample_buf[s..e]);
+        }
+        in_batch += 1;
+        if in_batch == bsize {
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                return Err(KError::new("cancelled", "bulk import cancelled"));
+            }
+            flush_builders(sess, table_name, &col_syms, &type_chars, bsize, &mut builders)?;
+            total += in_batch as u64;
+            if let Some(p) = progress {
+                p.store(total, Ordering::Relaxed);
+            }
+            in_batch = 0;
+        }
+    }
+    drop(sample_spans);
+    drop(sample_buf);
+
+    loop {
+        while in_batch < bsize && read_csv_record(&mut reader, &mut line)? {
+            scanner.scan(&line, delimiter, |fields| {
+                for (ci, b) in builders.iter_mut().enumerate() {
+                    b.push(fields.get(ci).unwrap_or(""));
+                }
+                in_batch += 1;
+                Ok(())
+            })?;
+        }
+        if in_batch == 0 {
+            break;
+        }
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             return Err(KError::new("cancelled", "bulk import cancelled"));
         }
-        let q = build_batch_insert_q(table_name, &headers, &type_chars, &pending_rows)?;
-        sess.run_q(&q)?;
-        total += pending_rows.len() as u64;
+        flush_builders(sess, table_name, &col_syms, &type_chars, bsize, &mut builders)?;
+        total += in_batch as u64;
         if let Some(p) = progress {
             p.store(total, Ordering::Relaxed);
         }
-        pending_rows.clear();
-        while pending_rows.len() < bsize {
-            line.clear();
-            if reader.read_line(&mut line)? == 0 {
-                break;
-            }
-            if let Some(r) = parse_delimited(&line, delimiter)?.into_iter().next() {
-                pending_rows.push(r);
-            }
-        }
+        in_batch = 0;
     }
 
     Ok(total)
-}
-
-fn build_batch_insert_q(
-    table_name: &str,
-    headers: &[String],
-    type_chars: &[char],
-    rows: &[Vec<String>],
-) -> KResult<String> {
-    if rows.is_empty() {
-        return Ok(String::new());
-    }
-    let mut col_exprs = Vec::with_capacity(headers.len());
-    for (ci, (h, &tc)) in headers.iter().zip(type_chars).enumerate() {
-        if tc == 'C' {
-            let items: Vec<String> = rows
-                .iter()
-                .map(|r| q_literal_for_column(r.get(ci).map(String::as_str).unwrap_or(""), 'C'))
-                .collect::<KResult<_>>()?;
-            let rhs = if items.len() == 1 {
-                format!("enlist {}", items[0])
-            } else {
-                format!("({})", items.join("; "))
-            };
-            col_exprs.push(format!("{h}: {rhs}"));
-        } else {
-            let atoms: Vec<K> = rows
-                .iter()
-                .map(|r| crate::engine::ops::parse_atom_from_str(tc.to_ascii_lowercase(), r.get(ci).map(String::as_str).unwrap_or("")))
-                .collect();
-            let cv = ColVec::from_atoms(atoms);
-            col_exprs.push(format!("{h}: {}", K::Vector(cv).q_repr()));
-        }
-    }
-    Ok(format!("`{table_name} upsert ([] {})", col_exprs.join("; ")))
 }

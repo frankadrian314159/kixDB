@@ -14,6 +14,13 @@ pub struct Strings {
 }
 
 impl Strings {
+    pub fn with_capacity(strings: usize, bytes: usize) -> Self {
+        Self {
+            ends: Vec::with_capacity(strings),
+            bytes: Vec::with_capacity(bytes),
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.ends.len()
     }
@@ -47,6 +54,30 @@ impl Strings {
         self.ends.extend(other.ends.iter().map(|end| base + end));
     }
 
+    /// Append strings from contiguous Arrow `BinaryArray` offsets and value bytes in one copy.
+    pub fn extend_arrow_binary(&mut self, offsets: &[i32], data: &[u8]) {
+        let Some((&first, rest)) = offsets.split_first() else { return };
+        let Some(&last) = rest.last() else { return };
+        let base = self.bytes.len() as u64;
+        let start = first as usize;
+        self.bytes.extend_from_slice(&data[start..last as usize]);
+        self.ends.extend(rest.iter().map(|&off| base + (off as usize - start) as u64));
+    }
+
+    /// Byte range `(start, end)` in `text()` covering rows `row_start..row_end`, plus initial offset.
+    pub fn slice_bounds(&self, row_start: usize, row_end: usize) -> (usize, usize) {
+        if row_start >= row_end {
+            return (0, 0);
+        }
+        let b0 = if row_start == 0 { 0 } else { self.ends[row_start - 1] as usize };
+        let b1 = self.ends[row_end - 1] as usize;
+        (b0, b1)
+    }
+
+    pub fn end_at(&self, i: usize) -> u64 {
+        self.ends[i]
+    }
+
     /// The strings of these lengths that `bytes` holds, one after another.
     pub fn from_parts(lengths: impl IntoIterator<Item = u32>, bytes: Vec<u8>) -> Option<Strings> {
         let mut end = 0;
@@ -63,6 +94,72 @@ impl Strings {
 
     pub fn text(&self) -> &[u8] {
         &self.bytes
+    }
+
+    pub fn reverse_each(&self) -> ColVec {
+        let mut out = Self::with_capacity(self.len(), self.bytes.len());
+        for b in self.iter() {
+            out.bytes.extend(b.iter().rev().copied());
+            out.ends.push(out.bytes.len() as u64);
+        }
+        ColVec::of_strings(Attr::None, out)
+    }
+
+    pub fn take_each(&self, n: i64) -> ColVec {
+        let un = n.unsigned_abs() as usize;
+        let mut out = Self::with_capacity(self.len(), self.len().saturating_mul(un));
+        for b in self.iter() {
+            let len = b.len();
+            if n == 0 {
+                // empty
+            } else if len == 0 {
+                out.bytes.resize(out.bytes.len() + un, NULL_CHAR);
+            } else if n > 0 && un <= len {
+                out.bytes.extend_from_slice(&b[..un]);
+            } else if n < 0 && un <= len {
+                out.bytes.extend_from_slice(&b[len - un..]);
+            } else if n > 0 {
+                out.bytes.extend((0..un).map(|i| b[i % len]));
+            } else {
+                let start = (len - (un % len)) % len;
+                out.bytes.extend((0..un).map(|i| b[(start + i) % len]));
+            }
+            out.ends.push(out.bytes.len() as u64);
+        }
+        ColVec::of_strings(Attr::None, out)
+    }
+
+    pub fn drop_each(&self, n: i64) -> ColVec {
+        let un = n.unsigned_abs() as usize;
+        let mut out = Self::with_capacity(self.len(), self.bytes.len());
+        for b in self.iter() {
+            let slice = if n == 0 {
+                b
+            } else if un >= b.len() {
+                b""
+            } else if n > 0 {
+                &b[un..]
+            } else {
+                &b[..b.len() - un]
+            };
+            out.push(slice);
+        }
+        ColVec::of_strings(Attr::None, out)
+    }
+
+    pub fn concat_each(&self, extra: &[u8], prepend: bool) -> ColVec {
+        let mut out = Self::with_capacity(self.len(), self.bytes.len() + self.len() * extra.len());
+        for b in self.iter() {
+            if prepend {
+                out.bytes.extend_from_slice(extra);
+                out.bytes.extend_from_slice(b);
+            } else {
+                out.bytes.extend_from_slice(b);
+                out.bytes.extend_from_slice(extra);
+            }
+            out.ends.push(out.bytes.len() as u64);
+        }
+        ColVec::of_strings(Attr::None, out)
     }
 }
 
@@ -145,7 +242,14 @@ impl ColVec {
     /// The column with packed strings made the general list that they stand for.
     pub fn listed(&self) -> Cow<'_, ColVec> {
         match self {
-            ColVec::Strings(attr, s) => Cow::Owned(ColVec::General(*attr, Arc::new(crate::engine::par::map(&(0..s.len()).collect::<Vec<_>>(), |&i| value(s.get(i)))))),
+            ColVec::Strings(attr, s) => {
+                use rayon::prelude::*;
+                let items = match crate::engine::par::split(s.len()) {
+                    false => (0..s.len()).map(|i| value(s.get(i))).collect(),
+                    true => (0..s.len()).into_par_iter().map(|i| value(s.get(i))).collect(),
+                };
+                Cow::Owned(ColVec::General(*attr, Arc::new(items)))
+            }
             other => Cow::Borrowed(other),
         }
     }
@@ -189,7 +293,7 @@ impl K {
         match self {
             K::Vector(c) => K::Vector(column(c)),
             K::Table(t) => K::Table(Arc::new(flip(t))),
-            K::KeyedTable(t) => K::KeyedTable(Arc::new(KeyedTable { keys: flip(&t.keys), vals: flip(&t.vals) })),
+            K::KeyedTable(t) => K::KeyedTable(Arc::new(KeyedTable::from_flips(flip(&t.keys), flip(&t.vals)))),
             K::Dict(d) => K::Dict(Arc::new(Dict { keys: Box::new(d.keys.listed()), vals: Box::new(d.vals.listed()) })),
             other => other.clone(),
         }

@@ -551,15 +551,121 @@ pub fn delimited_lines(delimiter: char, flip: &Flip) -> K {
     K::Vector(ColVec::General(Attr::None, Arc::new(lines)))
 }
 
-/// The column that the text `fields` make for the type `tc` (`*` and `C`: strings).
-fn parsed_column(tc: char, fields: &[&str]) -> ColVec {
-    let kind = tc.to_ascii_lowercase();
-    if tc == '*' || tc == 'C' {
-        ColVec::General(Attr::None, Arc::new(fields.iter().map(|f| K::string(f)).collect()))
-    } else if fields.is_empty() {
-        ColVec::empty_of_type_char(kind).unwrap_or_else(|| ColVec::General(Attr::None, Arc::new(vec![])))
-    } else {
-        ColVec::from_atoms(fields.iter().map(|f| crate::engine::ops::parse_atom_from_str(kind, f)).collect())
+/// Typed single-pass column builder for `0:` text parsing and streaming CSV imports.
+pub(crate) enum ColBuilder {
+    Skip,
+    Bool(crate::bools::Bools),
+    Guid(Vec<[u8; 16]>),
+    Byte(Vec<u8>),
+    Short(Vec<i16>),
+    Int(char, Vec<i32>),
+    Long(char, Vec<i64>),
+    Real(Vec<f32>),
+    Float(char, Vec<f64>),
+    Char(Vec<u8>),
+    Sym(Vec<SymId>),
+    PackedStrings(crate::strings::Strings),
+    Strings(Vec<K>),
+}
+
+impl ColBuilder {
+    pub(crate) fn with_capacity(tc: char, cap: usize, pack_strings: bool) -> Self {
+        if tc == ' ' {
+            return Self::Skip;
+        }
+        if tc == '*' || tc == 'C' {
+            return if pack_strings {
+                Self::PackedStrings(crate::strings::Strings::with_capacity(cap, cap * 16))
+            } else {
+                Self::Strings(Vec::with_capacity(cap))
+            };
+        }
+        let kind = tc.to_ascii_lowercase();
+        match kind {
+            'b' => Self::Bool(crate::bools::Bools::with_capacity(cap)),
+            'g' => Self::Guid(Vec::with_capacity(cap)),
+            'x' => Self::Byte(Vec::with_capacity(cap)),
+            'h' => Self::Short(Vec::with_capacity(cap)),
+            'i' | 'd' | 'm' | 'u' | 'v' | 't' => Self::Int(kind, Vec::with_capacity(cap)),
+            'j' | 'p' | 'n' => Self::Long(kind, Vec::with_capacity(cap)),
+            'e' => Self::Real(Vec::with_capacity(cap)),
+            'f' | 'z' => Self::Float(kind, Vec::with_capacity(cap)),
+            'c' => Self::Char(Vec::with_capacity(cap)),
+            's' => Self::Sym(Vec::with_capacity(cap)),
+            _ => {
+                if pack_strings {
+                    Self::PackedStrings(crate::strings::Strings::with_capacity(cap, cap * 16))
+                } else {
+                    Self::Strings(Vec::with_capacity(cap))
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn push(&mut self, s: &str) {
+        match self {
+            Self::Skip => {}
+            Self::Bool(b) => b.push(matches!(s.trim(), "1" | "1b" | "true" | "TRUE" | "t" | "T")),
+            Self::Guid(v) => v.push(parse_guid(s.trim()).unwrap_or(NULL_GUID)),
+            Self::Byte(v) => v.push(u8::from_str_radix(s.trim().trim_start_matches("0x"), 16).unwrap_or(0)),
+            Self::Short(v) => v.push(s.trim().trim_end_matches('h').parse().unwrap_or(NULL_SHORT)),
+            Self::Int('i', v) => v.push(s.trim().trim_end_matches('i').parse().unwrap_or(NULL_INT)),
+            Self::Int(kind, v) => {
+                let n = match crate::engine::ops::parse_atom_from_str(*kind, s) {
+                    K::Date(n) | K::Month(n) | K::Minute(n) | K::Second(n) | K::Time(n) | K::Int(n) => n,
+                    _ => NULL_INT,
+                };
+                v.push(n);
+            }
+            Self::Long('j', v) => v.push(s.trim().trim_end_matches('j').parse().unwrap_or(NULL_LONG)),
+            Self::Long(kind, v) => {
+                let n = match crate::engine::ops::parse_atom_from_str(*kind, s) {
+                    K::Timestamp(n) | K::Timespan(n) | K::Long(n) => n,
+                    _ => NULL_LONG,
+                };
+                v.push(n);
+            }
+            Self::Real(v) => v.push(s.trim().trim_end_matches('e').parse().unwrap_or(f32::NAN)),
+            Self::Float('f', v) => v.push(s.trim().trim_end_matches('f').parse().unwrap_or(f64::NAN)),
+            Self::Float(kind, v) => {
+                let f = match crate::engine::ops::parse_atom_from_str(*kind, s) {
+                    K::Datetime(dt) => dt,
+                    _ => f64::NAN,
+                };
+                v.push(f);
+            }
+            Self::Char(v) => v.push(s.as_bytes().first().copied().unwrap_or(b' ')),
+            Self::Sym(v) => v.push(intern(s.trim())),
+            Self::PackedStrings(v) => v.push(s.as_bytes()),
+            Self::Strings(v) => v.push(K::string(s)),
+        }
+    }
+
+    pub(crate) fn finish(self) -> Option<ColVec> {
+        Some(match self {
+            Self::Skip => return None,
+            Self::Bool(b) => ColVec::Bool(Attr::None, Arc::new(b)),
+            Self::Guid(v) => ColVec::Guid(Attr::None, Arc::new(v)),
+            Self::Byte(v) => ColVec::Byte(Attr::None, Arc::new(v)),
+            Self::Short(v) => ColVec::Short(Attr::None, Arc::new(v)),
+            Self::Int('d', v) => ColVec::Date(Attr::None, Arc::new(v)),
+            Self::Int('m', v) => ColVec::Month(Attr::None, Arc::new(v)),
+            Self::Int('u', v) => ColVec::Minute(Attr::None, Arc::new(v)),
+            Self::Int('v', v) => ColVec::Second(Attr::None, Arc::new(v)),
+            Self::Int('t', v) => ColVec::Time(Attr::None, Arc::new(v)),
+            Self::Int(_, v) => ColVec::Int(Attr::None, Arc::new(v)),
+            Self::Long('p', v) => ColVec::Timestamp(Attr::None, Arc::new(v)),
+            Self::Long('n', v) => ColVec::Timespan(Attr::None, Arc::new(v)),
+            Self::Long(_, v) => ColVec::Long(Attr::None, Arc::new(v)),
+            Self::Real(v) => ColVec::Real(Attr::None, Arc::new(v)),
+            Self::Float('z', v) => ColVec::Datetime(Attr::None, Arc::new(v)),
+            Self::Float(_, v) => ColVec::Float(Attr::None, Arc::new(v)),
+            Self::Char(v) => ColVec::Char(Attr::None, Arc::new(v)),
+            Self::Sym(v) => ColVec::Sym(Attr::None, Arc::new(v)),
+            Self::PackedStrings(v) => ColVec::of_strings(Attr::None, v),
+            Self::Strings(v) => ColVec::General(Attr::None, Arc::new(v)),
+        })
     }
 }
 
@@ -581,13 +687,13 @@ fn fixed_width(types: &str, widths: &[i64], text: &str) -> KResult<K> {
         return Err(KError::length("0: needs a positive width for each type"));
     }
     let record: usize = widths.iter().map(|&w| w as usize).sum();
-    let mut fields: Vec<Vec<&str>> = vec![vec![]; widths.len()];
+    let mut builders: Vec<ColBuilder> = types.chars().map(|tc| ColBuilder::with_capacity(tc, 0, false)).collect();
     for line in text.lines() {
         let mut rest = line;
         while !rest.is_empty() {
-            for (field, &width) in fields.iter_mut().zip(widths) {
+            for (builder, &width) in builders.iter_mut().zip(widths) {
                 let cut = rest.char_indices().nth(width as usize).map_or(rest.len(), |c| c.0);
-                field.push(&rest[..cut]);
+                builder.push(&rest[..cut]);
                 rest = &rest[cut..];
             }
             if line.len() < record {
@@ -595,16 +701,21 @@ fn fixed_width(types: &str, widths: &[i64], text: &str) -> KResult<K> {
             }
         }
     }
-    let columns = types.chars().zip(&fields).filter(|(tc, _)| *tc != ' ').map(|(tc, f)| K::Vector(parsed_column(tc, f)));
-    Ok(K::Vector(ColVec::General(Attr::None, Arc::new(columns.collect()))))
+    let columns: Vec<K> = builders.into_iter().filter_map(ColBuilder::finish).map(K::Vector).collect();
+    Ok(K::Vector(ColVec::General(Attr::None, Arc::new(columns))))
 }
 
 /// `"S=;" 0: text`: the keys (of the first type) and the values (strings) of pairs such as `a=1;b=2`.
 fn key_values(spec: &[u8], text: &str) -> KResult<K> {
     let &[kind, within, between, ..] = spec else { return Err(KError::length("0: needs a key type and two delimiters")) };
-    let pairs: Vec<(&str, &str)> = text.split(between as char).filter(|p| !p.is_empty()).map(|p| p.split_once(within as char).unwrap_or((p, ""))).collect();
-    let (keys, values): (Vec<&str>, Vec<&str>) = pairs.into_iter().unzip();
-    let sides = [parsed_column(kind as char, &keys), parsed_column('*', &values)];
+    let mut keys = ColBuilder::with_capacity(kind as char, 0, false);
+    let mut values = ColBuilder::with_capacity('*', 0, false);
+    for p in text.split(between as char).filter(|p| !p.is_empty()) {
+        let (k, v) = p.split_once(within as char).unwrap_or((p, ""));
+        keys.push(k);
+        values.push(v);
+    }
+    let sides = [keys.finish().unwrap(), values.finish().unwrap()];
     Ok(K::Vector(ColVec::General(Attr::None, Arc::new(sides.into_iter().map(K::Vector).collect()))))
 }
 
@@ -639,7 +750,7 @@ pub fn zero_colon(ws: &Workspace, lhs: &K, rhs: &K) -> KResult<K> {
         return key_values(spec, &source_text(ws, rhs)?);
     }
 
-    // 3. Parse delimited text: `(types; delim) 0: source`
+    // 3. Parse delimited text in one pass directly into typed columns: `(types; delim) 0: source`
     let K::Vector(spec) = lhs else {
         return Err(KError::ty("0: expects (types; delimiter) on LHS"));
     };
@@ -650,37 +761,42 @@ pub fn zero_colon(ws: &Workspace, lhs: &K, rhs: &K) -> KResult<K> {
     let delim_k = spec.get_atom(1);
     let (delim_ch, has_header) = match &delim_k {
         K::Char(b) => (*b as char, false),
-        K::Vector(ColVec::Char(_, bs)) if !bs.is_empty() => (bs[0] as char, true), // `enlist ","` -> 1-element Char vector!
+        K::Vector(ColVec::Char(_, bs)) if !bs.is_empty() => (bs[0] as char, true),
         K::Vector(widths) if widths.as_i64_vec().is_some() => {
             return fixed_width(&types_str, &widths.as_i64_vec().unwrap_or_default(), &source_text(ws, rhs)?);
         }
         _ => return Err(KError::ty("0: delimiter must be char or enlisted char, or the widths of the fields")),
     };
 
-    let rows = crate::tools::parse_delimited(&source_text(ws, rhs)?, delim_ch)?;
-    if rows.is_empty() {
+    let text = source_text(ws, rhs)?;
+    let tchars: Vec<char> = types_str.chars().collect();
+    let mut builders: Vec<ColBuilder> = tchars.iter().map(|&tc| ColBuilder::with_capacity(tc, 0, has_header)).collect();
+    let mut out_cols: Vec<SymId> = Vec::new();
+    let mut saw_any = false;
+
+    crate::tools::scan_delimited_rows(&text, delim_ch, |fields| {
+        if !saw_any && has_header {
+            saw_any = true;
+            for (ci, &tc) in tchars.iter().enumerate() {
+                if tc != ' ' {
+                    let cname = fields.get(ci).map(|s| s.trim()).unwrap_or("");
+                    let chosen = if cname.is_empty() { intern(&format!("x{ci}")) } else { intern(cname) };
+                    out_cols.push(chosen);
+                }
+            }
+            return Ok(());
+        }
+        saw_any = true;
+        for (ci, builder) in builders.iter_mut().enumerate() {
+            builder.push(fields.get(ci).unwrap_or(""));
+        }
+        Ok(())
+    })?;
+
+    if !saw_any {
         return Ok(K::Vector(ColVec::General(Attr::None, Arc::new(vec![]))));
     }
-    let start_row = if has_header { 1 } else { 0 };
-    let data_rows = &rows[start_row..];
-
-    let mut out_cols: Vec<SymId> = Vec::new();
-    let mut out_vecs: Vec<ColVec> = Vec::new();
-
-    for (ci, tc) in types_str.chars().enumerate() {
-        if tc == ' ' {
-            // `' '` skips column in kdb+ `0:`!
-            continue;
-        }
-        if has_header {
-            let cname = rows[0].get(ci).map(|s| s.trim()).unwrap_or("");
-            let chosen = if cname.is_empty() { format!("x{ci}") } else { cname.to_string() };
-            out_cols.push(intern(&chosen));
-        }
-        let fields: Vec<&str> = data_rows.iter().map(|r| r.get(ci).map(String::as_str).unwrap_or("")).collect();
-        out_vecs.push(parsed_column(tc, &fields));
-    }
-
+    let out_vecs: Vec<ColVec> = builders.into_iter().filter_map(ColBuilder::finish).collect();
     if has_header {
         Ok(K::Table(Arc::new(Flip::new(out_cols, out_vecs)?)))
     } else {

@@ -394,6 +394,14 @@ impl<'a> Engine<'a> {
         }
     }
 
+    pub fn eval_stmts(&mut self, stmts: &[Expr]) -> KResult<K> {
+        let mut last = K::Null;
+        for s in stmts {
+            last = self.eval_expr(s)?;
+        }
+        Ok(last)
+    }
+
     pub fn eval_str(&mut self, src: &str) -> KResult<K> {
         if let Some(q) = src.trim().strip_prefix("EXPLAIN ") {
             let stmts = parse_script(q)?;
@@ -405,25 +413,11 @@ impl<'a> Engine<'a> {
             return Ok(K::Vector(ColVec::General(Attr::None, Arc::new(lines))));
         }
         let stmts = parse_script(src)?;
-        if stmts.is_empty() {
-            return Ok(K::Null);
-        }
-        let mut last = K::Null;
-        for s in &stmts {
-            last = self.eval_expr(s)?;
-        }
-        Ok(last)
+        self.eval_stmts(&stmts)
     }
 
-    pub fn run_batch(&mut self, src: &str) -> Vec<Event> {
+    pub fn run_stmts(&mut self, stmts: &[Expr]) -> Vec<Event> {
         let mut events = Vec::new();
-        let stmts = match parse_script(src) {
-            Ok(s) => s,
-            Err(e) => {
-                events.push(Event::Error(e));
-                return events;
-            }
-        };
         for (i, s) in stmts.iter().enumerate() {
             let result = self.eval_expr(s);
             events.append(&mut self.messages);
@@ -447,6 +441,13 @@ impl<'a> Engine<'a> {
             }
         }
         events
+    }
+
+    pub fn run_batch(&mut self, src: &str) -> Vec<Event> {
+        match parse_script(src) {
+            Ok(stmts) => self.run_stmts(&stmts),
+            Err(e) => vec![Event::Error(e)],
+        }
     }
 
     pub fn has_partitioned(&self, name: SymId) -> bool {
@@ -962,6 +963,17 @@ impl<'a> Engine<'a> {
 
             Expr::Binary { op, lhs, rhs } => {
                 let op_name = resolve(*op);
+                // Fuse `k sublist ... xasc/xdesc table` and chained `xasc`/`xdesc` into one MSD / Top-K sort pass.
+                if op_name == "sublist"
+                    && matches!(&**rhs, Expr::Binary { op: rop, .. } if matches!(resolve(*rop), "xasc" | "xdesc"))
+                {
+                    return self.eval_sort_chain(Some(lhs), rhs);
+                }
+                if matches!(op_name, "xasc" | "xdesc")
+                    && matches!(&**rhs, Expr::Binary { op: rop, .. } if matches!(resolve(*rop), "xasc" | "xdesc"))
+                {
+                    return self.eval_sort_chain(None, expr);
+                }
                 // Protected evaluation / functional amend when `@` or `.` is used with bracketed multi-args is `Expr::Apply`,
                 // while infix `f @ x` and `f . args` evaluate `rhs` first (right-to-left!), then `lhs`!
                 let rval = self.eval_step(rhs)?;
@@ -1160,6 +1172,75 @@ impl<'a> Engine<'a> {
 
             Expr::SysCmd { cmd, arg } => Ok(self.eval_sys_cmd(cmd, arg)?),
         }
+    }
+
+    /// Evaluate a chained `xasc`/`xdesc` expression (and optional outer `sublist`) in right-to-left `q` order,
+    /// fusing multi-column and Top-K table sorts into a single pass.
+    fn eval_sort_chain(&mut self, limit_expr: Option<&Expr>, mut cur: &Expr) -> Result<K, StepErr> {
+        let mut chain: Vec<(&Expr, bool)> = Vec::new();
+        while let Expr::Binary { op, lhs, rhs } = cur {
+            match resolve(*op) {
+                "xasc" => {
+                    chain.push((lhs, false));
+                    cur = rhs;
+                }
+                "xdesc" => {
+                    chain.push((lhs, true));
+                    cur = rhs;
+                }
+                _ => break,
+            }
+        }
+        let mut base_val = self.eval_step(cur)?;
+        let table_cols: Option<Vec<SymId>> = match &base_val {
+            K::Table(t) => Some(t.cols.clone()),
+            K::KeyedTable(kt) => {
+                let mut all = kt.keys.cols.clone();
+                all.extend_from_slice(&kt.vals.cols);
+                Some(all)
+            }
+            _ => None,
+        };
+        let Some(table_cols) = table_cols else {
+            for &(col_expr, desc) in chain.iter().rev() {
+                let lval = self.eval_step(col_expr)?;
+                base_val = self.eval_binary_dispatch(if desc { "xdesc" } else { "xasc" }, &lval, &base_val)?;
+            }
+            if let Some(lim) = limit_expr {
+                let lval = self.eval_step(lim)?;
+                base_val = self.eval_binary_dispatch("sublist", &lval, &base_val)?;
+            }
+            return Ok(base_val);
+        };
+        let mut stages: Vec<(Vec<SymId>, bool)> = Vec::with_capacity(chain.len());
+        for &(col_expr, desc) in chain.iter().rev() {
+            let lval = self.eval_step(col_expr)?;
+            let syms = ops::extract_sym_list(&lval.plain())?;
+            for &s in &syms {
+                if !table_cols.contains(&s) {
+                    return Err(KError::value(resolve(s)).into());
+                }
+            }
+            stages.push((syms, desc));
+        }
+        stages.reverse();
+        if let Some(lim) = limit_expr {
+            let lim_val = self.eval_step(lim)?;
+            let top_k = match &*lim_val.plain() {
+                K::Long(n) if *n >= 0 => Some(*n as usize),
+                K::Int(n) if *n >= 0 => Some(*n as usize),
+                K::Short(n) if *n >= 0 => Some(*n as usize),
+                K::Byte(n) => Some(*n as usize),
+                K::Bool(b) => Some(usize::from(*b)),
+                _ => None,
+            };
+            if let Some(k) = top_k {
+                return Ok(ops::table_sort_multi(&stages, &base_val, Some(k))?);
+            }
+            let sorted = ops::table_sort_multi(&stages, &base_val, None)?;
+            return Ok(self.eval_binary_dispatch("sublist", &lim_val, &sorted)?);
+        }
+        Ok(ops::table_sort_multi(&stages, &base_val, None)?)
     }
 
     fn eval_table_cols(&mut self, defs: &[(SymId, Expr)]) -> Result<Flip, StepErr> {
@@ -1609,8 +1690,10 @@ impl<'a> Engine<'a> {
                         return self.apply_func(inner, vals);
                     };
                     if let (ColVec::Strings(_, s), Func::Prim(p)) = (cv, inner) {
-                        if resolve(*p) == "count" {
-                            return Ok(K::Vector(ColVec::Long(Attr::None, Arc::new(s.lengths().map(i64::from).collect()))));
+                        match resolve(*p) {
+                            "count" => return Ok(K::Vector(ColVec::Long(Attr::None, Arc::new(s.lengths().map(i64::from).collect())))),
+                            "reverse" | "|" => return Ok(K::Vector(s.reverse_each())),
+                            _ => {}
                         }
                     }
                     let mut out = Vec::with_capacity(cv.len());
@@ -1638,6 +1721,17 @@ impl<'a> Engine<'a> {
                             Ok(K::Vector(ColVec::from_atoms(out)))
                         }
                         (x, K::Vector(vb)) => {
+                            if let (ColVec::Strings(_, s), Func::Prim(p)) = (vb, inner) {
+                                if matches!(&*x.plain(), K::Long(_) | K::Int(_) | K::Short(_) | K::Byte(_) | K::Bool(_)) {
+                                    if let Ok(n) = x.as_i64() {
+                                        match resolve(*p) {
+                                            "#" => return Ok(K::Vector(s.take_each(n))),
+                                            "_" => return Ok(K::Vector(s.drop_each(n))),
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
                             let mut out = Vec::with_capacity(vb.len());
                             for i in 0..vb.len() {
                                 out.push(self.apply_func(inner, &[x.clone(), vb.get_atom(i)])?);
@@ -1848,6 +1942,15 @@ impl<'a> Engine<'a> {
                 let K::Vector(cv) = &vals[1] else {
                     return self.apply_func(inner, vals);
                 };
+                if let (ColVec::Strings(_, s), Func::Prim(p)) = (cv, inner) {
+                    if resolve(*p) == "," {
+                        match lhs {
+                            K::Char(c) => return Ok(K::Vector(s.concat_each(std::slice::from_ref(c), true))),
+                            K::Vector(ColVec::Char(_, bs)) => return Ok(K::Vector(s.concat_each(bs, true))),
+                            _ => {}
+                        }
+                    }
+                }
                 let mut out = Vec::with_capacity(cv.len());
                 for i in 0..cv.len() {
                     out.push(self.apply_func(inner, &[lhs.clone(), cv.get_atom(i)])?);
@@ -1866,6 +1969,15 @@ impl<'a> Engine<'a> {
                     return self.apply_func(inner, vals);
                 };
                 let rhs = &vals[1];
+                if let (ColVec::Strings(_, s), Func::Prim(p)) = (cv, inner) {
+                    if resolve(*p) == "," {
+                        match rhs {
+                            K::Char(c) => return Ok(K::Vector(s.concat_each(std::slice::from_ref(c), false))),
+                            K::Vector(ColVec::Char(_, bs)) => return Ok(K::Vector(s.concat_each(bs, false))),
+                            _ => {}
+                        }
+                    }
+                }
                 let mut out = Vec::with_capacity(cv.len());
                 for i in 0..cv.len() {
                     out.push(self.apply_func(inner, &[cv.get_atom(i), rhs.clone()])?);
@@ -2480,7 +2592,7 @@ pub(crate) fn is_ephemeral_var(name: SymId) -> bool {
 /// `strings ~\: one` and `one ~/: strings` of packed strings, which need not be made to be compared.
 fn matching(inner: &Func, strings: &K, one: &K) -> Option<K> {
     let (Func::Prim(p), K::Vector(ColVec::Strings(_, s)), K::Vector(ColVec::Char(_, text))) = (inner, strings, one) else { return None };
-    let equal = || s.iter().map(|item| item == text.as_slice()).collect();
+    let equal = || crate::bools::Bools::from_fn(s.len(), |i| s.get(i) == text.as_slice());
     (resolve(*p) == "~").then(|| K::Vector(ColVec::Bool(Attr::None, Arc::new(equal()))))
 }
 

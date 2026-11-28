@@ -297,3 +297,67 @@ fn a_snapshot_shares_the_variables_until_one_is_written() {
     assert_eq!(copy.vars[&kixdb::sym::intern("a")].to_string(), "1");
     assert_eq!(c.eval("a").unwrap().to_string(), "2");
 }
+
+#[test]
+fn top_k_sorts_composite_joins_fby_and_grouped_updates_match_full_evaluation() {
+    let mut c = Server::new().connect();
+    c.eval("t: ([] s: `b`a`b`a`c`a; k: 2 1 2 1 3 2; v: 10 20 30 40 50 60; w: 1.0 2.0 3.0 0N 5.0 6.0)").unwrap();
+    for (code, expected) in [
+        // Top-K chained xdesc/xasc matches full sort + take, including tie stability and cleared attributes
+        ("(3 sublist `k xdesc `s xasc t) ~ 3 # (`k xdesc (`s xasc t))", "1b"),
+        ("attr (3 sublist `s xasc t)`s", "`"),
+        ("attr (`s xasc `k xdesc t)`s", "`s"),
+        // fby primitive fast paths (including nulls)
+        ("exec v from t where v = (max; v) fby s", "30 50 60"),
+        ("exec v from t where v = (first; v) fby ([] s; k)", "10 20 50 60"),
+        ("exec (last; w) fby s from t", "3 6 3 6 5 6f"),
+        // Grouped update with wavg, sums, and partial where selection
+        ("exec u from update u: v wavg w by s from t where k <= 2", "2.5 5 2.5 5 0n 5"),
+        ("exec rs from update rs: sums v by s from t where k <= 2", "10 20 40 60 0N 120"),
+        // 3-column keyed joins and plus join
+        (
+            "exec z from ([] a: 1 2 1; b: `x`y`z; d: 2024.01.01 2024.01.02 2024.01.01) lj ([a: 1 2 1; b: `x`y`x; d: 2024.01.01 2024.01.02 2024.01.01] z: 7 8 9)",
+            "7 8 0N",
+        ),
+        ("exec v from ([] k: 1 2 3; v: 10 20 30) pj ([k: 2 4] v: 5 9)", "10 25 30"),
+    ] {
+        assert_eq!(c.eval(code).unwrap().to_string(), expected, "{code}");
+    }
+}
+
+#[test]
+fn characters_made_one_a_row_are_a_column() {
+    let mut c = kixdb::Server::new().connect();
+    c.eval("t: ([] s: (\"ann\"; \"bo\"; \"cy\"))").unwrap();
+    // one character from each row is a column; a string that is written, or joined from the rows, is repeated on each
+    assert_eq!(c.eval("select f: first each s, u: upper first each s from t").unwrap(), c.eval("flip `f`u!(\"abc\"; \"ABC\")").unwrap());
+    assert_eq!(
+        c.eval("select n: count each s, a: \"abc\", b: \"-\" sv string count each s from t").unwrap(),
+        c.eval("([] n: 3 2 2; a: 3 # enlist \"abc\"; b: 3 # enlist \"3-2-2\")").unwrap()
+    );
+}
+
+#[test]
+fn mixed_columns_stay_mixed_as_rows_are_added() {
+    let mut c = kixdb::Server::new().connect();
+    for setup in [
+        "t: ([] id: 0 1; g: (1; `a)); delete from `t where id = 1",
+        "`t insert (2; 2)",
+        "`t upsert (3; 3)",
+        "t,: (4; 4)",
+        "t: t , ([] id: enlist 5; g: enlist 5)",
+        "kt: ([id: 0 1] g: (1; `a)); delete from `kt where id = 1",
+        "`kt upsert (2; 2)",
+        "`kt upsert (0; 3)",
+        "kt,: ([id: enlist 3] g: enlist 4)",
+        // an empty column takes the type of what is added
+        "e: ([] g: ()); `e insert enlist 1 2",
+        "ke: ([id: `long$()] g: ()); `ke upsert (1; 2)",
+    ] {
+        c.eval(setup).unwrap_or_else(|e| panic!("{setup}: {e}"));
+    }
+    assert_eq!(c.eval("(type t`g; type (0!kt)`g; type e`g; type (0!ke)`g)").unwrap(), c.eval("0 0 7 7h").unwrap());
+    // so values of other types can still be added
+    c.eval("`t insert (6; `z); `kt upsert (9; `z)").unwrap();
+    assert_eq!(c.eval("(count t; count kt)").unwrap(), c.eval("6 4").unwrap());
+}

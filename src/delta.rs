@@ -77,6 +77,7 @@ fn begins(a: &ColVec, b: &ColVec) -> bool {
     macro_rules! on {
         ($($same:ident)*; $($float:ident)*) => {
             match (a, b) {
+                (ColVec::Bool(_, x), ColVec::Bool(_, y)) => Arc::ptr_eq(x, y) || y.begins_with(x),
                 $((ColVec::$same(_, x), ColVec::$same(_, y)) => Arc::ptr_eq(x, y) || y.starts_with(x),)*
                 $((ColVec::$float(_, x), ColVec::$float(_, y)) => x.len() <= y.len() && x.iter().zip(y.iter()).all(|(x, y)| x.to_bits() == y.to_bits()),)*
                 (ColVec::General(_, x), ColVec::General(_, y)) => x.len() <= y.len() && (Arc::ptr_eq(x, y) || x.iter().zip(y.iter()).all(|(x, y)| identical(x, y))),
@@ -86,7 +87,7 @@ fn begins(a: &ColVec, b: &ColVec) -> bool {
             }
         };
     }
-    on!(Bool Guid Byte Short Int Long Char Sym Timestamp Month Date Timespan Minute Second Time; Real Float Datetime)
+    on!(Guid Byte Short Int Long Char Sym Timestamp Month Date Timespan Minute Second Time; Real Float Datetime)
 }
 
 /// Whether row `i` of `a` and row `j` of `b`, a column of the same type, hold the same bits.
@@ -94,6 +95,7 @@ fn same_item(a: &ColVec, i: usize, b: &ColVec, j: usize) -> bool {
     macro_rules! on {
         ($($same:ident)*; $($float:ident)*) => {
             match (a, b) {
+                (ColVec::Bool(_, x), ColVec::Bool(_, y)) => x.get(i) == y.get(j),
                 $((ColVec::$same(_, x), ColVec::$same(_, y)) => x[i] == y[j],)*
                 $((ColVec::$float(_, x), ColVec::$float(_, y)) => x[i].to_bits() == y[j].to_bits(),)*
                 (ColVec::General(_, x), ColVec::General(_, y)) => identical(&x[i], &y[j]),
@@ -103,7 +105,7 @@ fn same_item(a: &ColVec, i: usize, b: &ColVec, j: usize) -> bool {
             }
         };
     }
-    on!(Bool Guid Byte Short Int Long Char Sym Timestamp Month Date Timespan Minute Second Time; Real Float Datetime)
+    on!(Guid Byte Short Int Long Char Sym Timestamp Month Date Timespan Minute Second Time; Real Float Datetime)
 }
 
 /// The rows whose removal turns `old` into `new`, when that is how they differ and fewer rows go than stay.
@@ -195,6 +197,15 @@ fn extend(col: &mut ColVec, at: u64, tail: &ColVec) -> bool {
                 }
             };
         }
+        (ColVec::Bool(attr, x), ColVec::Bool(new, y)) if x.len() as u64 == at => {
+            if x.is_empty() {
+                *x = y.clone();
+            } else {
+                Arc::make_mut(x).extend_from(y);
+            }
+            *attr = *new;
+            return true;
+        }
         (ColVec::General(..), ColVec::Strings(..)) => return extend(col, at, &tail.listed()),
         _ => {}
     }
@@ -215,7 +226,7 @@ fn extend(col: &mut ColVec, at: u64, tail: &ColVec) -> bool {
             }
         };
     }
-    on!(General Bool Guid Byte Short Int Long Real Float Char Sym Timestamp Month Date Datetime Timespan Minute Second Time)
+    on!(General Guid Byte Short Int Long Real Float Char Sym Timestamp Month Date Datetime Timespan Minute Second Time)
 }
 
 /// The columns of a vector, dictionary of lists or table, to change.
@@ -245,7 +256,7 @@ pub fn remove(value: &mut K, removed: &Removed) -> bool {
         return false;
     }
     for (col, &attr) in cols.iter_mut().zip(&removed.attrs) {
-        if let ColVec::Strings(..) = col {
+        if matches!(col.plain(), ColVec::Strings(..) | ColVec::Bool(..)) {
             let kept: Vec<usize> = (0..removed.at).filter(|r| removed.rows.binary_search(r).is_err()).map(|r| r as usize).collect();
             **col = col.gather(&kept);
             col.set_attr_unchecked(attr);
@@ -264,12 +275,15 @@ pub fn remove(value: &mut K, removed: &Removed) -> bool {
                             gone.next_if_eq(&&(row - 1)).is_none()
                         });
                     })*
-                    ColVec::Enum(..) | ColVec::Strings(..) => return false,
+                    ColVec::Enum(..) | ColVec::Strings(..) | ColVec::Bool(..) => return false,
                 }
             };
         }
-        on!(General Bool Guid Byte Short Int Long Real Float Char Sym Timestamp Month Date Datetime Timespan Minute Second Time);
+        on!(General Guid Byte Short Int Long Real Float Char Sym Timestamp Month Date Datetime Timespan Minute Second Time);
         col.set_attr_unchecked(attr);
+    }
+    if let K::KeyedTable(t) = value {
+        Arc::make_mut(t).key_index.reset();
     }
     true
 }
@@ -281,6 +295,14 @@ pub(crate) fn set(col: &mut ColVec, rows: &[u64], values: &ColVec) -> bool {
     }
     if let ColVec::Enum(t, x) = col {
         return matches!(values, ColVec::Enum(u, y) if t == u && set(x, rows, y));
+    }
+    if let (ColVec::Bool(attr, x), ColVec::Bool(new, y)) = (&mut *col, values) {
+        if !rows.is_empty() {
+            let x = Arc::make_mut(x);
+            rows.iter().enumerate().for_each(|(j, &r)| x.set(r as usize, y.get(j)));
+        }
+        *attr = *new;
+        return true;
     }
     // strings set among packed ones: the text is put together anew, each row's from the last value set in it
     if let (ColVec::Strings(attr, x), Some(ColVec::Strings(new, y))) = (&mut *col, values.packed().as_deref()) {
@@ -315,7 +337,7 @@ pub(crate) fn set(col: &mut ColVec, rows: &[u64], values: &ColVec) -> bool {
             }
         };
     }
-    on!(General Bool Guid Byte Short Int Long Real Float Char Sym Timestamp Month Date Datetime Timespan Minute Second Time)
+    on!(General Guid Byte Short Int Long Real Float Char Sym Timestamp Month Date Datetime Timespan Minute Second Time)
 }
 
 /// Whether `changes` were made from a value like `value`: `patch` will then make all of them.
@@ -342,11 +364,16 @@ pub fn fits(value: &K, changes: &Changes) -> bool {
 
 /// Make `changes` to `value`; `false` if they were not made from a value like it.
 pub fn patch(value: &mut K, changes: &Changes) -> bool {
-    // the index of a keyed table's keys goes with them where rows are only added to them
-    let taken = match value {
+    let key_change = match value {
         K::KeyedTable(t) => {
-            let mut keys = changes.iter().filter(|c| (c.0 as usize) < t.keys.ncols()).peekable();
-            (keys.peek().is_some() && keys.all(|c| matches!(c.1, ColChange::Append { .. }))).then(|| crate::index::take_keys(&t.keys.vals)).flatten()
+            let nkeys = t.keys.ncols();
+            let has_any = changes.iter().any(|(i, _)| (*i as usize) < nkeys);
+            let only_append = has_any
+                && changes
+                    .iter()
+                    .filter(|(i, _)| (*i as usize) < nkeys)
+                    .all(|(_, c)| matches!(c, ColChange::Append { .. }));
+            Some((has_any, only_append))
         }
         _ => None,
     };
@@ -361,8 +388,13 @@ pub fn patch(value: &mut K, changes: &Changes) -> bool {
         (None, _) => false,
     });
     value.pack();
-    if let (true, Some(taken), K::KeyedTable(t)) = (made, taken, &*value) {
-        crate::index::keep_keys(&t.keys.vals, taken);
+    if let (Some((true, only_append)), K::KeyedTable(t)) = (key_change, value) {
+        let t = Arc::make_mut(t);
+        if made && only_append {
+            t.key_index.extend_after_append(&t.keys.vals);
+        } else {
+            t.key_index.reset();
+        }
     }
     made
 }
