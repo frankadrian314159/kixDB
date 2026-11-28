@@ -11,6 +11,7 @@ use kixdb::engine::qsql::resolve_col_names;
 use kixdb::engine::DistMode;
 use kixdb::parser::is_builtin_verb;
 use kixdb::sym::{intern, resolve, SymId};
+use kixdb::types::AdverbKind;
 use kixdb::{ColVec, Connection, Flip, Func, K};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -145,6 +146,7 @@ const ELEMENTWISE_UNARY: [&str; 22] = [
     "signum", "null", "not", "upper", "lower", "trim", "string",
 ];
 const ELEMENTWISE_BINARY: [&str; 16] = ["+", "-", "*", "%", "=", "<>", "<", "<=", ">", ">=", "&", "|", "and", "or", "div", "mod"];
+const EACH: [&str; 2] = ["each", "peach"];
 const PREDICATES: [&str; 13] = ["=", "<>", "<", "<=", ">", ">=", "&", "|", "and", "or", "in", "within", "like"];
 
 fn is_one_of(s: SymId, set: &[&str]) -> bool {
@@ -174,6 +176,29 @@ fn one_value(q: &QSql) -> bool {
         && matches!(q.cols.as_slice(), [c] if c.name.is_none() && matches!(&c.expr, Expr::Unary { op, .. } if is_one_of(*op, &AGGREGATES)))
 }
 
+/// The name of a built-in verb written as one.
+fn verb_name(f: &Expr) -> Option<SymId> {
+    match f {
+        Expr::Lit(K::Func(Func::Prim(s))) => Some(*s),
+        Expr::Var(s) => is_builtin_verb(resolve(*s)).then_some(*s),
+        _ => None,
+    }
+}
+
+/// A built-in verb, perhaps with adverbs (`#`, `,\:`). (A user's function is not: the types of its results could differ
+/// from shard to shard.)
+fn is_verb(f: &Expr) -> bool {
+    match f {
+        Expr::Adverb { func, .. } => is_verb(func),
+        other => verb_name(other).is_some(),
+    }
+}
+
+/// Whether the expression applies a verb item by item (`f each x`, `x f'y`).
+pub fn has_adverb(e: &Expr) -> bool {
+    e.any(&mut |x| matches!(x, Expr::Adverb { .. }) || matches!(x, Expr::Binary { op, .. } if is_one_of(*op, &EACH)))
+}
+
 /// Whether row `r` of the result depends only on row `r` of the columns (so each shard can compute its own rows). A
 /// `fby` is allowed when its groups include all of `keys`: the distribution columns that differ between the rows.
 pub fn rowwise(e: &Expr, cols: &HashSet<SymId>, keys: &[SymId]) -> bool {
@@ -183,11 +208,25 @@ pub fn rowwise(e: &Expr, cols: &HashSet<SymId>, keys: &[SymId]) -> bool {
         Expr::Var(s) => cols.contains(s),
         Expr::Field(base, _) => matches!(&**base, Expr::Var(s) if cols.contains(s)),
         Expr::Unary { op, arg } => is_one_of(*op, &ELEMENTWISE_UNARY) && rw(arg),
-        Expr::Apply { target, args } => match (&**target, args.as_slice()) {
-            (Expr::Var(f), [Some(a)]) => is_one_of(*f, &ELEMENTWISE_UNARY) && rw(a),
-            _ => false,
-        },
+        Expr::Apply { target, args } => {
+            // applied to each row's item of a column
+            let items = |x: &Expr| rw(x) && uses_column(x, cols);
+            match (&**target, args.as_slice()) {
+                (Expr::Var(f), [Some(a)]) => is_one_of(*f, &ELEMENTWISE_UNARY) && rw(a),
+                (Expr::Adverb { kind, func }, [Some(a), rest @ ..]) if is_verb(func) => match (kind, rest) {
+                    (AdverbKind::Each, []) => items(a),
+                    // paired item by item, so what is not a column must be an atom
+                    (AdverbKind::Each, [Some(b)]) => rw(a) && rw(b) && (uses_column(a, cols) || uses_column(b, cols)),
+                    // the other argument is used whole for every row
+                    (AdverbKind::EachLeft, [Some(b)]) => items(a) && is_constant(b, cols),
+                    (AdverbKind::EachRight, [Some(b)]) => is_constant(a, cols) && items(b),
+                    _ => false,
+                },
+                _ => false,
+            }
+        }
         Expr::Binary { op, lhs, rhs } => match resolve(*op) {
+            "each" | "peach" => is_verb(lhs) && rw(rhs) && uses_column(rhs, cols),
             "in" | "within" | "like" => rw(lhs) && is_constant(rhs, cols),
             "xbar" | "$" => is_constant(lhs, cols) && rw(rhs),
             "^" | "xexp" | "xlog" => rw(lhs) && rw(rhs),
@@ -220,6 +259,10 @@ pub fn filters_rows(e: &Expr, cols: &HashSet<SymId>, keys: &[SymId]) -> bool {
         Expr::Binary { op, .. } => is_one_of(*op, &PREDICATES),
         Expr::Unary { op, .. } => is_one_of(*op, &["not", "null", "~"]),
         Expr::Var(_) => true,
+        // `c ~\: "text"`, `"text" ~/: c`: a comparison for each row
+        Expr::Apply { target, .. } => {
+            matches!(&**target, Expr::Adverb { func, .. } if verb_name(func).is_some_and(|v| resolve(v) == "~" || is_one_of(v, &PREDICATES)))
+        }
         _ => false,
     };
     predicate && rowwise(e, cols, keys)

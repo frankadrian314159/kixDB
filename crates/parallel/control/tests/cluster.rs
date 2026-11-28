@@ -561,3 +561,74 @@ fn streamed_two_phase_and_k_way_sorted_merges_match_one_engine() {
     p.plan("5 sublist `s xdesc 0! select s: sum size by sym from trade", "k-way sorted merge");
     p.plan("25 sublist `v xdesc `sid xasc big", "k-way sorted merge");
 }
+
+#[test]
+fn verbs_applied_item_by_item_run_on_the_shards() {
+    let mut p = Pair::new(3);
+    for statement in [
+        ".kix.dist[`cust; `sharded; `id]",
+        "n: 60",
+        "cust: ([] id: til n; grp: `a`b`c (til n) mod 3; name: n#(\"ann\";\"bo\";\"carla\";\"\"); \
+         phone: (n#(\"13\";\"31\";\"23\";\"99\")) ,' \"-555-\" ,/: string til n; bal: -50 + (37 * til n) mod 101)",
+        ".kix.dist[`none; `sharded; `id]",
+        "none: 0 # cust",
+    ] {
+        p.single.eval(statement).unwrap_or_else(|e| panic!("{statement}: {e}"));
+        p.session.eval(statement).unwrap_or_else(|e| panic!("{statement}: {e}"));
+    }
+    for table in ["cust", "none"] {
+        for (columns, how) in [
+            ("cc: `$2#'phone", "merged in order"),
+            ("a: 2#'phone, b: 2_'phone, c: -3#'phone", "merged in order"),
+            ("a: (phone ,\\: \"x\"), b: (\"+\" ,/: phone), c: (name ,' phone)", "merged in order"),
+            ("n: count each phone, f: first each name, u: upper each name, r: reverse peach phone", "merged in order"),
+            ("n: count'[phone], m: 2 + count each name, s: `$\"-\" vs/: phone", "merged in order"),
+            ("n: sum count each phone, m: max count each name by grp", "two-phase"),
+            ("n: sum count each phone", "two-phase"),
+            ("n: count i by cc: `$2#'phone", "two-phase"),
+            ("n: count each phone by id", "grouped by"),
+            ("f: first each phone, g: upper first each name", "merged in order"),
+            ("n: count i by f: first each phone", "two-phase"),
+            ("m: max first each phone by grp", "two-phase"),
+            ("distinct f: 2#'phone", "merged in order"),
+        ] {
+            p.plan(&format!("select {columns} from {table}"), how);
+        }
+        p.plan(&format!("exec `$2#'phone from {table}"), "merged in order");
+        // (the first clause leaves most shards, or all, without rows for those that follow)
+        for first in ["bal > -100", "id < 1", "id < 0"] {
+            for then in [
+                "(`$2#'phone) in `13`31",
+                "(`$2#'phone) like \"1*\"",
+                "0 < count each phone",
+                "(5 xbar count each phone) within 5 10",
+                "\"1\" = first each phone",
+                "\"13\" ~/: 2#'phone",
+                "name ~\\: \"ann\"",
+                "\"5\" in/: phone",
+            ] {
+                p.plan(&format!("select id, cc: 2#'phone from {table} where {first}, {then}"), "merged in order");
+                p.check(&format!("select n: sum count each phone, hi: max count each name from {table} where {first}, {then}"));
+            }
+        }
+    }
+    // TPC-H Q22's shape: no table comes to the control node
+    for statement in [
+        "avg_bal: exec avg bal from (select bal, cc: `$2#'phone from cust where bal > 0) where cc in `13`31",
+        "select numcust: count i, total: sum bal by cc from (select bal, cc: `$2#'phone from cust where bal > avg_bal, not id in 1 2 3) where cc in `13`31",
+    ] {
+        let plan = p.check(statement);
+        assert!(plan.contains("merged in order") && !plan.contains("gather cust"), "{statement}: {plan}");
+    }
+    // what needs other rows, or a function of the user's, is computed on the control node
+    for columns in ["(name ,\\: phone)", "(name ,/: phone)", "{count x} each phone", "(phone ,' name 0)", "(,':) name", "count each distinct name"] {
+        p.plan(&format!("select {columns} from cust"), "gather cust");
+    }
+    // changes: rows are chosen on the shards, new columns are made here, so that every shard gets their types
+    p.plan("delete from `cust where \"99\" ~/: 2#'phone", "update / delete run on every shard");
+    p.check("update len: count each phone from `cust where id < 1");
+    p.check("update len: count each phone from `cust");
+    p.check("update bal: 0 from `cust where name ~\\: \"bo\"");
+    p.check("`cust insert (100; `a; \"zed\"; \"13-000\"; 5; 6)");
+    p.check("cust");
+}

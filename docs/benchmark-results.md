@@ -1,5 +1,19 @@
 # Benchmark results: scale factor 0.3
 
+## Row-wise verbs on the shards
+
+Measured 2026-11-27 **on battery**, where the machine is about half as fast: commit `2e6f1ef` and the change below, run
+back to back, one run each, TPC-H on six shards in one process. Built-in verbs applied item by item, such as
+`` `$2#'c_phone ``, now run on the shards ([plan.rs](../crates/parallel/control/src/plan.rs)), so TPC-H Q22 no longer
+gathers `customer`. **It is no faster:** 56 ms before, 58 ms now, against 8 ms on the single node. In a separate run of
+its three statements, most of the time went elsewhere:
+
+| Q22 statement | ms |
+| --- | ---: |
+| average balance over a subquery | 23 |
+| `distinct exec o_custkey from orders`, which brings every order's key to the control node | 42 |
+| the final grouped query | 5 |
+
 ## Converting columns to and from Arrow
 
 Measured 2026-11-27 **on battery**, where the machine is about half as fast: commit `a34cdb4` and the change below, run
@@ -726,7 +740,7 @@ From the profile of the join change; the filtering change was not profiled on th
 * **Assigned tables travel twice.** A table assigned to a variable in a multi-statement query is sent to the shards, and
   later statements fetch it back (DS Q22 and Q36).
 * **TPC-H Q22** is slower on the cluster than on the single node: `` `$2#'c_phone `` is not pushed down, so `customer`
-  is gathered.
+  is gathered. (It is pushed down [since](#row-wise-verbs-on-the-shards), which did not make Q22 faster.)
 
 ## Recommended next steps
 
@@ -734,7 +748,13 @@ None of the gains has been measured.
 
 1. Profile aggregation, now the largest part of TPC-DS and close to `where` on TPC-H.
 2. Profile the control node's merging by key and ordering of rows.
-3. Keep intermediate tables on the control node. This changes where assigned tables live, so it needs a design decision.
+3. Have the shards do `distinct` themselves: `distinct exec o_custkey from orders` is the longest statement of TPC-H
+   Q22 ([measured](#row-wise-verbs-on-the-shards)).
+
+Keeping intermediate tables on the control node was considered and **decided against** on 2026-11-27: assigned tables
+stay on the shards. The statements after the main aggregation took about 41 ms in TPC-DS Q22 and 12 ms in Q36 on six
+shards (one run, on battery), their own computation included, so the saving would be less, and it would change where
+assigned tables live.
 
 ## Cost of TLS between nodes
 

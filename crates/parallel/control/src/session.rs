@@ -6,7 +6,7 @@
 //! it names, gathered from the shards; tables that changed are distributed again.
 use crate::catalog::{column_type, rekey, schema_of, unkey, with_attrs, Names, Table};
 use crate::exec::{augmented, in_order};
-use crate::plan::{has_query, is_constant, rowwise, scan_filters, Kind, Layout, Planner, Push};
+use crate::plan::{has_adverb, has_query, is_constant, rowwise, scan_filters, Kind, Layout, Planner, Push};
 use crate::Inner;
 use kix_shared_ces::wire::{ForwardReply, ForwardReq, Forwarded, LoadMode, LoadReq, MemberReq, MutateReq, TxnOp, Work, ORD_COL};
 use kixdb::ast::{ColSpec, Expr, QSql, QSqlKind};
@@ -1024,7 +1024,9 @@ impl ClusterSession {
                 for (c, name) in query.cols.iter_mut().zip(names) {
                     c.name = Some(name);
                     let Some(s) = self.with_planner(|p| p.substitute(&c.expr, &cols)) else { return Ok(None) };
-                    let each_row = grouped_by_key || rowwise(&s, &cols, &keys) || (is_constant(&s, &cols) && matches!(s, Expr::Lit(ref k) if k.is_atom()));
+                    // (a verb applied item by item gives a shard without rows a column of no type, so such a column is made here)
+                    let by_row = rowwise(&s, &cols, &keys) && !has_adverb(&s);
+                    let each_row = grouped_by_key || by_row || (is_constant(&s, &cols) && matches!(s, Expr::Lit(ref k) if k.is_atom()));
                     // shards whose rows do not match must end up with columns of the same type as the others
                     let same_type = match t.schema.col(name) {
                         Some(old) => old.type_num() == 0 || column_type(&mut self.conn, &t.schema, &s) == Some(old.type_num()),

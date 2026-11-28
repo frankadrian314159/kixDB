@@ -317,6 +317,12 @@ s4`): `ca.key` stays off the nodes.
 | two-phase aggregation | `sum count min max prd avg wavg wsum var svar dev sdev`, and arithmetic on them | shards compute partial states, the control node merges them |
 | gather | everything else | the tables named are copied to the control node and the statement runs there |
 
+**Row by row** means that a row of the result depends on that row alone: arithmetic and other item-by-item verbs, casts,
+`fby` over groups that a shard holds whole, and a built-in verb applied item by item, as in `` `$2#'phone ``,
+`count each name`, `x f'y` (what is not a column must then be an atom), `col f\:y` and `y f/:col`. A filter that is
+itself such an application must apply a comparison (`name ~\: "bo"`). The table is gathered for a function of your own
+applied this way, and for an `update` that sets a column this way.
+
 For a gathered query over one sharded table, leading row-by-row filters run on the shards and only the columns used are
 copied. A statement that calls `value`, `get`, `system` or similar may name tables at run time, so every table is
 gathered.
