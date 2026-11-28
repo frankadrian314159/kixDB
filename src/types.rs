@@ -1014,6 +1014,24 @@ impl ColVec {
         }
     }
 
+    /// The same items as a list of mixed values, unless they are a list of values already.
+    pub fn into_list(self) -> ColVec {
+        if self.is_list() {
+            return self;
+        }
+        ColVec::General(Attr::None, Arc::new((0..self.len()).map(|i| self.get_atom(i)).collect()))
+    }
+
+    /// `concat` for the rows of a table: a list column stays one as it grows, though its items may then share a type.
+    /// (An empty one takes the type of typed items.)
+    pub fn grow(&self, other: &ColVec) -> ColVec {
+        let joined = self.concat(other);
+        match self.is_list() && (!self.is_empty() || matches!(other, ColVec::General(..))) {
+            true => joined.into_list(),
+            false => joined,
+        }
+    }
+
     /// Strict typed append for table `insert`/`upsert` (coerces int->long/float where safe, errors on incompatible types).
     pub fn append_strict(&self, other: &ColVec) -> KResult<ColVec> {
         // an enumeration takes only its own: the engine enumerates new values, checking them, before it adds them
@@ -1029,7 +1047,7 @@ impl ColVec {
             if matches!(self, ColVec::General(_, _)) && self.is_empty() && !matches!(other, ColVec::General(_, _)) {
                 return Ok(other.clone());
             }
-            let mut joined = self.concat(other);
+            let mut joined = self.grow(other);
             if self.attr() == Attr::Grouped {
                 joined.set_attr_unchecked(Attr::Grouped);
             }

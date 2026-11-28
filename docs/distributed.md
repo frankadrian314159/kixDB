@@ -490,8 +490,6 @@ shards must match.
   Shards can be [added by themselves](#adding-shards-by-itself) when memory calls for it; none is removed so.
 * Slots move to even out their number, not the rows in them: one symbol or day with most of the rows stays whole.
 * **Floating point sums** added in two phases can differ from one server's in the last digits.
-* **A column of mixed types** whose rows on a shard share one type becomes a column of that type there when more rows of
-  it are added. That shard then refuses rows of other types with `'type`, where one server takes them.
 * A shard makes one change at a time.
 * A change that is not an append, an assignment to some rows or columns or a removal of rows (a re-sort, for one) is logged and
   replicated as the whole new value of the table's slice (see [storage.md](storage.md)).

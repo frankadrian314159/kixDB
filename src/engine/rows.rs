@@ -19,10 +19,11 @@ fn ordered(t: &Flip, like: &Flip) -> KResult<Flip> {
     }
 }
 
-/// `a , b` of tables: the rows of both, matching columns by name; a column of two types becomes a list of mixed values.
+/// `a , b` of tables: the rows of both, matching columns by name; a column of two types becomes a list of mixed values, and
+/// such a list stays one.
 pub fn append(a: &Flip, b: &Flip) -> KResult<Flip> {
     let b = ordered(b, a)?;
-    Ok(Flip { cols: a.cols.clone(), vals: a.vals.iter().zip(&b.vals).map(|(x, y)| x.concat(y)).collect() })
+    Ok(Flip { cols: a.cols.clone(), vals: a.vals.iter().zip(&b.vals).map(|(x, y)| x.grow(y)).collect() })
 }
 
 /// A list of values: dictionaries with the same names for keys make a table.

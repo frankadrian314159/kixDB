@@ -336,3 +336,28 @@ fn characters_made_one_a_row_are_a_column() {
         c.eval("([] n: 3 2 2; a: 3 # enlist \"abc\"; b: 3 # enlist \"3-2-2\")").unwrap()
     );
 }
+
+#[test]
+fn mixed_columns_stay_mixed_as_rows_are_added() {
+    let mut c = kixdb::Server::new().connect();
+    for setup in [
+        "t: ([] id: 0 1; g: (1; `a)); delete from `t where id = 1",
+        "`t insert (2; 2)",
+        "`t upsert (3; 3)",
+        "t,: (4; 4)",
+        "t: t , ([] id: enlist 5; g: enlist 5)",
+        "kt: ([id: 0 1] g: (1; `a)); delete from `kt where id = 1",
+        "`kt upsert (2; 2)",
+        "`kt upsert (0; 3)",
+        "kt,: ([id: enlist 3] g: enlist 4)",
+        // an empty column takes the type of what is added
+        "e: ([] g: ()); `e insert enlist 1 2",
+        "ke: ([id: `long$()] g: ()); `ke upsert (1; 2)",
+    ] {
+        c.eval(setup).unwrap_or_else(|e| panic!("{setup}: {e}"));
+    }
+    assert_eq!(c.eval("(type t`g; type (0!kt)`g; type e`g; type (0!ke)`g)").unwrap(), c.eval("0 0 7 7h").unwrap());
+    // so values of other types can still be added
+    c.eval("`t insert (6; `z); `kt upsert (9; `z)").unwrap();
+    assert_eq!(c.eval("(count t; count kt)").unwrap(), c.eval("6 4").unwrap());
+}

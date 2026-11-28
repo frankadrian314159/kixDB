@@ -518,7 +518,7 @@ pub fn union_join(lhs: &K, rhs: &K) -> KResult<K> {
                 }
             }
             let (na, nb) = (ka.nrows(), kb.nrows());
-            let keys: Vec<ColVec> = ka.keys.vals.iter().zip(&kb.keys.vals).map(|(a, b)| a.concat(b)).collect();
+            let keys: Vec<ColVec> = ka.keys.vals.iter().zip(&kb.keys.vals).map(|(a, b)| a.grow(b)).collect();
             // the number of each row's key among the rows of both tables, in order of first appearance
             let ids = group_ids(&keys, na + nb);
             let first = first_rows(&ids);
@@ -528,7 +528,7 @@ pub fn union_join(lhs: &K, rhs: &K) -> KResult<K> {
                 .enumerate()
                 .map(|(c, &name)| {
                     let side = |t: &KeyedTable, n| t.vals.col(name).cloned().unwrap_or_else(|| proto_v[c].gather(&vec![usize::MAX; n]));
-                    let column = side(ka, na).concat(&side(kb, nb));
+                    let column = side(ka, na).grow(&side(kb, nb));
                     // each key takes the value of its first row, then of any later row whose value is not null
                     let mut from = first.clone();
                     for (r, &id) in ids.iter().enumerate() {
@@ -537,9 +537,10 @@ pub fn union_join(lhs: &K, rhs: &K) -> KResult<K> {
                             from[id] = r;
                         }
                     }
+                    let mixed = ka.vals.col(name).is_some_and(ColVec::is_list);
                     match column.gather(&from) {
-                        // (values of one type among mixed ones make a column of that type)
-                        ColVec::General(_, items) if !items.is_empty() => ColVec::from_atoms((*items).clone()),
+                        // (values of one type among mixed ones make a column of that type, but a mixed column stays one)
+                        ColVec::General(_, items) if !items.is_empty() && !mixed => ColVec::from_atoms((*items).clone()),
                         typed => typed,
                     }
                 })

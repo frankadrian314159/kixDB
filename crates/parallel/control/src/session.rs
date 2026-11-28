@@ -946,7 +946,13 @@ impl ClusterSession {
         let coerce = Expr::Binary { op: intern("upsert"), lhs: Box::new(Expr::Lit(empty)), rhs: Box::new(Expr::Lit(rows)) };
         let K::Table(coerced) = self.conn.eval_expr(&coerce)? else { return Err(KError::ty("rows do not form a table")) };
         // (this node has the lists that enumerations take values from; the shards check foreign keys)
-        let coerced = self.conn.enumerate_rows(&t.schema, (*coerced).clone(), true)?;
+        let mut coerced = self.conn.enumerate_rows(&t.schema, (*coerced).clone(), true)?;
+        // (a mixed column of a table that has rows stays one, even on a shard that holds none of them)
+        let typed = |&c: &usize| t.schema.vals[c].is_list() && !coerced.vals[c].is_list();
+        let mixed: Vec<usize> = (0..coerced.ncols()).filter(typed).collect();
+        if !mixed.is_empty() && self.inner.rows_of(&t)? > 0 {
+            mixed.into_iter().for_each(|c| coerced.vals[c] = coerced.vals[c].clone().into_list());
+        }
         let schema = t.schema.concat(&coerced.take(0))?;
         let before = match verb {
             "insert" => self.inner.rows_of(&t)? as i64,

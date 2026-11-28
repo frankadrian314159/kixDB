@@ -723,3 +723,44 @@ fn general_columns_stay_general_where_rows_share_a_type() {
         p.check(code);
     }
 }
+
+#[test]
+fn rows_of_one_type_can_be_added_to_mixed_columns() {
+    let mut p = Pair::new(3);
+    for code in [
+        ".kix.dist[`u; `sharded; `id]",
+        // (two shards hold one type each, and one holds no row)
+        "u: ([] id: 0 1; g: (1; `a))",
+        "`u insert (0; 2)",
+        "`u insert (0; `b)",
+        "`u insert (3 4 5; 6 7 8)",
+        "`u insert (3 4 5; `c`d`e)",
+        "u,: ([] id: 6 7; g: 1 2)",
+        "u",
+        "delete from `u where id > 1",
+        "`u insert (2; 9)",
+        "`u insert (2; `f)",
+        "u",
+        ".kix.dist[`kt; `sharded; `id]",
+        "kt: ([id: 0 1] g: (1; `a))",
+        "`kt upsert (0; 2)",
+        "`kt upsert (0; `b)",
+        "`kt upsert (3 4 5; 6 7 8)",
+        "`kt upsert (3 4 5; `c`d`e)",
+        "kt",
+        ".kix.dist[`st; `sharded; `id]",
+        "st: ([] id: 0 1; g: (\"ab\"; \"cd\"))",
+        "`st insert (3 4 5; 6 7 8)",
+        "`st insert (3 4 5; `c`d`e)",
+        "st",
+        // an empty column takes the type of what is added
+        ".kix.dist[`e; `sharded; `id]",
+        "e: ([] id: `long$(); g: ())",
+        "`e insert (0 1; 2 3)",
+        "`e insert (2; `a)",
+        "meta e",
+        "e",
+    ] {
+        p.check(code);
+    }
+}

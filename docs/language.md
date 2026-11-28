@@ -23,6 +23,8 @@ Integer arithmetic and aggregates wrap on overflow.
 * A symbol compares only with a symbol (`'type`). Writing a value of another type into a simple list, or adding one with
   `,:`, is `'type`; a general list whose items come to share a type becomes simple. One exception: longs that fit are
   taken into an `int` column of a table by `insert`, `upsert` and `t,:row` (`update` still wants ints).
+* A table's column that is a general list stays one as `insert`, `upsert` or `,` add rows to the table, even if its
+  items then all share a type; an empty one takes the type of what is added.
 * Verbs applied to two dictionaries work key by key over the keys of both; a value only one has is kept, and compared
   with a null by comparisons. `d _ key` and `keys _ d` drop entries.
 * Casting a float to a whole number rounds it. A type can be given by number (`7h$x`), and `"ijf"$x` casts item by item.
