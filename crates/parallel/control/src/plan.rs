@@ -117,6 +117,7 @@ impl Push {
             Kind::Replicated => "replicated: one shard".to_string(),
             Kind::Route(s) => format!("route: shard {s}"),
             Kind::ByKey => "scatter-gather: grouped by the distribution column".to_string(),
+            Kind::Ordered if self.query.distinct => "scatter-gather: each shard's distinct rows merged in order".to_string(),
             Kind::Ordered => "scatter-gather: rows merged in order".to_string(),
             Kind::TwoPhase(_) => "scatter-gather: two-phase aggregation".to_string(),
         };
@@ -174,6 +175,33 @@ fn one_value(q: &QSql) -> bool {
     q.kind == QSqlKind::Exec
         && q.by.is_none()
         && matches!(q.cols.as_slice(), [c] if c.name.is_none() && matches!(&c.expr, Expr::Unary { op, .. } if is_one_of(*op, &AGGREGATES)))
+}
+
+/// `distinct select ...`, `distinct exec c from t` or `exec distinct c from t` as a query marked `distinct`.
+pub fn distinct_query(e: &Expr) -> Option<Expr> {
+    let distinct = |op: &SymId| resolve(*op) == "distinct";
+    let mut q = match e {
+        Expr::Unary { op, arg } if distinct(op) => match &**arg {
+            Expr::Query(q) if !q.cols.is_empty() => (**q).clone(),
+            _ => return None,
+        },
+        Expr::Query(q) if q.kind == QSqlKind::Exec => match q.cols.as_slice() {
+            [ColSpec { name: None, expr: Expr::Unary { op, arg } }] if distinct(op) => {
+                let mut inner = (**q).clone();
+                inner.cols[0].expr = (**arg).clone();
+                inner
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+    // rows, or the values of one column; groups and limits would come before `distinct`
+    let listed = q.kind == QSqlKind::Select || q.kind == QSqlKind::Exec && matches!(q.cols.as_slice(), [c] if c.name.is_none());
+    if !listed || q.by.is_some() || q.limit.is_some() {
+        return None;
+    }
+    q.distinct = true;
+    Some(Expr::Query(Box::new(q)))
 }
 
 /// The name of a built-in verb written as one.
@@ -612,7 +640,14 @@ impl Planner<'_> {
             }
             // `count i` counts rows wherever they are
             Expr::Unary { op, arg } if resolve(*op) == "count" && matches!(&**arg, Expr::Var(s) if resolve(*s) == "i") => Some(e.clone()),
-            Expr::Query(q) => self.analyze(q).map(|_| e.clone()),
+            Expr::Query(q) => {
+                let marked = distinct_query(e);
+                let q = match &marked {
+                    Some(Expr::Query(marked)) => marked,
+                    _ => q,
+                };
+                self.analyze(q).map(|_| e.clone())
+            }
             Expr::Lambda { .. } => self.closed_expr(e, &HashSet::new()).then(|| e.clone()),
             Expr::Lit(K::Func(f)) => self.closed(f).then(|| e.clone()),
             Expr::Assign { .. } | Expr::IndexAssign { .. } | Expr::SysCmd { .. } | Expr::If { .. } | Expr::Do { .. } | Expr::While { .. } | Expr::Return(_) => None,

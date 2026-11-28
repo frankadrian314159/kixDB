@@ -6,7 +6,7 @@
 //! it names, gathered from the shards; tables that changed are distributed again.
 use crate::catalog::{column_type, rekey, schema_of, unkey, with_attrs, Names, Table};
 use crate::exec::{augmented, in_order};
-use crate::plan::{has_adverb, has_query, is_constant, rowwise, scan_filters, Kind, Layout, Planner, Push};
+use crate::plan::{distinct_query, has_adverb, has_query, is_constant, rowwise, scan_filters, Kind, Layout, Planner, Push};
 use crate::Inner;
 use kix_shared_ces::wire::{ForwardReply, ForwardReq, Forwarded, LoadMode, LoadReq, MemberReq, MutateReq, TxnOp, Work, ORD_COL};
 use kixdb::ast::{ColSpec, Expr, QSql, QSqlKind};
@@ -237,7 +237,7 @@ impl ClusterSession {
                 "control node: schema only".into()
             } else if self.counted(e).is_some() {
                 "scatter-gather: row counts summed".into()
-            } else if let Some(push) = self.analyze(e) {
+            } else if let Some(push) = self.analyze_read(e) {
                 push.describe()
             } else if self.as_insert(e).is_some() {
                 "rows split over the shards".into()
@@ -383,7 +383,7 @@ impl ClusterSession {
             self.note(format!("scatter-gather: count of {}", t.name));
             return Ok(Some(K::Long(self.inner.count(&t)? as i64)));
         }
-        if let Some(mut push) = self.analyze(e) {
+        if let Some(mut push) = self.analyze_read(e) {
             self.note(push.describe());
             let q = &mut push.query;
             for x in q.where_clauses.iter_mut().chain(q.cols.iter_mut().map(|c| &mut c.expr)).chain(q.by.iter_mut().flatten().map(|c| &mut c.expr)) {
@@ -570,6 +570,12 @@ impl ClusterSession {
     fn analyze(&mut self, e: &Expr) -> Option<Push> {
         let q = as_query(e)?;
         self.with_planner(|p| p.analyze(&q))
+    }
+
+    /// How to push a read down. `distinct` of a query's rows is pushed as a query marked so, for each shard to drop its
+    /// own repeats.
+    fn analyze_read(&mut self, e: &Expr) -> Option<Push> {
+        distinct_query(e).and_then(|q| self.analyze(&q)).or_else(|| self.analyze(e))
     }
 
     /// Run `e` against a private copy of the mirror, then make in the mirror what changed there, unless the shards did

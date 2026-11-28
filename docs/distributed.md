@@ -314,6 +314,7 @@ s4`): `ca.key` stays off the nodes.
 | route | leading row-by-row `where` clauses fix every distribution column to values on one shard | that shard runs the whole query, including `deltas`, `mavg`, `first` and so on |
 | grouped by the distribution columns | `by` includes each one that the filters do not fix to a single value | each group lies on one shard: results are concatenated |
 | rows merged in order | row-by-row filters and columns | shard results are merged by ordinal |
+| distinct rows merged in order | the same under `distinct`: `select distinct ...`, `distinct select ...`, `distinct exec c from t`, `exec distinct c from t` | each shard sends the first of its equal rows; the merged rows' repeats are dropped |
 | two-phase aggregation | `sum count min max prd avg wavg wsum var svar dev sdev`, and arithmetic on them | shards compute partial states, the control node merges them |
 | gather | everything else | the tables named are copied to the control node and the statement runs there |
 

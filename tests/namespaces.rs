@@ -65,6 +65,8 @@ fn tables_and_functions() {
         (".Q.fu[{x * x}; 3 1 3 3]", "9 1 9 9"),
         (".Q.fc[{2 * x}; 1 2 3]", "2 4 6"),
         (".Q.V[k] `v", "1 2 3"),
+        // (what a shard's `distinct` sends: the first of the rows that agree in the other columns)
+        ("(.kix.firsts[([] a: 1 2 1 1; b: `x`y`x`z; o: 0 1 2 3); `o]) `o", "0 1 3"),
         ("(.Q.v `k) ~ k", "1b"),
         (".Q.v 42", "42"),
         ("kt: ([e: 1 2] n: `x`y); (.Q.fk `kt$2 1; .Q.fk 1 2)", "`kt`"),

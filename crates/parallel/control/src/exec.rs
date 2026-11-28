@@ -309,12 +309,17 @@ impl Inner {
         };
         // the query as one shard answers it whole
         let whole = || {
-            with(&|s| {
+            let sent = with(&|s| {
                 *s.from = source(&push.rel, false);
                 if push.exec_single {
                     s.cols[0].name = None;
                 }
-            })
+            });
+            // (`exec` takes no notice of the mark)
+            match q.distinct && q.kind == QSqlKind::Exec {
+                true => Expr::Unary { op: intern("distinct"), arg: Box::new(sent) },
+                false => sent,
+            }
         };
         match &push.kind {
             Kind::Replicated => self.one(0, whole()),
@@ -324,18 +329,30 @@ impl Inner {
                 s.kind = QSqlKind::Select;
                 s.limit = None;
             })),
-            Kind::Ordered => self.ordered(push, with(&|s| {
-                *s.from = source(&push.rel, true);
-                s.kind = QSqlKind::Select;
-                if !s.cols.is_empty() {
-                    s.cols.push(ColSpec { name: Some(intern(ORD_COL)), expr: Expr::Var(intern(ORD_COL)) });
-                }
-                // `distinct` applies to all rows together; a limit taken of each shard's rows still holds the answer
-                if s.distinct {
-                    s.distinct = false;
-                    s.limit = None;
-                }
-            })),
+            Kind::Ordered => {
+                let ord = intern(ORD_COL);
+                let sent = with(&|s| {
+                    *s.from = source(&push.rel, true);
+                    s.kind = QSqlKind::Select;
+                    if !s.cols.is_empty() {
+                        s.cols.push(ColSpec { name: Some(ord), expr: Expr::Var(ord) });
+                    }
+                    // `distinct` applies to all rows together; a limit taken of each shard's rows still holds the answer
+                    if s.distinct {
+                        s.distinct = false;
+                        s.limit = None;
+                    }
+                });
+                // each shard sends only the first of its own equal rows, compared without their ordinals
+                let sent = match q.distinct && !q.cols.is_empty() {
+                    true => Expr::Apply {
+                        target: Box::new(Expr::Var(intern(".kix.firsts"))),
+                        args: vec![Some(sent), Some(Expr::Lit(K::Sym(ord)))],
+                    },
+                    false => sent,
+                };
+                self.ordered(push, sent)
+            }
             Kind::TwoPhase(aggs) => self.two_phase(mirror, push, aggs, with(&|s| {
                 *s.from = source(&push.rel, false);
                 s.kind = QSqlKind::Select;
@@ -387,7 +404,8 @@ impl Inner {
         let rows = in_order_limit(flips, limit)?;
         if q.kind == QSqlKind::Exec {
             return Ok(if push.exec_single {
-                K::Vector(rows.vals[0].clone())
+                let values = K::Vector(rows.vals[0].clone());
+                if q.distinct { distinct_op(&values)? } else { values }
             } else {
                 dict(names(&rows), K::Vector(ColVec::from_atoms(rows.vals.into_iter().map(K::Vector).collect())))
             });

@@ -632,3 +632,75 @@ fn verbs_applied_item_by_item_run_on_the_shards() {
     p.check("`cust insert (100; `a; \"zed\"; \"13-000\"; 5; 6)");
     p.check("cust");
 }
+
+#[test]
+fn distinct_rows_are_dropped_on_the_shards() {
+    let mut p = Pair::new(3);
+    for statement in [
+        ".kix.dist[`t; `sharded; `id]",
+        "n: 90",
+        "t: ([] id: til n; s: `c`a`b`a (til n) mod 4; v: n#3 1 2 3 1; f: n#0n 1.5 -0.0 0.0 2.5; d: 2026.01.01 + (til n) mod 3; \
+         flag: n#10b; name: n#(\"bo\";\"ann\";\"\";\"x\"); g: n#(1; `a; \"xy\"; 1 2; ()); sorted: `s#(til n) div 30)",
+        ".kix.dist[`none; `sharded; `id]",
+        "none: 0 # t",
+        ".kix.dist[`kt; `sharded; `id]",
+        "kt: ([id: til 20] s: 20#`b`a)",
+        ".kix.dist[`inst; `replicated]",
+        "inst: ([] s: `c`a`b`a; w: 1 2 3 2)",
+    ] {
+        p.single.eval(statement).unwrap_or_else(|e| panic!("{statement}: {e}"));
+        p.session.eval(statement).unwrap_or_else(|e| panic!("{statement}: {e}"));
+    }
+    let pushed = "distinct rows merged in order";
+    for table in ["t", "none"] {
+        // (the last two filters leave most shards, or all, without rows)
+        for filter in ["", " where v > 1", " where id < 1", " where id < 0"] {
+            for column in ["s", "v", "f", "d", "flag", "name", "g", "sorted", "2#'name", "v * 10", "count each name", "first each name"] {
+                // (a mixed column whose rows here share a type arrives from a shard as a column of that type, however
+                // it is asked for)
+                if column == "g" && filter == " where id < 1" {
+                    continue;
+                }
+                p.plan(&format!("distinct exec {column} from {table}{filter}"), pushed);
+                p.plan(&format!("exec distinct {column} from {table}{filter}"), pushed);
+                p.plan(&format!("select distinct c: {column} from {table}{filter}"), pushed);
+                p.check(&format!("attr distinct exec {column} from {table}{filter}"));
+                p.check(&format!("meta select distinct c: {column} from {table}{filter}"));
+            }
+            for columns in ["s, v", "s, f, d", "name, g", "s, c: v, d", "s, s", "sorted, flag"] {
+                if columns == "name, g" && filter == " where id < 1" {
+                    continue;
+                }
+                p.plan(&format!("select distinct {columns} from {table}{filter}"), pushed);
+                p.plan(&format!("distinct select {columns} from {table}{filter}"), pushed);
+            }
+        }
+    }
+    p.plan("select[3] distinct s from t", pushed);
+    p.plan("select[-2] distinct s, v from t", pushed);
+    p.plan("select distinct from t where v > 1", "merged in order");
+    p.plan("select distinct s from t where v = (max; v) fby id", pushed);
+    p.plan("distinct exec s from kt", pushed);
+    p.plan("select distinct s from kt", pushed);
+    p.check("distinct select from kt");
+    p.check("select distinct from kt");
+    // one shard answers whole
+    p.plan("distinct exec s from t where id = 7", "route");
+    p.plan("exec distinct s from t where id = 7", "route");
+    p.plan("exec distinct s from inst", "replicated");
+    p.plan("distinct select s, w from inst", "replicated");
+    // as part of a larger statement
+    p.plan("x: distinct exec s from t; count x", "control");
+    p.plan("count distinct exec s from t", pushed);
+    p.plan("select from inst where s in distinct exec s from t", "replicated");
+    p.plan("select id from t where s in exec distinct s from t where v > 2", "merged in order");
+    // what is not the distinct rows of one query is done as before
+    p.check("distinct exec s, v from t");
+    p.check("exec distinct s, v from t");
+    p.check("distinct select[3] s from t");
+    p.check("exec distinct s by v from t");
+    p.check("distinct select s by v from t");
+    p.check("exec distinct sum v from t");
+    p.check("distinct exec distinct s from t");
+    p.check("exec distinct nosuch from t");
+}

@@ -14,13 +14,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 /// Each function and the number of its arguments.
-const FUNCTIONS: [(&str, usize); 55] = [
+const FUNCTIONS: [(&str, usize); 56] = [
     (".Q.addmonths", 2), (".Q.addr", 1), (".Q.atob", 1), (".Q.bt", 1), (".Q.btoa", 1), (".Q.chk", 1), (".Q.dd", 2), (".Q.def", 2),
     (".Q.cn", 1), (".Q.dpft", 4), (".Q.dpfts", 5), (".Q.dpt", 3), (".Q.dpts", 4), (".Q.hdpf", 4), (".Q.MAP", 1), (".Q.par", 3), (".Q.en", 2), (".Q.ens", 3), (".Q.ind", 2), (".Q.view", 1), (".Q.f", 2), (".Q.fc", 2), (".Q.ff", 2), (".Q.fk", 1), (".Q.fmt", 3), (".Q.fs", 2),
     (".Q.fsn", 3), (".Q.ft", 2), (".Q.fu", 2), (".Q.gc", 1), (".Q.gz", 1), (".Q.id", 1), (".Q.j10", 1), (".Q.j12", 1), (".Q.opt", 1), (".Q.qt", 1),
     (".Q.s", 1), (".Q.s1", 1), (".Q.sbt", 1), (".Q.sha1", 1), (".Q.trp", 3), (".Q.trpd", 3), (".Q.ts", 2),
     (".Q.ty", 1), (".Q.v", 1), (".Q.V", 1), (".Q.w", 1), (".Q.x10", 1), (".Q.x12", 1), (".j.j", 1), (".j.jd", 1),
-    (".j.k", 1), (".kix.def", 1), (".kix.dist", 2), (".kix.objects", 1),
+    (".j.k", 1), (".kix.def", 1), (".kix.dist", 2), (".kix.firsts", 2), (".kix.objects", 1),
 ];
 
 /// Those that change the workspace or write files.
@@ -450,6 +450,12 @@ impl Engine<'_> {
             }
             ".j.k" => json::read(&text(x)?)?,
             ".kix.objects" => crate::inspect::workspace_objects_table(self.ws)?,
+            // the first of each of the table's rows that agree in every column but the one named (a shard's `distinct`)
+            ".kix.firsts" => {
+                let (K::Table(t), K::Sym(aside)) = (x, y) else { return Err(KError::ty(".kix.firsts takes a table and a column's name")) };
+                let compared: Vec<ColVec> = t.cols.iter().zip(&t.vals).filter(|(c, _)| *c != aside).map(|(_, v)| v.clone()).collect();
+                K::Table(Arc::new(t.gather(&ops::first_rows(&ops::group_ids(&compared, t.nrows())))))
+            }
             ".kix.def" => {
                 let target = x.as_str().unwrap_or_else(|| x.cell_text());
                 crate::inspect::workspace_definition(self.ws, &target)?
