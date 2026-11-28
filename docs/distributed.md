@@ -474,7 +474,7 @@ shards must match.
 
 * **Upgrade the control nodes and all shards together:** the messages between them change from version to version.
   (Since [columns of strings](storage.md#columns-of-strings) are sent and saved packed, an earlier version cannot read
-  what a later one wrote.)
+  what a later one wrote. Query results carry byte, char and GUID columns differently from earlier versions too.)
 * **Every node is trusted fully.** A certificate of the cluster's authority gives full access to every shard, and
   certificates cannot be revoked one by one (see [Security](#security)).
 * **A single control node is a single point of failure** ([several](#several-control-nodes) are not), and gathering

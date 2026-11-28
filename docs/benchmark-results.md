@@ -1,5 +1,30 @@
 # Benchmark results: scale factor 0.3
 
+## Converting columns to and from Arrow
+
+Measured 2026-11-27 **on battery**, where the machine is about half as fast: commit `a34cdb4` and the change below, run
+back to back, one run each (the mean of 40 conversions). Numeric and temporal columns are now copied between the engine
+and Arrow as blocks ([arrowconv.rs](../crates/parallel/shared-ces/src/arrowconv.rs)) instead of an item at a time, and a
+validity bitmap is built only for a column of a batch that has nulls. Milliseconds for 600,000 rows of a `long`, a
+`float`, a `date` and a `real` column, in batches of 65,536 rows:
+
+| | `a34cdb4` | now |
+| --- | ---: | ---: |
+| to Arrow, no nulls | 11.3 | 6.0 |
+| from Arrow, no nulls | 10.2 | 4.0 |
+| to Arrow, 1% nulls | 16.8 | 8.0 |
+| from Arrow, 1% nulls | 11.0 | 7.7 |
+
+Byte, char and GUID columns, which each item used to be packed for on its own in kdb+ IPC form, are copied as blocks
+too. Milliseconds for 600,000 rows of one column (on battery, one run each, the mean of 10 conversions):
+
+| | before | now |
+| --- | ---: | ---: |
+| to Arrow, `char` / `byte` / `guid` | 74 / 70 / 87 | 1.9 / 0.4 / 3.5 |
+| from Arrow, `char` / `byte` / `guid` | 39 / 35 / 34 | 1.7 / 0.2 / 2.5 |
+
+Only the conversion was timed, not whole cluster queries.
+
 ## Finding items with `?`
 
 Measured 2026-11-26 **on battery**, where the machine is about half as fast: commit `d507205` and the change below, run
