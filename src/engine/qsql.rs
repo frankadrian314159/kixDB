@@ -16,6 +16,15 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Whether the expression applies something item by item (`f each x`, `f'[x]`).
+fn applies_each(e: &Expr) -> bool {
+    e.any(&mut |x| match x {
+        Expr::Adverb { kind: AdverbKind::Each, .. } => true,
+        Expr::Binary { op, .. } => matches!(resolve(*op), "each" | "peach"),
+        _ => false,
+    })
+}
+
 /// Verbs whose argument names things only at run time.
 pub const DYNAMIC: [&str; 6] = ["value", "get", "eval", "reval", "system", ".Q.v"];
 
@@ -425,6 +434,8 @@ impl<'a> Engine<'a> {
                         _ => false,
                     }
                 };
+                // A list of characters that a verb made one row at a time (`first each name`) is a column too
+                let one_a_row = |chars: usize, e: &Expr| chars == filtered.nrows() && applies_each(e);
                 let has_vec = evaluated.iter().zip(cols).any(|(k, cs)| {
                     if is_col_vec(k) {
                         true
@@ -433,6 +444,7 @@ impl<'a> Engine<'a> {
                         infer_col_name(&cs.expr)
                             .and_then(|n| filtered.col(n))
                             .is_some_and(|c| matches!(c, ColVec::Char(_, _)) && bs.len() == filtered.nrows())
+                            || one_a_row(bs.len(), &cs.expr)
                     } else {
                         false
                     }
@@ -452,9 +464,9 @@ impl<'a> Engine<'a> {
                             K::Vector(ColVec::Char(_, ref bs))
                                 if !infer_col_name(&cs.expr)
                                     .and_then(|n| filtered.col(n))
-                                    .is_some_and(|c| matches!(c, ColVec::Char(_, _))) =>
+                                    .is_some_and(|c| matches!(c, ColVec::Char(_, _)))
+                                    && !one_a_row(bs.len(), &cs.expr) =>
                             {
-                                let _ = bs;
                                 out_vals.push(ColVec::General(Attr::None, Arc::new(vec![k; target_len])));
                             }
                             K::Vector(cv) => {

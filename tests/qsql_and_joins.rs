@@ -324,3 +324,15 @@ fn top_k_sorts_composite_joins_fby_and_grouped_updates_match_full_evaluation() {
         assert_eq!(c.eval(code).unwrap().to_string(), expected, "{code}");
     }
 }
+
+#[test]
+fn characters_made_one_a_row_are_a_column() {
+    let mut c = kixdb::Server::new().connect();
+    c.eval("t: ([] s: (\"ann\"; \"bo\"; \"cy\"))").unwrap();
+    // one character from each row is a column; a string that is written, or joined from the rows, is repeated on each
+    assert_eq!(c.eval("select f: first each s, u: upper first each s from t").unwrap(), c.eval("flip `f`u!(\"abc\"; \"ABC\")").unwrap());
+    assert_eq!(
+        c.eval("select n: count each s, a: \"abc\", b: \"-\" sv string count each s from t").unwrap(),
+        c.eval("([] n: 3 2 2; a: 3 # enlist \"abc\"; b: 3 # enlist \"3-2-2\")").unwrap()
+    );
+}
